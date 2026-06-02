@@ -1,0 +1,28 @@
+[package]
+name = "core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pdfium-render = { version = "0.8", features = ["thread_safe"] }
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+lru = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+base64 = "0.22"
+image = { version = "0.25", features = ["png"] }
+
+[[bin]]
+name = "milestone1"
+path = "src/bin/milestone1.rs"
+
+[[bin]]
+name = "milestone2"
+path = "src/bin/milestone2.rs"
+
+[[bin]]
+name = "pdf_renderer"
+path = "src/bin/pdf_renderer.rs"

@@ -1,0 +1,43 @@
+# Rust / Cargo build output (14GB+ — never commit)
+/target/
+**/target/
+
+# Node / frontend build output
+node_modules/
+desktop/src-frontend/dist/
+desktop/src-frontend/node_modules/
+
+# PDFium binary — developer-placed per setup instructions, platform-specific, ~29MB
+libs/pdfium/*
+!libs/pdfium/.gitkeep
+
+# Generated Tauri icons can be regenerated; keep source icon only
+# (commented out — keep icons committed unless they bloat the repo)
+# desktop/icons/
+
+# SQLite project files and registries (user data, not source)
+*.tcop
+*.tcop-shm
+*.tcop-wal
+registry.db
+*.db-shm
+*.db-wal
+
+# Dev/run logs and scratch artifacts
+*.log
+test_stdin.txt
+test_stdout.txt
+test_vectors.txt
+test_milestone1.pdf
+
+# Milestone verification screenshots (regenerable proof artifacts)
+milestone2_tile.png
+milestone3_window.png
+milestone4_window.png
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
