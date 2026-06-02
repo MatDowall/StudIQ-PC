@@ -16,13 +16,5 @@ base64 = "0.22"
 image = { version = "0.25", features = ["png"] }
 
 [[bin]]
-name = "milestone1"
-path = "src/bin/milestone1.rs"
-
-[[bin]]
-name = "milestone2"
-path = "src/bin/milestone2.rs"
-
-[[bin]]
 name = "pdf_renderer"
 path = "src/bin/pdf_renderer.rs"

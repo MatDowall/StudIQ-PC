@@ -29,21 +29,10 @@ pub struct TileData {
     pub generation: u64,
 }
 
-pub struct RenderRequest {
-    pub key: TileKey,
-    pub pdf_path: String,
-    pub lib_path: String,
-    pub cache_dir: String,
-    pub renderer_path: String,
-    pub dpi: f32,
-    pub generation: u64,
-}
-
 pub struct TileManager {
     cache: Arc<Mutex<LruCache<TileKey, TileData>>>,
     queued: Arc<Mutex<HashMap<TileKey, u64>>>,
     generation: Arc<AtomicU64>,
-    render_tx: Sender<RenderRequest>,
     completion_tx: Sender<TileData>,
     pub completion_rx: Receiver<TileData>,
 }
@@ -55,18 +44,13 @@ pub enum TileQueueState {
 }
 
 impl TileManager {
-    pub fn new(
-        render_tx: Sender<RenderRequest>,
-        completion_tx: Sender<TileData>,
-        completion_rx: Receiver<TileData>,
-    ) -> Self {
+    pub fn new(completion_tx: Sender<TileData>, completion_rx: Receiver<TileData>) -> Self {
         Self {
             cache: Arc::new(Mutex::new(LruCache::new(
                 NonZeroUsize::new(MAX_CACHED_TILES).unwrap(),
             ))),
             queued: Arc::new(Mutex::new(HashMap::new())),
             generation: Arc::new(AtomicU64::new(1)),
-            render_tx,
             completion_tx,
             completion_rx,
         }
@@ -136,63 +120,8 @@ impl TileManager {
         self.queued.lock().remove(key);
     }
 
-    pub fn get_or_queue(
-        &self,
-        key: TileKey,
-        pdf_path: &str,
-        lib_path: &str,
-        cache_dir: &str,
-        renderer_path: &str,
-    ) -> Option<TileData> {
-        let mut cache = self.cache.lock();
-        if let Some(tile) = cache.get(&key) {
-            return Some(tile.clone());
-        }
-        drop(cache);
-
-        let generation = self.current_generation();
-        let mut queued = self.queued.lock();
-        if queued
-            .get(&key)
-            .is_some_and(|queued_generation| *queued_generation == generation)
-        {
-            return None;
-        }
-
-        let dpi = 96.0 * 2f32.powi(key.zoom_level as i32 - 2);
-        if self
-            .render_tx
-            .try_send(RenderRequest {
-                key,
-                pdf_path: pdf_path.to_string(),
-                lib_path: lib_path.to_string(),
-                cache_dir: cache_dir.to_string(),
-                renderer_path: renderer_path.to_string(),
-                dpi,
-                generation,
-            })
-            .is_ok()
-        {
-            queued.insert(key, generation);
-        }
-        None
-    }
-
     pub fn get_cached(&self, key: &TileKey) -> Option<TileData> {
         self.cache.lock().get(key).cloned()
-    }
-
-    pub fn invalidate_zoom(&self, zoom_level: u8) {
-        let mut cache = self.cache.lock();
-        let keys: Vec<TileKey> = cache
-            .iter()
-            .filter_map(|(key, _)| (key.zoom_level == zoom_level).then_some(*key))
-            .collect();
-        for key in keys {
-            cache.pop(&key);
-        }
-        drop(cache);
-        self.queued.lock().retain(|k, _| k.zoom_level != zoom_level);
     }
 
     pub fn drain_completed(&self) -> Vec<TileData> {
