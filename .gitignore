@@ -35,6 +35,9 @@ milestone2_tile.png
 milestone3_window.png
 milestone4_window.png
 
+# Claude Code local (machine-specific) settings — keep shared settings.json tracked
+.claude/settings.local.json
+
 # OS / editor cruft
 .DS_Store
 Thumbs.db
