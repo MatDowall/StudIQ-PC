@@ -103,6 +103,10 @@ function pageToScreen(
   };
 }
 
+// Measurement geometry is stored in `geometry_json` as PDF points with a
+// Y-up, bottom-left origin — the same convention the snap engine produces
+// (see resolveSnap / scheduleSnapResolution). Render it through pageToScreen
+// so overlays and snap indicators stay in the same coordinate space.
 function drawOverlays(
   ctx: CanvasRenderingContext2D,
   measurements: MeasurementDto[],
@@ -112,17 +116,8 @@ function drawOverlays(
   page: PageMeta,
   pageIndex: number,
 ) {
-  const width = ctx.canvas.width;
-  const height = ctx.canvas.height;
-  ctx.clearRect(0, 0, width, height);
-
   const pageMeasurements = measurements.filter((measurement) => measurement.page_index === pageIndex);
   if (pageMeasurements.length === 0) return;
-
-  const pageLeft = -pan.x;
-  const pageTop = -pan.y;
-  const scaleX = (page.width_pts * zoom * 96) / (72 * page.width_pts);
-  const scaleY = (page.height_pts * zoom * 96) / (72 * page.height_pts);
 
   ctx.fillStyle = `${colour}55`;
   ctx.strokeStyle = colour;
@@ -138,10 +133,12 @@ function drawOverlays(
 
     if (!Array.isArray(points) || points.length < 2) continue;
 
+    const first = pageToScreen(points[0].x, points[0].y, page.height_pts, pan, zoom);
     ctx.beginPath();
-    ctx.moveTo(pageLeft + points[0].x * scaleX, pageTop + points[0].y * scaleY);
+    ctx.moveTo(first.x, first.y);
     for (const point of points.slice(1)) {
-      ctx.lineTo(pageLeft + point.x * scaleX, pageTop + point.y * scaleY);
+      const screen = pageToScreen(point.x, point.y, page.height_pts, pan, zoom);
+      ctx.lineTo(screen.x, screen.y);
     }
     ctx.closePath();
     ctx.fill();

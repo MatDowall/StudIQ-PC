@@ -42,14 +42,17 @@ Frontend state lives in `desktop/src-frontend/src/store/appStore.ts` (Zustand). 
 engine (endpoint → midpoint → intersection, with a bbox prefilter) is in `resolveSnap` there.
 Canvas drawing + pan/zoom + snap UI is in `components/ViewerCanvas.tsx`.
 
-## Coordinate convention — IMPORTANT for measurement work
+## Coordinate convention — measurements are PDF points, Y-up
 
-The snap engine and snap indicator work in **PDF points, Y-up** (origin bottom-left;
-`ViewerCanvas` converts with `pageHeightPts - ptY`). The existing `drawOverlays` for stored
-measurements currently draws **Y-down** with no flip — these disagree. No measurement can be
-saved yet (no `create_measurement` command), so `geometry_json` has no established format.
-**When implementing Phase 3 measurement tools, standardize on PDF points / Y-up and make the
-snap path and the overlay path agree.**
+All on-page geometry uses **PDF points with a Y-up, bottom-left origin** (the convention
+PDFium and the snap engine use). `ViewerCanvas` converts to screen with `pageToScreen`
+(`pageHeightPts - ptY`). The snap engine (`resolveSnap` / `scheduleSnapResolution`) produces
+snap points in this space, and `drawOverlays` renders stored measurements through that same
+`pageToScreen` path — so snap indicators and saved geometry share one coordinate space.
+
+**Phase 3 measurement tools must store `geometry_json` as `[{ "x": <pt>, "y": <pt> }, ...]`
+in PDF points, Y-up**, so saved geometry round-trips through snap and overlay with no flip.
+(No `create_measurement` command exists yet; rendering of saved geometry is already wired up.)
 
 ## Build & run
 
