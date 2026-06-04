@@ -110,6 +110,7 @@ export function TreeNode({ node, depth, activeNodeId, onNodeClick, onContextMenu
         page_count: null,
         uom: node.uom,
         colour: node.colour,
+        framing_size: null,
       }))
     : [];
   const children = isDrawing ? pageChildren : cachedChildren;

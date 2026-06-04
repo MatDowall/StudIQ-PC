@@ -1,5 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import { create } from "zustand";
+import type { GroupProps } from "../lib/quantity";
+import type { OpeningTemplate } from "../lib/framing";
+
+export type DimensionGroupPropsDto = GroupProps;
 
 export interface TreeNodeDto {
   id: number;
@@ -13,6 +17,9 @@ export interface TreeNodeDto {
   page_count: number | null;
   uom: string | null;
   colour: string | null;
+  // Framing size (e.g. "90x45") for timber-framing groups; null otherwise. Lets the tree row
+  // show the size without loading the group's props.
+  framing_size: string | null;
 }
 
 export interface MeasurementDto {
@@ -22,8 +29,19 @@ export interface MeasurementDto {
   page_index: number;
   measurement_type: string;
   geometry_json: string;
+  polarity: number;
   quantity: number | null;
   uom: string | null;
+  // Per-wall timber-framing extras (door/window openings, raking, manual studs) as JSON; null
+  // for non-framing measurements. Parsed via lib/framing.ts.
+  framing_json: string | null;
+}
+
+export interface PageScaleDto {
+  drawing_id: number;
+  page_index: number;
+  mm_per_point: number;
+  unit: string;
 }
 
 export interface PageMeta {
@@ -73,7 +91,19 @@ export interface PageVectors {
   primitives: VectorPrimitive[];
 }
 
+/** A destination folder for the copy dialog: id plus its full `/`-joined path. */
+export interface FolderOption {
+  id: number;
+  path: string;
+}
+
+/** Ribbon-triggered actions handled by the dimension-group pane (which owns the dialogs). */
+export type DgPaneCommand = "add" | "properties" | "copy";
+
 export type SnapType = "endpoint" | "midpoint" | "intersection";
+
+/** Viewer interaction mode: place new dimensions, or select/edit existing ones. */
+export type ViewerMode = "add" | "select";
 
 export interface SnapPoint {
   x: number;
@@ -116,14 +146,52 @@ interface AppStore {
   vectorIndex: Record<number, IndexedPrimitive[]>;
   snapPoint: SnapPoint | null;
   snapType: SnapType | null;
+  // "point" = click-to-place vertices (default); "line" = auto-detect wall segment on hover.
+  drawingType: "point" | "line";
+  // Live proposed measurement for line mode: the detected wall extended to its intersections.
+  lineSnapResult: { start: SnapPoint; end: SnapPoint } | null;
 
   dimensionRoots: TreeNodeDto[];
+  // The "active" group is where new dimensions are added (the primary selection).
   activeDimensionGroupId: number | null;
+  // All selected groups render concurrently (CostX Ctrl-click multi-select).
+  selectedGroupIds: number[];
+  groupColours: Record<number, string>;
   activeBreadcrumb: string;
   overlayMeasurements: MeasurementDto[];
   overlayColour: string;
+  // "add" = click to place new dimensions; "select" = pick/edit/delete existing ones.
+  viewerMode: ViewerMode;
+  selectedMeasurementId: number | null;
+  // When set, the viewer is placing a door/window opening: hovering a framing wall shows a ghost
+  // that commits onto the wall on click. Overrides add/select while active.
+  openingPlacement: OpeningTemplate | null;
+  // Drawing ribbon: false = 2D plan view (default), true = 3D framing view.
+  view3d: boolean;
+  // Scale of the active drawing page, and whether the calibration capture is in progress.
+  pageScale: PageScaleDto | null;
+  calibrating: boolean;
+  // CostX props for each selected group, scales for every page referenced by loaded
+  // measurements (keyed `${drawingId}:${pageIndex}`), and the polarity new dimensions take.
+  groupProps: Record<number, DimensionGroupPropsDto>;
+  scaleCache: Record<string, PageScaleDto | null>;
+  drawPolarity: number;
+  // Ribbon → dimension-group pane bridge: the pane watches `seq` and opens the matching
+  // dialog for the active group (the pane owns the Add / Properties / Copy dialogs).
+  dgPaneCommand: { action: DgPaneCommand; seq: number } | null;
 
   setActiveProject: (project: ProjectMeta | null) => void;
+  setViewerMode: (mode: ViewerMode) => void;
+  setOpeningPlacement: (template: OpeningTemplate | null) => void;
+  setView3d: (on: boolean) => void;
+  selectMeasurement: (measurementId: number | null) => void;
+  updateMeasurementGeometry: (measurementId: number, geometryJson: string) => Promise<void>;
+  updateMeasurementFraming: (measurementId: number, framingJson: string | null) => Promise<void>;
+  setCalibrating: (calibrating: boolean) => void;
+  loadPageScale: (drawingId: number, pageIndex: number) => Promise<void>;
+  setPageScale: (drawingId: number, pageIndex: number, mmPerPoint: number, unit: string) => Promise<void>;
+  setDrawPolarity: (polarity: number) => void;
+  saveGroupProps: (props: DimensionGroupPropsDto) => Promise<void>;
   createProject: (name: string, client: string, contractNumber: string, filePath: string) => Promise<void>;
   openProject: (filePath: string) => Promise<void>;
   closeProject: () => Promise<void>;
@@ -134,14 +202,27 @@ interface AppStore {
   addDrawing: (parentId: number | null, name: string, filePath: string) => Promise<void>;
   addDrawingToFolderPath: (folderPath: string, name: string, filePath: string) => Promise<void>;
   createDimensionGroupInFolderPath: (folderPath: string, name: string, colour: string) => Promise<void>;
+  listDimensionFolders: () => Promise<FolderOption[]>;
+  copyDimensionGroup: (sourceNodeId: number, targetFolderId: number, name: string, copyDimensions: boolean) => Promise<void>;
+  requestDgPaneCommand: (action: DgPaneCommand) => void;
   deleteNode: (node: TreeNodeDto) => Promise<void>;
   renameNode: (node: TreeNodeDto, name: string) => Promise<void>;
   updateDimensionGroupColour: (nodeId: number, colour: string) => Promise<void>;
-  selectDimensionGroup: (node: TreeNodeDto) => Promise<void>;
+  selectDimensionGroup: (node: TreeNodeDto, additive?: boolean) => Promise<void>;
+  createMeasurement: (input: {
+    measurementType?: string;
+    geometryJson: string;
+    polarity?: number;
+    quantity?: number | null;
+    uom?: string | null;
+  }) => Promise<MeasurementDto>;
+  deleteMeasurement: (measurementId: number) => Promise<void>;
   openDrawing: (node: TreeNodeDto) => Promise<void>;
   openDrawingPage: (node: TreeNodeDto) => Promise<void>;
   loadVectors: (pageIndex: number) => Promise<void>;
+  setDrawingType: (type: "point" | "line") => void;
   resolveSnap: (cursorPageX: number, cursorPageY: number, pageIndex: number, radiusPts: number) => void;
+  resolveLineSnap: (cursorPageX: number, cursorPageY: number, pageIndex: number, radiusPts: number) => void;
   clearSnap: () => void;
 }
 
@@ -283,6 +364,96 @@ function distanceToSegmentSq(pointX: number, pointY: number, segment: LineSegmen
   return nearestDx * nearestDx + nearestDy * nearestDy;
 }
 
+// Line-mode collinear-merge tolerances (all in PDF points unless noted).
+// A wall drawn as many small segments needs these to be recognised as one surface.
+const COLLINEAR_ANGLE_SIN = Math.sin((2 * Math.PI) / 180); // 2° — must be nearly parallel
+const COLLINEAR_PERP_TOL = 2; // max perpendicular offset to the same wall line
+const COLLINEAR_GAP_TOL = 60; // max end-to-end gap to merge through (covers door openings)
+// Crossings within this many points along the wall collapse to one junction, so a thick
+// crossing wall's two faces (or a multi-line corner) read as one. Tunable: must exceed a
+// single wall's face-to-face thickness (~2–6pt) but stay BELOW the spacing between distinct
+// walls (~10pt+), or separate cross-walls chain into one over-wide junction.
+const LINE_JUNCTION_CLUSTER_PTS = 8;
+
+// Merges `seed` with every adjacent collinear segment in `allSegs` that lies on the same
+// physical wall line. Returns the bounding LineSegment covering the full merged run.
+// Uses iterative expansion so chains of individually-adjacent segments are fully coalesced.
+function mergeCollinearSegments(seed: LineSegment, allSegs: LineSegment[]): LineSegment {
+  const dx = seed.x2 - seed.x1;
+  const dy = seed.y2 - seed.y1;
+  const len = Math.hypot(dx, dy);
+  if (len < 1e-9) return seed;
+  const ux = dx / len;
+  const uy = dy / len;
+
+  // Expand the parametric range [tMin, tMax] until stable.
+  let tMin = 0;
+  let tMax = 1;
+  let changed = true;
+  let guard = 0;
+  while (changed && guard++ < 30) {
+    changed = false;
+    for (const Q of allSegs) {
+      if (Q === seed) continue;
+      const qdx = Q.x2 - Q.x1;
+      const qdy = Q.y2 - Q.y1;
+      const qlen = Math.hypot(qdx, qdy);
+      if (qlen < 1e-9) continue;
+
+      // Must be nearly parallel to seed.
+      const crossMag = Math.abs(ux * qdy - uy * qdx) / qlen;
+      if (crossMag > COLLINEAR_ANGLE_SIN) continue;
+
+      // Perpendicular distance from Q's first endpoint to the infinite line through seed.
+      const perp = Math.abs(ux * (Q.y1 - seed.y1) - uy * (Q.x1 - seed.x1));
+      if (perp > COLLINEAR_PERP_TOL) continue;
+
+      // Project Q's endpoints onto seed's parametric axis.
+      const qt1 = ((Q.x1 - seed.x1) * ux + (Q.y1 - seed.y1) * uy) / len;
+      const qt2 = ((Q.x2 - seed.x1) * ux + (Q.y2 - seed.y1) * uy) / len;
+      const qMin = Math.min(qt1, qt2);
+      const qMax = Math.max(qt1, qt2);
+
+      // Only merge if Q is adjacent to (or overlapping with) the current accumulated range.
+      const gapTolT = COLLINEAR_GAP_TOL / len;
+      if (qMax < tMin - gapTolT || qMin > tMax + gapTolT) continue;
+
+      const nextMin = Math.min(tMin, qMin);
+      const nextMax = Math.max(tMax, qMax);
+      if (nextMin !== tMin || nextMax !== tMax) {
+        tMin = nextMin;
+        tMax = nextMax;
+        changed = true;
+      }
+    }
+  }
+
+  return {
+    x1: seed.x1 + tMin * dx,
+    y1: seed.y1 + tMin * dy,
+    x2: seed.x1 + tMax * dx,
+    y2: seed.y1 + tMax * dy,
+  };
+}
+
+// Returns the t-parameter on the infinite line through `S` at which it intersects the
+// finite segment `Q`. Returns null if the lines are parallel or the intersection lies
+// outside Q's bounds. Used by resolveLineSnap to extend a wall to its neighbours.
+function infiniteLineSegmentT(S: LineSegment, Q: LineSegment): number | null {
+  const dx = S.x2 - S.x1;
+  const dy = S.y2 - S.y1;
+  const b1 = Q.x2 - Q.x1;
+  const b2 = Q.y2 - Q.y1;
+  const c1 = Q.x1 - S.x1;
+  const c2 = Q.y1 - S.y1;
+  const denom = dx * b2 - dy * b1;
+  if (Math.abs(denom) < 1e-9) return null;
+  const t = (c1 * b2 - c2 * b1) / denom;
+  const s = (c1 * dy - c2 * dx) / denom;
+  if (s < -0.01 || s > 1.01) return null;
+  return t;
+}
+
 export const useAppStore = create<AppStore>((set, get) => ({
   activeProject: null,
   recentProjects: [],
@@ -298,15 +469,108 @@ export const useAppStore = create<AppStore>((set, get) => ({
   vectorIndex: {},
   snapPoint: null,
   snapType: null,
+  drawingType: "point",
+  lineSnapResult: null,
 
   dimensionRoots: [],
   activeDimensionGroupId: null,
+  selectedGroupIds: [],
+  groupColours: {},
   activeBreadcrumb: "",
   overlayMeasurements: [],
   overlayColour: "#4A9EFF",
+  viewerMode: "add",
+  selectedMeasurementId: null,
+  openingPlacement: null,
+  view3d: false,
+  pageScale: null,
+  calibrating: false,
+  groupProps: {},
+  scaleCache: {},
+  drawPolarity: 1,
+  dgPaneCommand: null,
 
   setActiveProject: (project) => {
     set({ activeProject: project });
+  },
+
+  setDrawPolarity: (polarity) => {
+    set({ drawPolarity: polarity });
+  },
+
+  setDrawingType: (type) => {
+    set({ drawingType: type, snapPoint: null, snapType: null, lineSnapResult: null });
+  },
+
+  saveGroupProps: async (props) => {
+    const saved = await invoke<DimensionGroupPropsDto>("set_dimension_group_props", { props });
+    await refreshTree("dimensions", set);
+    set((state) => ({
+      groupProps: { ...state.groupProps, [saved.node_id]: saved },
+      groupColours: state.selectedGroupIds.includes(saved.node_id)
+        ? { ...state.groupColours, [saved.node_id]: saved.pos_colour }
+        : state.groupColours,
+      overlayColour: state.activeDimensionGroupId === saved.node_id ? saved.pos_colour : state.overlayColour,
+    }));
+  },
+
+  setCalibrating: (calibrating) => {
+    set({ calibrating });
+  },
+
+  loadPageScale: async (drawingId, pageIndex) => {
+    const scale = await invoke<PageScaleDto | null>("get_page_scale", { drawingId, pageIndex });
+    const key = `${drawingId}:${pageIndex}`;
+    set((state) => ({
+      scaleCache: { ...state.scaleCache, [key]: scale },
+      // Only update the toolbar's active-page scale if still on that page (guards races).
+      pageScale: state.activeDrawingId === drawingId && state.activePageIndex === pageIndex ? scale : state.pageScale,
+    }));
+  },
+
+  setPageScale: async (drawingId, pageIndex, mmPerPoint, unit) => {
+    const scale = await invoke<PageScaleDto>("set_page_scale", { drawingId, pageIndex, mmPerPoint, unit });
+    const key = `${drawingId}:${pageIndex}`;
+    set((state) => ({
+      calibrating: false,
+      scaleCache: { ...state.scaleCache, [key]: scale },
+      pageScale: state.activeDrawingId === drawingId && state.activePageIndex === pageIndex ? scale : state.pageScale,
+    }));
+  },
+
+  setViewerMode: (mode) => {
+    // Switching mode cancels any in-progress door/window placement.
+    set((state) => ({ viewerMode: mode, openingPlacement: null, selectedMeasurementId: mode === "add" ? null : state.selectedMeasurementId }));
+  },
+
+  setOpeningPlacement: (template) => {
+    set({ openingPlacement: template });
+  },
+
+  setView3d: (on) => {
+    set({ view3d: on });
+  },
+
+  selectMeasurement: (measurementId) => {
+    set({ selectedMeasurementId: measurementId });
+  },
+
+  updateMeasurementGeometry: async (measurementId, geometryJson) => {
+    const updated = await invoke<MeasurementDto>("update_measurement_geometry", { measurementId, geometryJson });
+    set((state) => ({
+      overlayMeasurements: state.overlayMeasurements.map((measurement) =>
+        measurement.id === updated.id ? updated : measurement,
+      ),
+    }));
+  },
+
+  updateMeasurementFraming: async (measurementId, framingJson) => {
+    const updated = await invoke<MeasurementDto>("update_measurement_framing", { measurementId, framingJson });
+    set((state) => ({
+      overlayMeasurements: state.overlayMeasurements.map((measurement) =>
+        measurement.id === updated.id ? updated : measurement,
+      ),
+    }));
   },
 
   createProject: async (name, client, contractNumber, filePath) => {
@@ -342,7 +606,19 @@ export const useAppStore = create<AppStore>((set, get) => ({
       vectorIndex: {},
       snapPoint: null,
       snapType: null,
+      lineSnapResult: null,
       activeDimensionGroupId: null,
+      selectedGroupIds: [],
+      groupColours: {},
+      selectedMeasurementId: null,
+      viewerMode: "add",
+      openingPlacement: null,
+      view3d: false,
+      pageScale: null,
+      calibrating: false,
+      groupProps: {},
+      scaleCache: {},
+      drawPolarity: 1,
       activeBreadcrumb: "",
       overlayMeasurements: [],
       overlayColour: "#4A9EFF",
@@ -416,6 +692,19 @@ export const useAppStore = create<AppStore>((set, get) => ({
     await refreshTree("dimensions", set);
   },
 
+  listDimensionFolders: async () => {
+    return invoke<FolderOption[]>("list_dimension_folders");
+  },
+
+  copyDimensionGroup: async (sourceNodeId, targetFolderId, name, copyDimensions) => {
+    await invoke<TreeNodeDto>("copy_dimension_group", { sourceNodeId, targetFolderId, name, copyDimensions });
+    await refreshTree("dimensions", set);
+  },
+
+  requestDgPaneCommand: (action) => {
+    set((state) => ({ dgPaneCommand: { action, seq: (state.dgPaneCommand?.seq ?? 0) + 1 } }));
+  },
+
   deleteNode: async (node) => {
     const state = get();
     if (node.node_type !== "folder" && node.node_type !== "drawing" && node.node_type !== "dimension_group") {
@@ -430,6 +719,10 @@ export const useAppStore = create<AppStore>((set, get) => ({
         dimensionRoots: roots,
         childCache: {},
         activeDimensionGroupId: null,
+        selectedGroupIds: [],
+        groupColours: {},
+        groupProps: {},
+        selectedMeasurementId: null,
         activeBreadcrumb: "",
         overlayMeasurements: [],
         overlayColour: "#4A9EFF",
@@ -450,6 +743,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
       vectorIndex: clearsActiveDocument ? {} : state.vectorIndex,
       snapPoint: clearsActiveDocument ? null : state.snapPoint,
       snapType: clearsActiveDocument ? null : state.snapType,
+      lineSnapResult: clearsActiveDocument ? null : state.lineSnapResult,
       treeRevision: latest.treeRevision + 1,
     }));
   },
@@ -465,38 +759,134 @@ export const useAppStore = create<AppStore>((set, get) => ({
   updateDimensionGroupColour: async (nodeId, colour) => {
     await invoke<TreeNodeDto>("update_dimension_group_colour", { nodeId, colour });
     await refreshTree("dimensions", set);
-    const state = get();
-    if (state.activeDimensionGroupId === nodeId) {
-      set({ overlayColour: colour });
-    }
+    set((state) => {
+      if (!state.selectedGroupIds.includes(nodeId)) return {};
+      return {
+        groupColours: { ...state.groupColours, [nodeId]: colour },
+        overlayColour: state.activeDimensionGroupId === nodeId ? colour : state.overlayColour,
+        groupProps: state.groupProps[nodeId]
+          ? { ...state.groupProps, [nodeId]: { ...state.groupProps[nodeId], pos_colour: colour } }
+          : state.groupProps,
+      };
+    });
   },
 
-  selectDimensionGroup: async (node) => {
+  // Plain click selects one group; Ctrl+click toggles a group in/out of the
+  // selection. All selected groups render concurrently, each in its own colour;
+  // the active (primary) group is where new dimensions are added.
+  selectDimensionGroup: async (node, additive = false) => {
     if (node.node_type !== "dimension_group") return;
-    const measurements = await invoke<MeasurementDto[]>("get_measurements_for_group", { groupId: node.id });
     const state = get();
-    const breadcrumb = pathForNode(state.dimensionRoots, state.childCache, node.id)?.join(" / ") ?? node.name;
-    const firstMeasurement = measurements[0] ?? null;
+
+    let selectedIds: number[];
+    let activeId: number | null;
+    if (additive) {
+      if (state.selectedGroupIds.includes(node.id)) {
+        selectedIds = state.selectedGroupIds.filter((id) => id !== node.id);
+        activeId = selectedIds.length > 0 ? selectedIds[selectedIds.length - 1] : null;
+      } else {
+        selectedIds = [...state.selectedGroupIds, node.id];
+        activeId = node.id;
+      }
+    } else {
+      selectedIds = [node.id];
+      activeId = node.id;
+    }
+
+    // Load measurements + CostX props for every selected group.
+    const [perGroup, propsList] = await Promise.all([
+      Promise.all(selectedIds.map((id) => invoke<MeasurementDto[]>("get_measurements_for_group", { groupId: id }))),
+      Promise.all(selectedIds.map((id) => invoke<DimensionGroupPropsDto>("get_dimension_group_props", { nodeId: id }))),
+    ]);
+    const measurements = perGroup.flat();
+
+    const groupProps: Record<number, DimensionGroupPropsDto> = {};
+    selectedIds.forEach((id, index) => {
+      groupProps[id] = propsList[index];
+    });
+
+    // Each selected group's positive colour comes from its props.
+    const groupColours: Record<number, string> = {};
+    for (const id of selectedIds) {
+      groupColours[id] = groupProps[id]?.pos_colour ?? "#4A9EFF";
+    }
+
+    // Load the scale for every page referenced by the loaded measurements.
+    const pageKeys = Array.from(new Set(measurements.map((m) => `${m.drawing_id}:${m.page_index}`)));
+    const scaleEntries = await Promise.all(
+      pageKeys.map(async (key) => {
+        const [drawingId, pageIndex] = key.split(":").map(Number);
+        const scale = await invoke<PageScaleDto | null>("get_page_scale", { drawingId, pageIndex });
+        return [key, scale] as const;
+      }),
+    );
+    const scaleCache: Record<string, PageScaleDto | null> = Object.fromEntries(scaleEntries);
+
+    const activeNode = activeId !== null ? findNode(state.dimensionRoots, state.childCache, activeId) : null;
+    const breadcrumb =
+      activeId !== null ? pathForNode(state.dimensionRoots, state.childCache, activeId)?.join(" / ") ?? node.name : "";
+    const activeMeasurements = activeId !== null ? perGroup[selectedIds.indexOf(activeId)] ?? [] : [];
+    const firstMeasurement = activeMeasurements[0] ?? null;
+    const followsActiveDrawing =
+      firstMeasurement && state.currentDocument && state.activeDrawingId === firstMeasurement.drawing_id;
+
     set({
-      activeDimensionGroupId: node.id,
+      activeDimensionGroupId: activeId,
+      selectedGroupIds: selectedIds,
+      groupColours,
+      groupProps,
+      scaleCache,
+      selectedMeasurementId: null,
       activeBreadcrumb: breadcrumb,
       overlayMeasurements: measurements,
-      overlayColour: node.colour ?? "#4A9EFF",
-      activePageIndex:
-        firstMeasurement && state.currentDocument && state.activeDrawingId === firstMeasurement.drawing_id
-          ? firstMeasurement.page_index
-          : state.activePageIndex,
-      activePageNodeId:
-        firstMeasurement && state.currentDocument && state.activeDrawingId === firstMeasurement.drawing_id
-          ? drawingPageNodeId(firstMeasurement.drawing_id, firstMeasurement.page_index)
-          : state.activePageNodeId,
+      overlayColour: (activeId !== null ? groupColours[activeId] : activeNode?.colour) ?? "#4A9EFF",
+      activePageIndex: followsActiveDrawing ? firstMeasurement!.page_index : state.activePageIndex,
+      activePageNodeId: followsActiveDrawing
+        ? drawingPageNodeId(firstMeasurement!.drawing_id, firstMeasurement!.page_index)
+        : state.activePageNodeId,
     });
+  },
+
+  createMeasurement: async (input) => {
+    const state = get();
+    const { activeDimensionGroupId, activeDrawingId, activePageIndex, groupProps, drawPolarity } = state;
+    if (activeDimensionGroupId === null) throw new Error("No active dimension group");
+    if (activeDrawingId === null) throw new Error("No active drawing");
+
+    // The group owns the measurement type; new dimensions take the current draw polarity.
+    const measurementType = input.measurementType ?? groupProps[activeDimensionGroupId]?.measurement_type ?? "length";
+
+    const created = await invoke<MeasurementDto>("create_measurement", {
+      dimensionGroupId: activeDimensionGroupId,
+      drawingId: activeDrawingId,
+      pageIndex: activePageIndex,
+      measurementType,
+      geometryJson: input.geometryJson,
+      polarity: input.polarity ?? drawPolarity,
+      quantity: input.quantity ?? null,
+      uom: input.uom ?? null,
+    });
+
+    set((latest) =>
+      created.dimension_group_id === latest.activeDimensionGroupId
+        ? { overlayMeasurements: [...latest.overlayMeasurements, created] }
+        : {},
+    );
+    return created;
+  },
+
+  deleteMeasurement: async (measurementId) => {
+    await invoke("delete_measurement", { measurementId });
+    set((state) => ({
+      overlayMeasurements: state.overlayMeasurements.filter((measurement) => measurement.id !== measurementId),
+      selectedMeasurementId: state.selectedMeasurementId === measurementId ? null : state.selectedMeasurementId,
+    }));
   },
 
   openDrawing: async (node) => {
     if (!node.file_path) return;
     const document = await invoke<DocumentMeta>("open_document", { path: node.file_path });
-    set({ activeDrawingId: node.id, activePageIndex: 0, activePageNodeId: null, currentDocument: document, vectorCache: {}, vectorIndex: {}, snapPoint: null, snapType: null });
+    set({ activeDrawingId: node.id, activePageIndex: 0, activePageNodeId: null, currentDocument: document, vectorCache: {}, vectorIndex: {}, snapPoint: null, snapType: null, lineSnapResult: null });
     await get().loadVectors(0);
   },
 
@@ -520,6 +910,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
       vectorIndex: documentChanged ? {} : state.vectorIndex,
       snapPoint: null,
       snapType: null,
+      lineSnapResult: null,
     });
     await get().loadVectors(node.sort_order);
   },
@@ -618,5 +1009,134 @@ export const useAppStore = create<AppStore>((set, get) => ({
     set({ snapPoint: null, snapType: null });
   },
 
-  clearSnap: () => set({ snapPoint: null, snapType: null }),
+  resolveLineSnap: (cursorPageX, cursorPageY, pageIndex, radiusPts) => {
+    const index = get().vectorIndex[pageIndex];
+    if (!index) {
+      set({ lineSnapResult: null });
+      return;
+    }
+
+    // Step 1: collect every segment within the snap radius, nearest first. We also keep a
+    // flat list of all segments (the merge and opposite-face search need the whole page).
+    const radiusSq = radiusPts * radiusPts;
+    const allSegs: LineSegment[] = [];
+    const candidates: { seg: LineSegment; distSq: number }[] = [];
+    for (const item of index) {
+      for (const seg of item.segments) {
+        allSegs.push(seg);
+        if (
+          cursorPageX >= item.minX - radiusPts &&
+          cursorPageX <= item.maxX + radiusPts &&
+          cursorPageY >= item.minY - radiusPts &&
+          cursorPageY <= item.maxY + radiusPts
+        ) {
+          const dSq = distanceToSegmentSq(cursorPageX, cursorPageY, seg);
+          if (dSq <= radiusSq) candidates.push({ seg, distSq: dSq });
+        }
+      }
+    }
+
+    if (candidates.length === 0) {
+      set({ lineSnapResult: null });
+      return;
+    }
+    candidates.sort((a, b) => a.distSq - b.distSq);
+
+    // Step 2: choose the seed by *merged run length*, not by raw proximity. The cursor often
+    // lands closest to a tiny facet of a circle/symbol (e.g. a column dot at a junction) whose
+    // run is a fraction of a point; the actual wall is a long collinear run a hair further off.
+    // We consider only candidates within a small distance band of the nearest hit (so a far
+    // parallel wall can't hijack the pick) and take the one whose merged run is longest.
+    const SEED_DIST_BAND = 8; // pts beyond the nearest hit still considered "the same spot"
+    const nearestDist = Math.sqrt(candidates[0].distSq);
+    const bandMaxSq = (nearestDist + SEED_DIST_BAND) * (nearestDist + SEED_DIST_BAND);
+    let S: LineSegment | null = null;
+    let bestRun = -1;
+    for (const cand of candidates) {
+      if (cand.distSq > bandMaxSq) break; // sorted — everything past here is further still
+      const merged = mergeCollinearSegments(cand.seg, allSegs);
+      const run = Math.hypot(merged.x2 - merged.x1, merged.y2 - merged.y1);
+      if (run > bestRun + 1e-6) {
+        bestRun = run;
+        S = merged;
+      }
+    }
+    if (!S) {
+      set({ lineSnapResult: null });
+      return;
+    }
+
+    const dx = S.x2 - S.x1;
+    const dy = S.y2 - S.y1;
+    const lenSq = dx * dx + dy * dy;
+    if (lenSq < 1e-9) {
+      set({ lineSnapResult: null });
+      return;
+    }
+
+    // Step 3: project the cursor onto the merged wall to find which portion is active.
+    const tCursor = ((cursorPageX - S.x1) * dx + (cursorPageY - S.y1) * dy) / lenSq;
+    const len = Math.sqrt(lenSq);
+    const ux = dx / len;
+    const uy = dy / len;
+
+    // Step 4: collect where genuinely *transverse* segments cross the detected wall face S.
+    // We test against S only — NOT a synthesised opposite face. On hatched drawings the
+    // opposite-face search locks onto a hatch line a wall-thickness+ away and injects phantom
+    // crossings (door-swing arcs, hatch ticks) that fragment the wall. A perpendicular wall
+    // that truly butts in crosses S directly at the junction, so S alone is sufficient and far
+    // more robust. Near-parallel segments (the wall's own pieces/faces, and parallel hatching)
+    // are skipped, or their approximately-collinear endpoints would leak in as phantom clips.
+    const crossings: number[] = [];
+    for (const seg of allSegs) {
+      const qdx = seg.x2 - seg.x1;
+      const qdy = seg.y2 - seg.y1;
+      const qlen = Math.hypot(qdx, qdy);
+      if (qlen < 1e-9) continue;
+      const crossMag = Math.abs(ux * qdy - uy * qdx) / qlen;
+      if (crossMag <= COLLINEAR_ANGLE_SIN) continue; // not transverse — ignore
+      const t = infiniteLineSegmentT(S, seg);
+      if (t !== null) crossings.push(t);
+    }
+
+    // Step 5: group crossings into junctions, each kept as a [lo, hi] range. A thick crossing
+    // wall's two faces (and the cluttered corner lines around them) chain into one junction
+    // when within a wall-thickness of each other. Crossings outside (0,1) are discarded — they
+    // come from distant segments cutting the wall's *infinite* extension and would otherwise
+    // place phantom junctions past the wall's physical ends.
+    const onWall = crossings.filter((t) => t > 1e-6 && t < 1 - 1e-6).sort((a, b) => a - b);
+    const clusterTolT = LINE_JUNCTION_CLUSTER_PTS / len;
+    const junctions: { lo: number; hi: number }[] = [];
+    for (const t of onWall) {
+      const last = junctions[junctions.length - 1];
+      if (last && t - last.hi <= clusterTolT) {
+        last.hi = t;
+      } else {
+        junctions.push({ lo: t, hi: t });
+      }
+    }
+
+    // Step 6: bound the bay by the *near face* of the nearest junction on each side of the
+    // cursor (where the cross-wall begins), not the junction centre — so the line ends exactly
+    // where the perpendicular wall meets it. Wall ends bound the bay when no junction does. A
+    // junction straddling the cursor (hovering directly on a cross-wall) is skipped, yielding a
+    // full bay through it rather than a sliver.
+    let tLeft = 0;
+    let tRight = 1;
+    for (const j of junctions) {
+      if (j.hi <= tCursor) {
+        if (j.hi > tLeft) tLeft = j.hi;
+      } else if (j.lo >= tCursor) {
+        if (j.lo < tRight) tRight = j.lo;
+      }
+    }
+    tLeft = Math.max(0, Math.min(tLeft, 1));
+    tRight = Math.max(0, Math.min(tRight, 1));
+
+    const start: SnapPoint = { x: S.x1 + tLeft * dx, y: S.y1 + tLeft * dy };
+    const end: SnapPoint = { x: S.x1 + tRight * dx, y: S.y1 + tRight * dy };
+    set({ lineSnapResult: { start, end } });
+  },
+
+  clearSnap: () => set({ snapPoint: null, snapType: null, lineSnapResult: null }),
 }));

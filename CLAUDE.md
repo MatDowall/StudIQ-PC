@@ -4,7 +4,7 @@ Guidance for Claude Code (and future me) when working in this repository.
 
 ## What this is
 
-**Take-it-Off** — a Windows desktop **PDF takeoff / measurement** application for
+**StudIQ** — a Windows desktop **PDF takeoff / measurement** application for
 construction estimating (measuring quantities off tender drawings). The driving real-world
 test data is a set of architectural PDFs from Cook Brothers tenders (Dunedin).
 
@@ -50,9 +50,11 @@ PDFium and the snap engine use). `ViewerCanvas` converts to screen with `pageToS
 snap points in this space, and `drawOverlays` renders stored measurements through that same
 `pageToScreen` path — so snap indicators and saved geometry share one coordinate space.
 
-**Phase 3 measurement tools must store `geometry_json` as `[{ "x": <pt>, "y": <pt> }, ...]`
-in PDF points, Y-up**, so saved geometry round-trips through snap and overlay with no flip.
-(No `create_measurement` command exists yet; rendering of saved geometry is already wired up.)
+**Measurement tools store `geometry_json` as `[{ "x": <pt>, "y": <pt> }, ...]` in PDF points,
+Y-up**, so saved geometry round-trips through snap and overlay with no flip. Internal canonical
+units are millimetres: page scale is stored as `mm_per_point` (`page_scales` table), and group
+width/height/offset are metres (the unit the properties dialog edits). Quantities are derived
+on the frontend (`src-frontend/src/lib/quantity.ts`), not persisted to `measurements.quantity`.
 
 ## Build & run
 
@@ -61,19 +63,19 @@ The frontend `npm run build` also rebuilds the `pdf_renderer` binary (see packag
 
 ```powershell
 # Frontend build (also builds pdf_renderer in release)
-cd C:\Users\Admin\Documents\Take-it-Off\desktop\src-frontend
+cd C:\Users\Admin\Documents\StudIQ\desktop\src-frontend
 cmd /c npm run build
 
 # Backend build
-cd C:\Users\Admin\Documents\Take-it-Off
+cd C:\Users\Admin\Documents\StudIQ
 cargo build --package desktop
 
 # Full installer (MSI + NSIS) — outputs under target/release/bundle/
-cd C:\Users\Admin\Documents\Take-it-Off\desktop
+cd C:\Users\Admin\Documents\StudIQ\desktop
 cargo tauri build
 
 # Dev mode
-cd C:\Users\Admin\Documents\Take-it-Off\desktop
+cd C:\Users\Admin\Documents\StudIQ\desktop
 cargo tauri dev
 ```
 
@@ -85,20 +87,32 @@ Gotchas observed historically:
 
 ## Project status (as of June 2026)
 
-Complete through **Phase 2**. Working: project create/open (.tcop), drawing register tree,
-dimension-group tree, multi-page PDF view with tiled pan/zoom + preview, vector extraction
-(lines + rects, incl. straight subsegments of compound paths), and the endpoint/midpoint/
-intersection snap engine.
+Complete through **Phase 3**. Working: project create/open (.tcop), drawing register tree,
+dimension-group tree, multi-page PDF view with tiled pan/zoom + preview, vector extraction,
+the endpoint/midpoint/intersection snap engine, and the full CostX-style measurement suite —
+**count / length / area** tools owned by the dimension group, per-drawing-page scale
+calibration, the dimension-group properties dialog with the measurement-type → display
+derivation matrix (length/area/wall area/volume; weight stubbed), positive/negative polarity
+netting, live per-group quantities, CostX styling (bold outlines, circular handles, filled
+areas, ringed-cross count markers, per-polarity colour + line style), and full
+create/select/move/add-vertex/delete-vertex/delete editing with multi-group concurrent
+rendering. See `docs/phase3-completion-report.md`.
 
-**Phase 3 (next, not yet built):** measurement tools (drawing/saving measurements —
-no `create_measurement` command exists yet), scale calibration, quantity calculation.
-Later: perpendicular/nearest-edge/arc snap, snap settings UI, costing/reporting.
+CostX interaction model (authoritative — see `docs/phase3-plan.md`): add-mode is active while a
+group is selected (no tool button); draw is **click-to-place** (right-click/Enter/double-click
+to finish, Ctrl+click resumes from the last point, **middle-drag pans**); Add/Select toggle and
+Positive/Negative toggle live in the viewer toolbar.
+
+**Later (not yet built):** weight computation (needs a density/rate model), project-wide GFA
+roll-up, persisting quantities, per-dimension overrides ("Use Default"), costing/reporting,
+snap settings UI, perpendicular/nearest-edge/arc snap, dimension cutouts.
 
 ## Docs & process
 
 `docs/` holds the phase **prompts** (specs), **handovers** (architecture/state between
 phases), and **completion reports**. The most recent state is
-`docs/phase2-completion-report.md`. This project was developed milestone-by-milestone with
+`docs/phase3-completion-report.md` (plan in `docs/phase3-plan.md`). This project was developed
+milestone-by-milestone with
 explicit verification gates — keep that discipline: implement a milestone, verify it produces
 visible/testable proof, then move on.
 

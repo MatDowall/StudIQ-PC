@@ -1,6 +1,33 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { useAppStore, type SnapPoint, type SnapType } from "../store/appStore";
+import { deriveQuantity, formatQuantity, type GroupProps } from "../lib/quantity";
+import {
+  computeFramingGeometry,
+  computeFramingQuantities,
+  extraStudRect,
+  openingPreview,
+  orthogonalConstrain,
+  parseFramingSettings,
+  parseWallFraming,
+  projectOntoPath,
+  serializeWallFraming,
+  STUD_THICKNESS_MM,
+  type Opening,
+  type OpeningTemplate,
+  type WallFraming,
+} from "../lib/framing";
+import { computeWall3D } from "../lib/framing3d";
+import { ContextMenu } from "./ContextMenu";
+import { OpeningDialog } from "./OpeningDialog";
+import { RakingDialog } from "./RakingDialog";
+import { Framing3DView } from "./Framing3DView";
+
+interface ViewerMenuItem {
+  label: string;
+  action: () => void;
+  danger?: boolean;
+}
 
 const TILE_SIZE = 512;
 
@@ -54,8 +81,10 @@ export interface MeasurementDto {
   page_index: number;
   measurement_type: string;
   geometry_json: string;
+  polarity: number;
   quantity: number | null;
   uom: string | null;
+  framing_json: string | null;
 }
 
 interface ViewerCanvasProps {
@@ -64,6 +93,7 @@ interface ViewerCanvasProps {
   onStatusChange: (status: string) => void;
   overlayMeasurements?: MeasurementDto[];
   overlayColour?: string;
+  groupColours?: Record<number, string>;
 }
 
 function zoomBucket(zoom: number) {
@@ -103,47 +133,389 @@ function pageToScreen(
   };
 }
 
+const MEASURE_LINE_WIDTH = 2.5;
+const VERTEX_RADIUS = 4;
+
+type PagePoint = { x: number; y: number };
+
+/** Shortest distance from point (px,py) to segment (ax,ay)-(bx,by), in the same units. */
+function distanceToSegment(px: number, py: number, ax: number, ay: number, bx: number, by: number) {
+  const dx = bx - ax;
+  const dy = by - ay;
+  const lengthSq = dx * dx + dy * dy;
+  if (lengthSq === 0) return Math.hypot(px - ax, py - ay);
+  const t = Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / lengthSq));
+  return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+}
+
+/** Formats a length in PDF points as real-world units when a page scale exists, else "pt". */
+function formatLength(pts: number, scale: { mm_per_point: number; unit: string } | null) {
+  if (!scale) return `${pts.toFixed(0)} pt`;
+  const mm = pts * scale.mm_per_point;
+  if (scale.unit === "m") return `${(mm / 1000).toFixed(3)} m`;
+  if (scale.unit === "cm") return `${(mm / 10).toFixed(1)} cm`;
+  return `${mm.toFixed(0)} mm`;
+}
+
+/** Total polyline length in PDF points. */
+function pathLengthPts(points: PagePoint[]) {
+  let total = 0;
+  for (let i = 1; i < points.length; i += 1) {
+    total += Math.hypot(points[i].x - points[i - 1].x, points[i].y - points[i - 1].y);
+  }
+  return total;
+}
+
+// Length and timber-framing dimensions are open polylines; area-type displays close into a
+// polygon; count is a point set. Centralised so every hit-test/render agrees.
+function isAreaType(measurementType: string) {
+  return measurementType !== "length" && measurementType !== "count" && measurementType !== "timber_framing";
+}
+
+/** Canvas dash pattern for a CostX line style. */
+function lineDash(style: string | undefined): number[] {
+  switch (style) {
+    case "dashed":
+      return [9, 6];
+    case "dotted":
+      return [2, 5];
+    case "dash_dot":
+      return [9, 5, 2, 5];
+    default:
+      return [];
+  }
+}
+
+/** Count marker: a ringed cross at a point (CostX count style). */
+function drawCountMarker(ctx: CanvasRenderingContext2D, x: number, y: number, colour: string, selected = false) {
+  const r = selected ? 8 : 6;
+  ctx.save();
+  ctx.strokeStyle = colour;
+  ctx.lineWidth = selected ? 3 : 2;
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(x - r, y);
+  ctx.lineTo(x + r, y);
+  ctx.moveTo(x, y - r);
+  ctx.lineTo(x, y + r);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawVertices(ctx: CanvasRenderingContext2D, screenPts: PagePoint[], colour: string, selected = false) {
+  // Selected dimensions show larger hollow handles to signal they are draggable.
+  const radius = selected ? VERTEX_RADIUS + 2 : VERTEX_RADIUS;
+  ctx.lineWidth = selected ? 2 : 1.5;
+  for (const point of screenPts) {
+    ctx.beginPath();
+    ctx.arc(point.x, point.y, radius, 0, Math.PI * 2);
+    ctx.fillStyle = selected ? "#ffffff" : colour;
+    ctx.strokeStyle = selected ? colour : "#ffffff";
+    ctx.fill();
+    ctx.stroke();
+  }
+}
+
+// Renders one timber-framing wall: the two plate outlines plus studs (each a rectangle with a
+// corner-to-corner cross, transparent fill, solid same-colour outline — the architectural stud
+// symbol). Geometry is computed in PDF points and projected through pageToScreen. With no page
+// scale the members can't be sized, so we fall back to drawing the bare centre path.
+function drawFraming(
+  ctx: CanvasRenderingContext2D,
+  points: PagePoint[],
+  settings: ReturnType<typeof parseFramingSettings>,
+  mmPerPoint: number | null,
+  colour: string,
+  style: string | undefined,
+  pan: { x: number; y: number },
+  zoom: number,
+  page: PageMeta,
+  selected: boolean,
+  showVertices: boolean,
+  framing?: WallFraming,
+) {
+  const toScreen = (p: PagePoint) => pageToScreen(p.x, p.y, page.height_pts, pan, zoom);
+  const geom = computeFramingGeometry(points, settings, mmPerPoint, framing);
+
+  ctx.save();
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round";
+
+  if (geom.studs.length === 0) {
+    // No scale (or degenerate path) — show the centre path so the wall is still visible.
+    if (points.length >= 2) {
+      const sp = points.map(toScreen);
+      ctx.strokeStyle = colour;
+      ctx.lineWidth = selected ? MEASURE_LINE_WIDTH + 1 : MEASURE_LINE_WIDTH;
+      ctx.setLineDash(lineDash(style));
+      ctx.beginPath();
+      ctx.moveTo(sp[0].x, sp[0].y);
+      for (const s of sp.slice(1)) ctx.lineTo(s.x, s.y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    if (showVertices || selected) drawVertices(ctx, points.map(toScreen), colour, selected);
+    ctx.restore();
+    return;
+  }
+
+  // Plate outlines — solid, but the section spanning a door/window opening is drawn as a thin
+  // dashed line so the opening reads clearly. Build per-path-segment opening arc-length ranges.
+  const baseWidth = selected ? MEASURE_LINE_WIDTH + 1 : MEASURE_LINE_WIDTH;
+  // The dashed span covers the whole opening assembly (king-to-king), so the solid plate stops
+  // outside the kings rather than running over the jamb studs.
+  const segRanges: { lo: number; hi: number }[][] = points.map(() => []);
+  if (mmPerPoint) {
+    const jambPts = 2 * (STUD_THICKNESS_MM / mmPerPoint); // trimmer + king on each side
+    for (const o of framing?.openings ?? []) {
+      const c = o.centreMm / mmPerPoint;
+      const h = o.daylightWidthMm / mmPerPoint / 2 + jambPts;
+      if (segRanges[o.segmentIndex]) segRanges[o.segmentIndex].push({ lo: c - h, hi: c + h });
+    }
+  }
+  ctx.strokeStyle = colour;
+  ctx.lineCap = "butt"; // plate breaks end exactly at the opening edge (no round-cap overshoot)
+  for (const edge of [geom.plateLeft, geom.plateRight]) {
+    if (edge.length < 2) continue;
+    for (let i = 0; i < edge.length - 1; i += 1) {
+      const a = edge[i];
+      const b = edge[i + 1];
+      const segLen = Math.hypot(points[i + 1].x - points[i].x, points[i + 1].y - points[i].y) || 1;
+      const ranges = (segRanges[i] ?? [])
+        .filter((r) => r.hi > 0 && r.lo < segLen)
+        .map((r) => ({ lo: Math.max(0, r.lo) / segLen, hi: Math.min(segLen, r.hi) / segLen }))
+        .sort((x, y) => x.lo - y.lo);
+      const lerp = (t: number) => toScreen({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
+      const stroke = (t0: number, t1: number, dashed: boolean) => {
+        if (t1 - t0 < 1e-6) return;
+        const p0 = lerp(t0);
+        const p1 = lerp(t1);
+        ctx.setLineDash(dashed ? [5, 4] : lineDash(style));
+        ctx.lineWidth = dashed ? 1 : baseWidth;
+        ctx.beginPath();
+        ctx.moveTo(p0.x, p0.y);
+        ctx.lineTo(p1.x, p1.y);
+        ctx.stroke();
+      };
+      let t = 0;
+      for (const r of ranges) {
+        stroke(t, r.lo, false);
+        stroke(r.lo, r.hi, true);
+        t = r.hi;
+      }
+      stroke(t, 1, false);
+    }
+  }
+  ctx.setLineDash([]);
+  ctx.lineCap = "round";
+
+  // Studs.
+  ctx.lineWidth = selected ? 1.8 : 1.3;
+  for (const stud of geom.studs) {
+    const c = stud.map(toScreen);
+    ctx.beginPath();
+    ctx.moveTo(c[0].x, c[0].y);
+    ctx.lineTo(c[1].x, c[1].y);
+    ctx.lineTo(c[2].x, c[2].y);
+    ctx.lineTo(c[3].x, c[3].y);
+    ctx.closePath();
+    ctx.fillStyle = `${colour}22`;
+    ctx.fill();
+    ctx.strokeStyle = colour;
+    ctx.stroke();
+    // Corner-to-corner cross (architectural stud symbol).
+    ctx.beginPath();
+    ctx.moveTo(c[0].x, c[0].y);
+    ctx.lineTo(c[2].x, c[2].y);
+    ctx.moveTo(c[1].x, c[1].y);
+    ctx.lineTo(c[3].x, c[3].y);
+    ctx.stroke();
+  }
+
+  // Raked segments get a small plan label (the rake isn't visible in plan, but the heights matter).
+  for (const rake of framing?.rakes ?? []) {
+    const a = points[rake.segmentIndex];
+    const b = points[rake.segmentIndex + 1];
+    if (!a || !b) continue;
+    const m = toScreen({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
+    ctx.save();
+    ctx.fillStyle = colour;
+    ctx.font = "10px Segoe UI, sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText(`⟋ ${Math.round(rake.startMm)}→${Math.round(rake.endMm)}`, m.x, m.y - 8);
+    ctx.restore();
+  }
+
+  // Windows get a glass centreline through the opening (the standard plan symbol).
+  for (const opening of geom.openings) {
+    if (opening.kind !== "window") continue;
+    const d = opening.daylight.map(toScreen);
+    const mid = (p: { x: number; y: number }, q: { x: number; y: number }) => ({ x: (p.x + q.x) / 2, y: (p.y + q.y) / 2 });
+    const a = mid(d[0], d[3]);
+    const b = mid(d[1], d[2]);
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = colour;
+    ctx.stroke();
+  }
+
+  if (showVertices || selected) drawVertices(ctx, points.map(toScreen), colour, selected);
+  ctx.restore();
+}
+
 // Measurement geometry is stored in `geometry_json` as PDF points with a
 // Y-up, bottom-left origin — the same convention the snap engine produces
 // (see resolveSnap / scheduleSnapResolution). Render it through pageToScreen
 // so overlays and snap indicators stay in the same coordinate space.
+// CostX styling: bold coloured outline, filled fill for closed (area) types,
+// and filled circular vertex handles.
 function drawOverlays(
   ctx: CanvasRenderingContext2D,
   measurements: MeasurementDto[],
-  colour: string,
+  groupColours: Record<number, string>,
+  groupProps: Record<number, GroupProps>,
+  fallbackColour: string,
   pan: { x: number; y: number },
   zoom: number,
   page: PageMeta,
   pageIndex: number,
+  selectedId: number | null,
+  editPreview: { id: number; points: PagePoint[] } | null,
+  mmPerPoint: number | null,
 ) {
   const pageMeasurements = measurements.filter((measurement) => measurement.page_index === pageIndex);
   if (pageMeasurements.length === 0) return;
 
-  ctx.fillStyle = `${colour}55`;
-  ctx.strokeStyle = colour;
-  ctx.lineWidth = 2;
+  ctx.save();
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round";
 
   for (const measurement of pageMeasurements) {
-    let points: { x: number; y: number }[];
-    try {
-      points = JSON.parse(measurement.geometry_json);
-    } catch {
+    let points: PagePoint[];
+    if (editPreview && editPreview.id === measurement.id) {
+      points = editPreview.points;
+    } else {
+      try {
+        points = JSON.parse(measurement.geometry_json);
+      } catch {
+        continue;
+      }
+    }
+
+    if (!Array.isArray(points) || points.length < 1) continue;
+
+    // Negative dimensions render in the group's negative colour/style; positive in its colour.
+    const props = groupProps[measurement.dimension_group_id];
+    const negative = (measurement.polarity ?? 1) < 0;
+    const colour = negative
+      ? props?.neg_colour ?? "#FF0000"
+      : groupColours[measurement.dimension_group_id] ?? props?.pos_colour ?? fallbackColour;
+    const style = negative ? props?.neg_style : props?.pos_style;
+    const selected = measurement.id === selectedId;
+
+    // Count dimensions are point markers, not paths.
+    if (measurement.measurement_type === "count") {
+      for (const point of points) {
+        const s = pageToScreen(point.x, point.y, page.height_pts, pan, zoom);
+        drawCountMarker(ctx, s.x, s.y, colour, selected);
+      }
       continue;
     }
 
-    if (!Array.isArray(points) || points.length < 2) continue;
+    // Timber-framing walls render as plates + studs (+ any openings), not a bare polyline.
+    if (measurement.measurement_type === "timber_framing") {
+      const settings = parseFramingSettings(props?.framing_props_json ?? null);
+      const wallFraming = parseWallFraming(measurement.framing_json);
+      drawFraming(ctx, points, settings, mmPerPoint, colour, style, pan, zoom, page, selected, false, wallFraming);
+      continue;
+    }
 
-    const first = pageToScreen(points[0].x, points[0].y, page.height_pts, pan, zoom);
+    if (points.length < 2) continue;
+    // "length"/"timber_framing"/"count" are open; everything else closes into an area.
+    const isArea = isAreaType(measurement.measurement_type);
+    const screenPts = points.map((point) => pageToScreen(point.x, point.y, page.height_pts, pan, zoom));
+
+    ctx.strokeStyle = colour;
+    ctx.lineWidth = selected ? MEASURE_LINE_WIDTH + 1.5 : MEASURE_LINE_WIDTH;
+    ctx.setLineDash(lineDash(style));
     ctx.beginPath();
-    ctx.moveTo(first.x, first.y);
-    for (const point of points.slice(1)) {
-      const screen = pageToScreen(point.x, point.y, page.height_pts, pan, zoom);
+    ctx.moveTo(screenPts[0].x, screenPts[0].y);
+    for (const screen of screenPts.slice(1)) {
       ctx.lineTo(screen.x, screen.y);
     }
+    if (isArea) {
+      ctx.closePath();
+      ctx.fillStyle = `${colour}33`;
+      ctx.fill();
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    drawVertices(ctx, screenPts, colour, selected);
+  }
+
+  ctx.restore();
+}
+
+/** Renders the in-progress path: committed draft vertices + a live rubber-band to the
+ *  cursor. When `closed` (area draw), the polygon closes and fills as a preview. */
+function drawDraft(
+  ctx: CanvasRenderingContext2D,
+  draftPoints: PagePoint[],
+  livePoint: PagePoint | null,
+  colour: string,
+  pan: { x: number; y: number },
+  zoom: number,
+  page: PageMeta,
+  style?: string,
+  closed = false,
+) {
+  if (draftPoints.length === 0) return;
+
+  const pathPoints = livePoint ? [...draftPoints, livePoint] : draftPoints;
+  const screenPts = pathPoints.map((point) => pageToScreen(point.x, point.y, page.height_pts, pan, zoom));
+
+  ctx.save();
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round";
+  ctx.strokeStyle = colour;
+  ctx.lineWidth = MEASURE_LINE_WIDTH;
+  ctx.setLineDash(lineDash(style));
+  ctx.beginPath();
+  ctx.moveTo(screenPts[0].x, screenPts[0].y);
+  for (const screen of screenPts.slice(1)) {
+    ctx.lineTo(screen.x, screen.y);
+  }
+  if (closed && screenPts.length >= 3) {
     ctx.closePath();
+    ctx.fillStyle = `${colour}33`;
+    ctx.fill();
+  }
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Placed vertices are filled; the live endpoint (following the cursor) is hollow.
+  const placedCount = draftPoints.length;
+  ctx.lineWidth = 1.5;
+  for (let i = 0; i < screenPts.length; i += 1) {
+    const isLive = livePoint !== null && i >= placedCount;
+    ctx.beginPath();
+    ctx.arc(screenPts[i].x, screenPts[i].y, VERTEX_RADIUS, 0, Math.PI * 2);
+    if (isLive) {
+      ctx.fillStyle = "#ffffff";
+      ctx.strokeStyle = colour;
+    } else {
+      ctx.fillStyle = colour;
+      ctx.strokeStyle = "#ffffff";
+    }
     ctx.fill();
     ctx.stroke();
   }
+  ctx.restore();
 }
 
 function drawSnapIndicator(
@@ -182,13 +554,185 @@ function drawSnapIndicator(
   ctx.restore();
 }
 
-export function ViewerCanvas({ doc, pageIndex, onStatusChange, overlayMeasurements = [], overlayColour = "#4A9EFF" }: ViewerCanvasProps) {
+/** Draws the line-mode proposed measurement: a bold coloured segment with endpoint dots. */
+function drawLineSnapPreview(
+  ctx: CanvasRenderingContext2D,
+  start: SnapPoint,
+  end: SnapPoint,
+  colour: string,
+  pan: { x: number; y: number },
+  zoom: number,
+  page: PageMeta,
+) {
+  const a = pageToScreen(start.x, start.y, page.height_pts, pan, zoom);
+  const b = pageToScreen(end.x, end.y, page.height_pts, pan, zoom);
+  ctx.save();
+  ctx.strokeStyle = colour;
+  ctx.lineWidth = MEASURE_LINE_WIDTH + 1;
+  ctx.globalAlpha = 0.85;
+  ctx.beginPath();
+  ctx.moveTo(a.x, a.y);
+  ctx.lineTo(b.x, b.y);
+  ctx.stroke();
+  // Endpoint diamonds as snap indicators.
+  ctx.strokeStyle = "#FFD700";
+  ctx.lineWidth = 2;
+  ctx.globalAlpha = 1;
+  for (const pt of [a, b]) {
+    ctx.strokeRect(pt.x - 5, pt.y - 5, 10, 10);
+  }
+  ctx.restore();
+}
+
+type ScaleUnit = "mm" | "cm" | "m";
+
+/** Prompts for the real-world length of a drawn calibration line, then reports it in mm. */
+function CalibrationDialog({
+  pixelLength,
+  onConfirm,
+  onCancel,
+}: {
+  pixelLength: number;
+  onConfirm: (realMm: number, unit: ScaleUnit) => void;
+  onCancel: () => void;
+}) {
+  const [value, setValue] = useState("");
+  const [unit, setUnit] = useState<ScaleUnit>("m");
+
+  function confirm() {
+    const numeric = Number.parseFloat(value);
+    if (!Number.isFinite(numeric) || numeric <= 0) return;
+    const mm = unit === "m" ? numeric * 1000 : unit === "cm" ? numeric * 10 : numeric;
+    onConfirm(mm, unit);
+  }
+
+  return (
+    <div
+      style={{
+        position: "absolute",
+        inset: 0,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        background: "rgba(0,0,0,0.4)",
+        zIndex: 20,
+      }}
+    >
+      <div
+        style={{
+          width: 300,
+          padding: 16,
+          background: "#23262b",
+          color: "#e8e8e8",
+          border: "1px solid #3c4048",
+          borderRadius: 4,
+          fontFamily: "Segoe UI, sans-serif",
+          fontSize: 12,
+        }}
+      >
+        <div style={{ fontSize: 13, marginBottom: 10 }}>Set page scale</div>
+        <div style={{ color: "#9aa0aa", marginBottom: 12 }}>
+          Enter the real-world length of the line you drew ({pixelLength.toFixed(1)} pt).
+        </div>
+        <div style={{ display: "flex", gap: 6, marginBottom: 14 }}>
+          <input
+            autoFocus
+            type="number"
+            value={value}
+            onChange={(event) => setValue(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") confirm();
+              if (event.key === "Escape") onCancel();
+            }}
+            placeholder="e.g. 2.5"
+            style={{
+              flex: 1,
+              height: 28,
+              padding: "0 8px",
+              background: "#15171a",
+              color: "#e8e8e8",
+              border: "1px solid #3c4048",
+              borderRadius: 3,
+            }}
+          />
+          <select
+            value={unit}
+            onChange={(event) => setUnit(event.target.value as ScaleUnit)}
+            style={{
+              height: 28,
+              padding: "0 6px",
+              background: "#15171a",
+              color: "#e8e8e8",
+              border: "1px solid #3c4048",
+              borderRadius: 3,
+            }}
+          >
+            <option value="mm">mm</option>
+            <option value="cm">cm</option>
+            <option value="m">m</option>
+          </select>
+        </div>
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+          <button
+            onClick={onCancel}
+            style={{ height: 26, padding: "0 12px", background: "#2b2d31", color: "#e8e8e8", border: "1px solid #3c4048", borderRadius: 3, cursor: "pointer" }}
+          >
+            Cancel
+          </button>
+          <button
+            onClick={confirm}
+            style={{ height: 26, padding: "0 12px", background: "#4A9EFF", color: "#fff", border: "none", borderRadius: 3, cursor: "pointer" }}
+          >
+            Set Scale
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export function ViewerCanvas({
+  doc,
+  pageIndex,
+  onStatusChange,
+  overlayMeasurements = [],
+  overlayColour = "#4A9EFF",
+  groupColours = {},
+}: ViewerCanvasProps) {
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [viewportSize, setViewportSize] = useState({ width: 1, height: 1 });
   const [tiles, setTiles] = useState<Map<string, TileData>>(new Map());
   const [previews, setPreviews] = useState<Map<number, PreviewData>>(new Map());
   const [imageVersion, setImageVersion] = useState(0);
+
+  // --- Linear measure tool (M2) ---
+  const [draftPoints, setDraftPoints] = useState<PagePoint[]>([]);
+  const [cursorPagePoint, setCursorPagePoint] = useState<PagePoint | null>(null);
+  const [cursorClient, setCursorClient] = useState<{ x: number; y: number } | null>(null);
+  const [hoverInfo, setHoverInfo] = useState<{ x: number; y: number; text: string } | null>(null);
+  // Live geometry of the dimension whose vertex is being dragged (select mode).
+  const [editPreview, setEditPreview] = useState<{ id: number; points: PagePoint[] } | null>(null);
+  const [viewerMenu, setViewerMenu] = useState<{ x: number; y: number; items: ViewerMenuItem[] } | null>(null);
+  // Live ghost position while placing a door/window opening (select the wall + arc-length).
+  const [openingGhost, setOpeningGhost] = useState<{ measurementId: number; segmentIndex: number; centreMm: number } | null>(null);
+  // Right-click → Door options: the opening being edited in place.
+  const [pendingOpeningEdit, setPendingOpeningEdit] = useState<{ measurementId: number; index: number; template: OpeningTemplate } | null>(null);
+  // Right-click → Set Raking Frame: the segment being raked.
+  const [pendingRake, setPendingRake] = useState<{ measurementId: number; segmentIndex: number; start: number; end: number } | null>(null);
+  // Ctrl-hover (select mode): ghost position for a manually-placed extra stud.
+  const [studGhost, setStudGhost] = useState<{ measurementId: number; segmentIndex: number; centreMm: number } | null>(null);
+  // Right-click → View wall in 3D: the wall shown in the isolated 3D modal.
+  const [wall3dId, setWall3dId] = useState<number | null>(null);
+  const vertexDragRef = useRef<{ measurementId: number; vertexIndex: number } | null>(null);
+  const draftPointsRef = useRef<PagePoint[]>([]);
+  // Scale-calibration capture: up to two clicked points, then the length dialog.
+  const [calibPoints, setCalibPoints] = useState<PagePoint[]>([]);
+  const [calibDialog, setCalibDialog] = useState<{ pixelLength: number } | null>(null);
+  const calibPointsRef = useRef<PagePoint[]>([]);
+  // Last placed vertex on this page; lets Ctrl+click resume a path even after the
+  // previous dimension was committed (CostX behaviour).
+  const lastEndpointRef = useRef<PagePoint | null>(null);
 
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -201,14 +745,140 @@ export function ViewerCanvas({ doc, pageIndex, onStatusChange, overlayMeasuremen
 
   const snapPoint = useAppStore((state) => state.snapPoint);
   const snapType = useAppStore((state) => state.snapType);
+  const drawingType = useAppStore((state) => state.drawingType);
+  const lineSnapResult = useAppStore((state) => state.lineSnapResult);
   const loadVectors = useAppStore((state) => state.loadVectors);
   const resolveSnap = useAppStore((state) => state.resolveSnap);
+  const resolveLineSnap = useAppStore((state) => state.resolveLineSnap);
   const clearSnap = useAppStore((state) => state.clearSnap);
+  const createMeasurement = useAppStore((state) => state.createMeasurement);
+  const updateMeasurementGeometry = useAppStore((state) => state.updateMeasurementGeometry);
+  const updateMeasurementFraming = useAppStore((state) => state.updateMeasurementFraming);
+  const deleteMeasurement = useAppStore((state) => state.deleteMeasurement);
+  const openingPlacement = useAppStore((state) => state.openingPlacement);
+  const setOpeningPlacement = useAppStore((state) => state.setOpeningPlacement);
+  const activeDimensionGroupId = useAppStore((state) => state.activeDimensionGroupId);
+  const activeDrawingId = useAppStore((state) => state.activeDrawingId);
+  const viewerMode = useAppStore((state) => state.viewerMode);
+  const selectedMeasurementId = useAppStore((state) => state.selectedMeasurementId);
+  const selectMeasurement = useAppStore((state) => state.selectMeasurement);
+  const pageScale = useAppStore((state) => state.pageScale);
+  const calibrating = useAppStore((state) => state.calibrating);
+  const setCalibrating = useAppStore((state) => state.setCalibrating);
+  const setPageScale = useAppStore((state) => state.setPageScale);
+  const loadPageScale = useAppStore((state) => state.loadPageScale);
+  const groupProps = useAppStore((state) => state.groupProps);
+  const drawPolarity = useAppStore((state) => state.drawPolarity);
+
+  // Colour/style the in-progress draft takes from the active group + current polarity.
+  const activeProps = activeDimensionGroupId !== null ? groupProps[activeDimensionGroupId] : undefined;
+  const draftNegative = drawPolarity < 0;
+  const draftColour = draftNegative ? activeProps?.neg_colour ?? "#FF0000" : overlayColour;
+  const draftStyle = draftNegative ? activeProps?.neg_style : activeProps?.pos_style;
+  // Area groups draw closed polygons (≥3 vertices); count groups place single-click markers.
+  const drawingArea = activeProps?.measurement_type === "area";
+  const drawingCount = activeProps?.measurement_type === "count";
+  const drawingFraming = activeProps?.measurement_type === "timber_framing";
 
   const page = doc?.pages[pageIndex] ?? null;
+  // Add-mode is active when a dimension group is selected, a page is open, and the
+  // viewer isn't in select/edit or scale-calibration mode.
+  // Opening placement overrides add/select while active.
+  const measuring = viewerMode === "add" && activeDimensionGroupId !== null && page !== null && !calibrating && !openingPlacement;
+  const selectMode = viewerMode === "select" && page !== null && !calibrating && !openingPlacement;
   const preview = previews.get(pageIndex) ?? null;
   const pageSize = useMemo(() => (page ? pagePixelSize(page, zoom) : { width: 0, height: 0 }), [page, zoom]);
   const activeZoomBucket = zoomBucket(zoom);
+
+  // Update draft vertices through one helper so the ref (read synchronously by
+  // pointer/keyboard handlers) and the state (drives rendering) never diverge —
+  // a plain mirror effect can lag within a single double-click burst.
+  const applyDraft = useCallback((updater: PagePoint[] | ((prev: PagePoint[]) => PagePoint[])) => {
+    const next = typeof updater === "function" ? updater(draftPointsRef.current) : updater;
+    draftPointsRef.current = next;
+    setDraftPoints(next);
+  }, []);
+
+  // Abandon any in-progress path when add-mode ends.
+  useEffect(() => {
+    if (!measuring) {
+      applyDraft([]);
+      lastEndpointRef.current = null;
+    }
+  }, [measuring, applyDraft]);
+
+  // A fresh page has no in-progress path or resumable endpoint.
+  useEffect(() => {
+    applyDraft([]);
+    lastEndpointRef.current = null;
+    setHoverInfo(null);
+  }, [pageIndex, doc?.path, applyDraft]);
+
+  // Load the scale for whichever drawing page is in view.
+  useEffect(() => {
+    if (activeDrawingId === null || !page) return;
+    void loadPageScale(activeDrawingId, pageIndex);
+  }, [activeDrawingId, pageIndex, page, loadPageScale]);
+
+  const applyCalib = useCallback((points: PagePoint[]) => {
+    calibPointsRef.current = points;
+    setCalibPoints(points);
+  }, []);
+
+  // Reset the calibration capture whenever it is started or stopped.
+  useEffect(() => {
+    applyCalib([]);
+    setCalibDialog(null);
+  }, [calibrating, pageIndex, doc?.path, applyCalib]);
+
+  // Screen (client) coords → page point in PDF points, Y-up.
+  const clientToPagePoint = useCallback(
+    (clientX: number, clientY: number): PagePoint | null => {
+      const element = viewportRef.current;
+      if (!element || !page) return null;
+      const rect = element.getBoundingClientRect();
+      const scale = (zoom * 96) / 72;
+      return {
+        x: (clientX - rect.left + pan.x) / scale,
+        y: page.height_pts - (clientY - rect.top + pan.y) / scale,
+      };
+    },
+    [page, pan.x, pan.y, zoom],
+  );
+
+  // The point to commit at a click: snap target if one is live, else the raw cursor.
+  const placementPoint = useCallback(
+    (clientX: number, clientY: number): PagePoint | null => {
+      const snap = useAppStore.getState().snapPoint;
+      return snap ?? clientToPagePoint(clientX, clientY);
+    },
+    [clientToPagePoint],
+  );
+
+  const commitDraft = useCallback(
+    async (points: PagePoint[]) => {
+      // Drop consecutive duplicate vertices (e.g. a click that lands on the last point).
+      const cleaned = points.filter(
+        (point, index) => index === 0 || Math.hypot(point.x - points[index - 1].x, point.y - points[index - 1].y) > 1e-6,
+      );
+      // Areas need ≥3 vertices to enclose a region; lines need ≥2.
+      const minPoints = drawingArea ? 3 : 2;
+      if (cleaned.length < minPoints) {
+        if (cleaned.length >= 1) onStatusChange(drawingArea ? "An area needs at least 3 points" : "A line needs at least 2 points");
+        return;
+      }
+      // Remember the path's end so Ctrl+click can resume from it after commit.
+      lastEndpointRef.current = cleaned[cleaned.length - 1];
+      try {
+        // The active group's measurement type and the current draw polarity are applied
+        // in the store; here we only supply the geometry.
+        await createMeasurement({ geometryJson: JSON.stringify(cleaned) });
+      } catch (error) {
+        onStatusChange(`ERROR: ${error}`);
+      }
+    },
+    [createMeasurement, onStatusChange, drawingArea],
+  );
 
   const mergeTiles = useCallback((incoming: TileData[]) => {
     if (incoming.length === 0) return;
@@ -473,10 +1143,109 @@ export function ViewerCanvas({ doc, pageIndex, onStatusChange, overlayMeasuremen
     ctx.beginPath();
     ctx.rect(-pan.x, -pan.y, pageSize.width, pageSize.height);
     ctx.clip();
-    drawOverlays(ctx, overlayMeasurements, overlayColour, pan, zoom, page, pageIndex);
-    drawSnapIndicator(ctx, snapPoint, snapType, pan, zoom, page);
+    drawOverlays(ctx, overlayMeasurements, groupColours, groupProps, overlayColour, pan, zoom, page, pageIndex, selectedMeasurementId, editPreview, pageScale?.mm_per_point ?? null);
+    if (measuring) {
+      if (drawingType === "line") {
+        // Line mode: draw the detected wall segment as the live preview instead of a rubber-band.
+        if (lineSnapResult) {
+          drawLineSnapPreview(ctx, lineSnapResult.start, lineSnapResult.end, draftColour, pan, zoom, page);
+        }
+      } else if (drawingFraming) {
+        // Framing: preview plates + studs live as the wall is drawn (incl. the rubber-band point),
+        // with the live segment constrained to 90° off the previous one.
+        const rawLive = snapPoint ?? cursorPagePoint;
+        const livePoint = rawLive ? orthogonalConstrain(draftPoints, rawLive) : rawLive;
+        const draftPath = livePoint ? [...draftPoints, livePoint] : draftPoints;
+        const settings = parseFramingSettings(activeProps?.framing_props_json ?? null);
+        drawFraming(ctx, draftPath, settings, pageScale?.mm_per_point ?? null, draftColour, draftStyle, pan, zoom, page, false, true);
+      } else {
+        const livePoint = snapPoint ?? cursorPagePoint;
+        drawDraft(ctx, draftPoints, livePoint, draftColour, pan, zoom, page, draftStyle, drawingArea);
+      }
+    }
+    if (calibrating) {
+      // The calibration line is drawn in a distinct colour to set it apart from dimensions.
+      const livePoint = calibDialog ? null : snapPoint ?? cursorPagePoint;
+      drawDraft(ctx, calibPoints, livePoint, "#FFD700", pan, zoom, page);
+    }
+    // Door/window placement ghost: the opening's daylight gap + jamb studs on the hovered wall.
+    if (openingPlacement && openingGhost) {
+      const measurement = overlayMeasurements.find((m) => m.id === openingGhost.measurementId);
+      let ghostPts: PagePoint[] | null = null;
+      try {
+        ghostPts = measurement ? JSON.parse(measurement.geometry_json) : null;
+      } catch {
+        ghostPts = null;
+      }
+      if (measurement && Array.isArray(ghostPts)) {
+        const settings = parseFramingSettings(groupProps[measurement.dimension_group_id]?.framing_props_json ?? null);
+        const ghostOpening = { ...openingPlacement, segmentIndex: openingGhost.segmentIndex, centreMm: openingGhost.centreMm };
+        const preview = openingPreview(ghostPts, settings, pageScale?.mm_per_point ?? null, ghostOpening);
+        if (preview) {
+          ctx.save();
+          const ghostColour = "#FFD700";
+          ctx.strokeStyle = ghostColour;
+          ctx.lineWidth = 1.5;
+          const dl = preview.daylight.map((p) => pageToScreen(p.x, p.y, page.height_pts, pan, zoom));
+          ctx.beginPath();
+          ctx.moveTo(dl[0].x, dl[0].y);
+          for (const s of dl.slice(1)) ctx.lineTo(s.x, s.y);
+          ctx.closePath();
+          ctx.fillStyle = `${ghostColour}33`;
+          ctx.fill();
+          ctx.stroke();
+          for (const jamb of preview.jambs) {
+            const c = jamb.map((p) => pageToScreen(p.x, p.y, page.height_pts, pan, zoom));
+            ctx.beginPath();
+            ctx.moveTo(c[0].x, c[0].y);
+            for (const s of c.slice(1)) ctx.lineTo(s.x, s.y);
+            ctx.closePath();
+            ctx.stroke();
+          }
+          ctx.restore();
+        }
+      }
+    }
+    // Extra-stud ghost (select mode + Ctrl): a single stud aligned to the hovered wall.
+    if (studGhost) {
+      const measurement = overlayMeasurements.find((m) => m.id === studGhost.measurementId);
+      let pts: PagePoint[] | null = null;
+      try {
+        pts = measurement ? JSON.parse(measurement.geometry_json) : null;
+      } catch {
+        pts = null;
+      }
+      if (measurement && Array.isArray(pts)) {
+        const settings = parseFramingSettings(groupProps[measurement.dimension_group_id]?.framing_props_json ?? null);
+        const rect = extraStudRect(pts, settings, pageScale?.mm_per_point ?? null, studGhost.segmentIndex, studGhost.centreMm);
+        if (rect) {
+          const c = rect.map((p) => pageToScreen(p.x, p.y, page.height_pts, pan, zoom));
+          ctx.save();
+          ctx.beginPath();
+          ctx.moveTo(c[0].x, c[0].y);
+          for (const s of c.slice(1)) ctx.lineTo(s.x, s.y);
+          ctx.closePath();
+          ctx.fillStyle = "#FFD70033";
+          ctx.fill();
+          ctx.strokeStyle = "#FFD700";
+          ctx.lineWidth = 1.5;
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.moveTo(c[0].x, c[0].y);
+          ctx.lineTo(c[2].x, c[2].y);
+          ctx.moveTo(c[1].x, c[1].y);
+          ctx.lineTo(c[3].x, c[3].y);
+          ctx.stroke();
+          ctx.restore();
+        }
+      }
+    }
+    // Show the point-snap indicator only in point mode; line mode uses the segment preview.
+    if (drawingType !== "line") {
+      drawSnapIndicator(ctx, snapPoint, snapType, pan, zoom, page);
+    }
     ctx.restore();
-  }, [doc, overlayColour, overlayMeasurements, page, pageIndex, pageSize.height, pageSize.width, pan, snapPoint, snapType, viewportSize.height, viewportSize.width, zoom]);
+  }, [activeProps, calibDialog, calibPoints, calibrating, cursorPagePoint, doc, draftColour, draftPoints, draftStyle, drawingArea, drawingFraming, drawingType, editPreview, groupColours, groupProps, lineSnapResult, measuring, openingGhost, openingPlacement, overlayColour, overlayMeasurements, page, pageIndex, pageScale, pageSize.height, pageSize.width, pan, selectedMeasurementId, snapPoint, snapType, studGhost, viewportSize.height, viewportSize.width, zoom]);
 
   function clampPan(nextPan: { x: number; y: number }, nextZoom = zoom) {
     if (!page) return nextPan;
@@ -487,8 +1256,8 @@ export function ViewerCanvas({ doc, pageIndex, onStatusChange, overlayMeasuremen
     };
   }
 
-  function handlePointerDown(event: React.PointerEvent<HTMLDivElement>) {
-    if (!doc) return;
+  function startPan(event: React.PointerEvent<HTMLDivElement>) {
+    event.preventDefault();
     event.currentTarget.setPointerCapture(event.pointerId);
     dragRef.current = {
       pointerId: event.pointerId,
@@ -499,24 +1268,707 @@ export function ViewerCanvas({ doc, pageIndex, onStatusChange, overlayMeasuremen
     };
   }
 
+  function handlePointerDown(event: React.PointerEvent<HTMLDivElement>) {
+    if (!doc) return;
+
+    // Middle button always pans.
+    if (event.button === 1) {
+      startPan(event);
+      return;
+    }
+    if (event.button !== 0) return;
+
+    // Opening placement takes priority: a left click drops the door/window onto the ghosted wall.
+    if (openingPlacement && page) {
+      if (openingGhost) commitOpening();
+      return;
+    }
+
+    if (calibrating && page) {
+      // Capture two points spanning a known real-world dimension.
+      if (calibDialog) return; // waiting on the length dialog
+      const point = placementPoint(event.clientX, event.clientY);
+      if (!point) return;
+      const current = calibPointsRef.current;
+      if (current.length === 0) {
+        applyCalib([point]);
+      } else if (current.length === 1) {
+        const start = current[0];
+        const pixelLength = Math.hypot(point.x - start.x, point.y - start.y);
+        applyCalib([start, point]);
+        if (pixelLength > 1e-6) setCalibDialog({ pixelLength });
+      }
+      return;
+    }
+
+    if (measuring && page) {
+      // Line mode: one click places a measurement along the detected wall segment.
+      if (drawingType === "line") {
+        const result = useAppStore.getState().lineSnapResult;
+        if (!result) return;
+        void createMeasurement({ geometryJson: JSON.stringify([result.start, result.end]) }).catch(
+          (error) => onStatusChange(`ERROR: ${error}`),
+        );
+        return;
+      }
+
+      const rawPoint = placementPoint(event.clientX, event.clientY);
+      if (!rawPoint) return;
+
+      // Count: each click commits one marker immediately (no path).
+      if (drawingCount) {
+        void createMeasurement({ geometryJson: JSON.stringify([rawPoint]) }).catch((error) => onStatusChange(`ERROR: ${error}`));
+        return;
+      }
+
+      // Framing corners can only be 90°, so each new segment is forced orthogonal to the previous.
+      const point = drawingFraming ? orthogonalConstrain(draftPointsRef.current, rawPoint) : rawPoint;
+
+      // Click-to-place: each click drops a vertex (at the snap target if one is live).
+      applyDraft((prev) => {
+        if (prev.length === 0) {
+          // Ctrl on the first click resumes the path from the previous endpoint,
+          // even though that dimension is already committed.
+          if (event.ctrlKey && lastEndpointRef.current) return [lastEndpointRef.current, point];
+          return [point];
+        }
+        return [...prev, point];
+      });
+      return;
+    }
+
+    if (selectMode && page) {
+      // Ctrl+click places a manually-positioned extra stud on the ghosted wall.
+      if (event.ctrlKey && studGhost) {
+        commitExtraStud();
+        return;
+      }
+      // Drag a handle of the already-selected dimension to move that vertex.
+      if (selectedMeasurementId !== null) {
+        const vertexIndex = hitTestVertex(event.clientX, event.clientY, selectedMeasurementId);
+        if (vertexIndex >= 0) {
+          const points = measurementPoints(selectedMeasurementId);
+          if (points) {
+            event.currentTarget.setPointerCapture(event.pointerId);
+            vertexDragRef.current = { measurementId: selectedMeasurementId, vertexIndex };
+            setEditPreview({ id: selectedMeasurementId, points });
+            return;
+          }
+        }
+      }
+      // Otherwise select the dimension under the cursor, or pan on empty space.
+      const hitId = hitTestMeasurementId(event.clientX, event.clientY);
+      if (hitId !== null) {
+        selectMeasurement(hitId);
+        return;
+      }
+      selectMeasurement(null);
+      startPan(event);
+      return;
+    }
+
+    // No group selected: left-drag pans.
+    startPan(event);
+  }
+
   function handlePointerMove(event: React.PointerEvent<HTMLDivElement>) {
+    // While placing an opening, track the ghost (or pan on a middle-drag); skip snap/hover.
+    if (openingPlacement) {
+      const placingDrag = dragRef.current;
+      if (placingDrag) {
+        setPan(clampPan({ x: placingDrag.panX - (event.clientX - placingDrag.startX), y: placingDrag.panY - (event.clientY - placingDrag.startY) }));
+      } else {
+        resolveOpeningGhost(clientToPagePoint(event.clientX, event.clientY));
+      }
+      return;
+    }
+
+    // Select mode + Ctrl: ghost an extra stud aligned to the wall under the cursor.
+    if (selectMode && event.ctrlKey && !dragRef.current && !vertexDragRef.current) {
+      resolveStudGhost(clientToPagePoint(event.clientX, event.clientY));
+      setHoverInfo(null);
+      return;
+    }
+    if (studGhost) setStudGhost(null);
+
     scheduleSnapResolution(event.clientX, event.clientY);
 
-    const drag = dragRef.current;
-    if (!drag) return;
+    // Vertex drag takes priority — move the dragged handle to the snapped cursor.
+    const vertexDrag = vertexDragRef.current;
+    if (vertexDrag) {
+      const point = placementPoint(event.clientX, event.clientY);
+      if (point) {
+        setEditPreview((prev) => {
+          if (!prev) return prev;
+          const next = prev.points.slice();
+          next[vertexDrag.vertexIndex] = point;
+          return { id: prev.id, points: next };
+        });
+      }
+      return;
+    }
 
-    setPan(
-      clampPan({
-        x: drag.panX - (event.clientX - drag.startX),
-        y: drag.panY - (event.clientY - drag.startY),
-      }),
-    );
+    const drag = dragRef.current;
+    if (drag) {
+      setPan(
+        clampPan({
+          x: drag.panX - (event.clientX - drag.startX),
+          y: drag.panY - (event.clientY - drag.startY),
+        }),
+      );
+    }
+
+    if (measuring || calibrating) {
+      // Drive the live rubber-band endpoint (drawing a dimension or a calibration line).
+      setCursorClient({ x: event.clientX, y: event.clientY });
+      const raw = clientToPagePoint(event.clientX, event.clientY);
+      if (raw) setCursorPagePoint(raw);
+    }
+
+    // Hover-to-inspect committed dimensions works in add-mode too (add-mode is
+    // always on while a group is selected). It's suppressed mid-path below, where
+    // the live length readout takes over.
+    if (!drag && !calibrating) {
+      updateHover(event.clientX, event.clientY);
+    }
   }
 
   function handlePointerUp(event: React.PointerEvent<HTMLDivElement>) {
+    const vertexDrag = vertexDragRef.current;
+    if (vertexDrag) {
+      vertexDragRef.current = null;
+      const preview = editPreview;
+      if (preview) {
+        // Keep the preview (new position) on screen until the store has the updated
+        // geometry, then clear it. Clearing early would briefly fall back to the old
+        // stored geometry, making the vertex visibly snap back and forward.
+        void updateMeasurementGeometry(preview.id, JSON.stringify(preview.points))
+          .catch((error) => onStatusChange(`ERROR: ${error}`))
+          .finally(() => setEditPreview(null));
+      } else {
+        setEditPreview(null);
+      }
+      return;
+    }
+
     if (dragRef.current?.pointerId === event.pointerId) {
       dragRef.current = null;
     }
+  }
+
+  function handleContextMenu(event: React.MouseEvent<HTMLDivElement>) {
+    if (measuring) {
+      if (drawingType === "line") {
+        // No draft to finish in line mode; just suppress the context menu.
+        event.preventDefault();
+        return;
+      }
+      // Right-click ends the current dimension (CostX finish gesture).
+      event.preventDefault();
+      finishDraft();
+      return;
+    }
+
+    if (selectMode && page) {
+      event.preventDefault();
+
+      // A manually-placed extra stud under the cursor → Delete.
+      const studHit = hitTestExtraStud(event.clientX, event.clientY);
+      if (studHit) {
+        setViewerMenu({
+          x: event.clientX,
+          y: event.clientY,
+          items: [{ label: "Delete stud", danger: true, action: () => deleteExtraStud(studHit.measurementId, studHit.index) }],
+        });
+        return;
+      }
+
+      // A committed door/window under the cursor gets its own menu (Delete / Options / Move).
+      const openingHit = hitTestOpening(event.clientX, event.clientY);
+      if (openingHit) {
+        const { measurementId, index, opening } = openingHit;
+        const template: OpeningTemplate = {
+          kind: opening.kind,
+          daylightHeightMm: opening.daylightHeightMm,
+          daylightWidthMm: opening.daylightWidthMm,
+          lintelSize: opening.lintelSize,
+          lintelPly: opening.lintelPly,
+          sillHeightMm: opening.sillHeightMm,
+        };
+        const noun = opening.kind === "window" ? "window" : "door";
+        setViewerMenu({
+          x: event.clientX,
+          y: event.clientY,
+          items: [
+            { label: `${noun[0].toUpperCase()}${noun.slice(1)} options…`, action: () => setPendingOpeningEdit({ measurementId, index, template }) },
+            {
+              label: `Move ${noun}`,
+              action: () => {
+                deleteOpening(measurementId, index);
+                setOpeningPlacement(template);
+              },
+            },
+            { label: `Delete ${noun}`, danger: true, action: () => deleteOpening(measurementId, index) },
+          ],
+        });
+        return;
+      }
+
+      const id = hitTestMeasurementId(event.clientX, event.clientY);
+      if (id === null) {
+        setViewerMenu(null);
+        return;
+      }
+      selectMeasurement(id);
+
+      const measurement = overlayMeasurements.find((m) => m.id === id);
+      const points = measurementPoints(id);
+      if (!measurement || !points) return;
+      const isArea = isAreaType(measurement.measurement_type);
+      const minPoints = isArea ? 3 : 2;
+
+      // On a vertex → delete it; on a segment between vertices → add one. These are
+      // mutually exclusive so the obvious action sits directly under the cursor.
+      const items: ViewerMenuItem[] = [];
+      const vertexIndex = nearestVertex(event.clientX, event.clientY, id, VERTEX_RADIUS + 8);
+      if (vertexIndex >= 0 && points.length > minPoints) {
+        items.push({ label: "Delete point", danger: true, action: () => deleteVertex(id, vertexIndex) });
+      } else {
+        const segment = hitTestSegment(event.clientX, event.clientY, id);
+        if (segment) {
+          items.push({ label: "Add point", action: () => addVertex(id, segment.segmentIndex, segment.point) });
+        }
+      }
+
+      // Timber-framing walls: view in 3D + set/clear a raking frame on the segment under the cursor.
+      if (measurement.measurement_type === "timber_framing") {
+        items.push({ label: "View wall in 3D", action: () => setWall3dId(id) });
+        const seg = hitTestSegment(event.clientX, event.clientY, id);
+        if (seg) {
+          const framing = parseWallFraming(measurement.framing_json);
+          const existingRake = framing.rakes.find((r) => r.segmentIndex === seg.segmentIndex);
+          const groupSettings = parseFramingSettings(groupProps[measurement.dimension_group_id]?.framing_props_json ?? null);
+          items.push({
+            label: existingRake ? "Edit raking frame…" : "Set raking frame…",
+            action: () =>
+              setPendingRake({
+                measurementId: id,
+                segmentIndex: seg.segmentIndex,
+                start: existingRake?.startMm ?? groupSettings.wallHeightMm,
+                end: existingRake?.endMm ?? groupSettings.wallHeightMm,
+              }),
+          });
+          if (existingRake) items.push({ label: "Clear raking frame", danger: true, action: () => clearRake(id, seg.segmentIndex) });
+        }
+      }
+
+      if (items.length === 0) {
+        setViewerMenu(null);
+        return;
+      }
+      setViewerMenu({ x: event.clientX, y: event.clientY, items });
+      return;
+    }
+
+    event.preventDefault();
+  }
+
+  // Nearest segment of `id` under the cursor, with the click projected onto it (page pts).
+  function hitTestSegment(clientX: number, clientY: number, id: number): { segmentIndex: number; point: PagePoint } | null {
+    const element = viewportRef.current;
+    if (!element || !page) return null;
+    const points = measurementPoints(id);
+    if (!points || points.length < 2) return null;
+    const measurement = overlayMeasurements.find((m) => m.id === id);
+    const isArea = measurement ? isAreaType(measurement.measurement_type) : false;
+
+    const rect = element.getBoundingClientRect();
+    const sx = clientX - rect.left;
+    const sy = clientY - rect.top;
+    const screenPts = points.map((point) => pageToScreen(point.x, point.y, page.height_pts, pan, zoom));
+    const segmentCount = isArea ? screenPts.length : screenPts.length - 1;
+
+    let bestIndex = -1;
+    let bestDist = Infinity;
+    for (let i = 0; i < segmentCount; i += 1) {
+      const a = screenPts[i];
+      const b = screenPts[(i + 1) % screenPts.length];
+      const d = distanceToSegment(sx, sy, a.x, a.y, b.x, b.y);
+      if (d < bestDist) {
+        bestDist = d;
+        bestIndex = i;
+      }
+    }
+    if (bestIndex < 0 || bestDist > 8) return null;
+
+    // Project the cursor onto the chosen segment (in screen space) and map back to page pts.
+    const a = screenPts[bestIndex];
+    const b = screenPts[(bestIndex + 1) % screenPts.length];
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const lengthSq = dx * dx + dy * dy;
+    const t = lengthSq === 0 ? 0 : Math.max(0, Math.min(1, ((sx - a.x) * dx + (sy - a.y) * dy) / lengthSq));
+    const aPage = points[bestIndex];
+    const bPage = points[(bestIndex + 1) % points.length];
+    return { segmentIndex: bestIndex, point: { x: aPage.x + t * (bPage.x - aPage.x), y: aPage.y + t * (bPage.y - aPage.y) } };
+  }
+
+  // Inserts a vertex after `segmentIndex` (on the closing edge for areas this appends).
+  function addVertex(id: number, segmentIndex: number, point: PagePoint) {
+    const points = measurementPoints(id);
+    if (!points) return;
+    const insertAt = segmentIndex + 1;
+    const next = [...points.slice(0, insertAt), point, ...points.slice(insertAt)];
+    void updateMeasurementGeometry(id, JSON.stringify(next)).catch((error) => onStatusChange(`ERROR: ${error}`));
+  }
+
+  // Removes a vertex, leaving a straight segment between its neighbours.
+  function deleteVertex(id: number, vertexIndex: number) {
+    const points = measurementPoints(id);
+    if (!points) return;
+    const next = points.filter((_, index) => index !== vertexIndex);
+    void updateMeasurementGeometry(id, JSON.stringify(next)).catch((error) => onStatusChange(`ERROR: ${error}`));
+  }
+
+  function handleDoubleClick() {
+    if (!measuring) return;
+    finishDraft();
+  }
+
+  function finishDraft() {
+    if (draftPointsRef.current.length >= 2) {
+      void commitDraft(draftPointsRef.current);
+    }
+    applyDraft([]);
+  }
+
+  // While placing an opening, find the nearest framing wall to a page point and project onto it.
+  function resolveOpeningGhost(pagePoint: PagePoint | null) {
+    const mmpp = pageScale?.mm_per_point ?? null;
+    if (!pagePoint || !openingPlacement || !page || !mmpp) {
+      setOpeningGhost(null);
+      return;
+    }
+    const scale = (zoom * 96) / 72;
+    const thresholdPts = 24 / scale;
+    let best: { measurementId: number; segmentIndex: number; centreMm: number; dist: number } | null = null;
+    for (const measurement of overlayMeasurements) {
+      if (measurement.measurement_type !== "timber_framing" || measurement.page_index !== pageIndex) continue;
+      let pts: PagePoint[];
+      try {
+        pts = JSON.parse(measurement.geometry_json);
+      } catch {
+        continue;
+      }
+      if (!Array.isArray(pts) || pts.length < 2) continue;
+      const proj = projectOntoPath(pts, pagePoint, mmpp);
+      if (proj && proj.distancePts <= thresholdPts && (!best || proj.distancePts < best.dist)) {
+        best = { measurementId: measurement.id, segmentIndex: proj.segmentIndex, centreMm: proj.centreMm, dist: proj.distancePts };
+      }
+    }
+    setOpeningGhost(best ? { measurementId: best.measurementId, segmentIndex: best.segmentIndex, centreMm: best.centreMm } : null);
+  }
+
+  // Appends the current opening template onto the ghosted wall at the ghost position.
+  function commitOpening() {
+    if (!openingPlacement || !openingGhost) return;
+    const measurement = overlayMeasurements.find((m) => m.id === openingGhost.measurementId);
+    if (!measurement) return;
+    const existing = parseWallFraming(measurement.framing_json);
+    const opening: Opening = { ...openingPlacement, segmentIndex: openingGhost.segmentIndex, centreMm: openingGhost.centreMm };
+    void updateMeasurementFraming(measurement.id, serializeWallFraming({ ...existing, openings: [...existing.openings, opening] })).catch((error) =>
+      onStatusChange(`ERROR: ${error}`),
+    );
+  }
+
+  // Removes opening `index` from a measurement (right-click → Delete door).
+  function deleteOpening(measurementId: number, index: number) {
+    const measurement = overlayMeasurements.find((m) => m.id === measurementId);
+    if (!measurement) return;
+    const existing = parseWallFraming(measurement.framing_json);
+    const openings = existing.openings.filter((_, i) => i !== index);
+    void updateMeasurementFraming(measurementId, serializeWallFraming({ ...existing, openings })).catch((error) => onStatusChange(`ERROR: ${error}`));
+  }
+
+  // Replaces opening `index`'s parameters in place (right-click → Door options).
+  function updateOpening(measurementId: number, index: number, template: import("../lib/framing").OpeningTemplate) {
+    const measurement = overlayMeasurements.find((m) => m.id === measurementId);
+    if (!measurement) return;
+    const existing = parseWallFraming(measurement.framing_json);
+    const openings = existing.openings.map((o, i) => (i === index ? { ...o, ...template } : o));
+    void updateMeasurementFraming(measurementId, serializeWallFraming({ ...existing, openings })).catch((error) => onStatusChange(`ERROR: ${error}`));
+  }
+
+  // Sets (or replaces) the raking frame on one segment of a wall.
+  function setRake(measurementId: number, segmentIndex: number, startMm: number, endMm: number) {
+    const measurement = overlayMeasurements.find((m) => m.id === measurementId);
+    if (!measurement) return;
+    const existing = parseWallFraming(measurement.framing_json);
+    const rakes = [...existing.rakes.filter((r) => r.segmentIndex !== segmentIndex), { segmentIndex, startMm, endMm }];
+    void updateMeasurementFraming(measurementId, serializeWallFraming({ ...existing, rakes })).catch((error) => onStatusChange(`ERROR: ${error}`));
+  }
+
+  function clearRake(measurementId: number, segmentIndex: number) {
+    const measurement = overlayMeasurements.find((m) => m.id === measurementId);
+    if (!measurement) return;
+    const existing = parseWallFraming(measurement.framing_json);
+    const rakes = existing.rakes.filter((r) => r.segmentIndex !== segmentIndex);
+    void updateMeasurementFraming(measurementId, serializeWallFraming({ ...existing, rakes })).catch((error) => onStatusChange(`ERROR: ${error}`));
+  }
+
+  // Ctrl-hover: project onto the nearest framing wall to position a ghost extra stud.
+  function resolveStudGhost(pagePoint: PagePoint | null) {
+    const mmpp = pageScale?.mm_per_point ?? null;
+    if (!pagePoint || !page || !mmpp) {
+      setStudGhost(null);
+      return;
+    }
+    const scale = (zoom * 96) / 72;
+    const thresholdPts = 24 / scale;
+    let best: { measurementId: number; segmentIndex: number; centreMm: number; dist: number } | null = null;
+    for (const measurement of overlayMeasurements) {
+      if (measurement.measurement_type !== "timber_framing" || measurement.page_index !== pageIndex) continue;
+      let pts: PagePoint[];
+      try {
+        pts = JSON.parse(measurement.geometry_json);
+      } catch {
+        continue;
+      }
+      if (!Array.isArray(pts) || pts.length < 2) continue;
+      const proj = projectOntoPath(pts, pagePoint, mmpp);
+      if (proj && proj.distancePts <= thresholdPts && (!best || proj.distancePts < best.dist)) {
+        best = { measurementId: measurement.id, segmentIndex: proj.segmentIndex, centreMm: proj.centreMm, dist: proj.distancePts };
+      }
+    }
+    setStudGhost(best ? { measurementId: best.measurementId, segmentIndex: best.segmentIndex, centreMm: best.centreMm } : null);
+  }
+
+  function commitExtraStud() {
+    if (!studGhost) return;
+    const measurement = overlayMeasurements.find((m) => m.id === studGhost.measurementId);
+    if (!measurement) return;
+    const existing = parseWallFraming(measurement.framing_json);
+    const extraStuds = [...existing.extraStuds, { segmentIndex: studGhost.segmentIndex, centreMm: studGhost.centreMm }];
+    void updateMeasurementFraming(measurement.id, serializeWallFraming({ ...existing, extraStuds })).catch((error) => onStatusChange(`ERROR: ${error}`));
+  }
+
+  function deleteExtraStud(measurementId: number, index: number) {
+    const measurement = overlayMeasurements.find((m) => m.id === measurementId);
+    if (!measurement) return;
+    const existing = parseWallFraming(measurement.framing_json);
+    const extraStuds = existing.extraStuds.filter((_, i) => i !== index);
+    void updateMeasurementFraming(measurementId, serializeWallFraming({ ...existing, extraStuds })).catch((error) => onStatusChange(`ERROR: ${error}`));
+  }
+
+  // Id + index of a committed extra stud near the cursor (by its centre), or null.
+  function hitTestExtraStud(clientX: number, clientY: number): { measurementId: number; index: number } | null {
+    const element = viewportRef.current;
+    const mmpp = pageScale?.mm_per_point ?? null;
+    if (!element || !page || !mmpp) return null;
+    const rect = element.getBoundingClientRect();
+    const sx = clientX - rect.left;
+    const sy = clientY - rect.top;
+    let best: { measurementId: number; index: number; dist: number } | null = null;
+    for (const measurement of overlayMeasurements) {
+      if (measurement.measurement_type !== "timber_framing" || measurement.page_index !== pageIndex) continue;
+      let pts: PagePoint[];
+      try {
+        pts = JSON.parse(measurement.geometry_json);
+      } catch {
+        continue;
+      }
+      if (!Array.isArray(pts)) continue;
+      const extras = parseWallFraming(measurement.framing_json).extraStuds;
+      const settings = parseFramingSettings(groupProps[measurement.dimension_group_id]?.framing_props_json ?? null);
+      for (let index = 0; index < extras.length; index += 1) {
+        const r = extraStudRect(pts, settings, mmpp, extras[index].segmentIndex, extras[index].centreMm);
+        if (!r) continue;
+        const c = r.map((p) => pageToScreen(p.x, p.y, page.height_pts, pan, zoom));
+        const cx = (c[0].x + c[2].x) / 2;
+        const cy = (c[0].y + c[2].y) / 2;
+        const dist = Math.hypot(sx - cx, sy - cy);
+        if (dist <= 12 && (!best || dist < best.dist)) best = { measurementId: measurement.id, index, dist };
+      }
+    }
+    return best ? { measurementId: best.measurementId, index: best.index } : null;
+  }
+
+  // Id + index of a committed opening near the cursor (by its daylight centre), or null.
+  function hitTestOpening(clientX: number, clientY: number): { measurementId: number; index: number; opening: Opening } | null {
+    const element = viewportRef.current;
+    const mmpp = pageScale?.mm_per_point ?? null;
+    if (!element || !page || !mmpp) return null;
+    const rect = element.getBoundingClientRect();
+    const sx = clientX - rect.left;
+    const sy = clientY - rect.top;
+    const scale = (zoom * 96) / 72;
+    let best: { measurementId: number; index: number; opening: Opening; dist: number } | null = null;
+    for (const measurement of overlayMeasurements) {
+      if (measurement.measurement_type !== "timber_framing" || measurement.page_index !== pageIndex) continue;
+      let pts: PagePoint[];
+      try {
+        pts = JSON.parse(measurement.geometry_json);
+      } catch {
+        continue;
+      }
+      if (!Array.isArray(pts)) continue;
+      const openings = parseWallFraming(measurement.framing_json).openings;
+      for (let index = 0; index < openings.length; index += 1) {
+        const o = openings[index];
+        const a = pts[o.segmentIndex];
+        const b = pts[o.segmentIndex + 1];
+        if (!a || !b) continue;
+        const segLen = Math.hypot(b.x - a.x, b.y - a.y);
+        if (segLen < 1e-6) continue;
+        const sPts = o.centreMm / mmpp;
+        const centre = { x: a.x + ((b.x - a.x) / segLen) * sPts, y: a.y + ((b.y - a.y) / segLen) * sPts };
+        const screen = pageToScreen(centre.x, centre.y, page.height_pts, pan, zoom);
+        const halfWidthPx = (o.daylightWidthMm / mmpp) * scale * 0.5;
+        const dist = Math.hypot(sx - screen.x, sy - screen.y);
+        if (dist <= Math.max(10, halfWidthPx) && (!best || dist < best.dist)) {
+          best = { measurementId: measurement.id, index, opening: o, dist };
+        }
+      }
+    }
+    return best ? { measurementId: best.measurementId, index: best.index, opening: best.opening } : null;
+  }
+
+  // Parsed geometry of a measurement by id (PDF points), or null.
+  function measurementPoints(id: number): PagePoint[] | null {
+    const measurement = overlayMeasurements.find((m) => m.id === id);
+    if (!measurement) return null;
+    try {
+      const points = JSON.parse(measurement.geometry_json);
+      return Array.isArray(points) ? points : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // Index of the vertex of `id` under the cursor (within handle radius), or -1.
+  function hitTestVertex(clientX: number, clientY: number, id: number): number {
+    return nearestVertex(clientX, clientY, id, VERTEX_RADIUS + 5);
+  }
+
+  // Index of the closest vertex of `id` within `radius` screen px, or -1.
+  function nearestVertex(clientX: number, clientY: number, id: number, radius: number): number {
+    const element = viewportRef.current;
+    if (!element || !page) return -1;
+    const points = measurementPoints(id);
+    if (!points) return -1;
+    const rect = element.getBoundingClientRect();
+    const screenX = clientX - rect.left;
+    const screenY = clientY - rect.top;
+    let bestIndex = -1;
+    let bestDist = radius;
+    for (let i = 0; i < points.length; i += 1) {
+      const s = pageToScreen(points[i].x, points[i].y, page.height_pts, pan, zoom);
+      const d = Math.hypot(screenX - s.x, screenY - s.y);
+      if (d <= bestDist) {
+        bestDist = d;
+        bestIndex = i;
+      }
+    }
+    return bestIndex;
+  }
+
+  // Id of the topmost committed dimension under the cursor, or null.
+  function hitTestMeasurementId(clientX: number, clientY: number): number | null {
+    const element = viewportRef.current;
+    if (!element || !page) return null;
+    const rect = element.getBoundingClientRect();
+    const screenX = clientX - rect.left;
+    const screenY = clientY - rect.top;
+    const tolerance = 6;
+
+    // Iterate in reverse so the most-recently-drawn dimension wins.
+    for (let m = overlayMeasurements.length - 1; m >= 0; m -= 1) {
+      const measurement = overlayMeasurements[m];
+      if (measurement.page_index !== pageIndex) continue;
+      let points: PagePoint[];
+      try {
+        points = JSON.parse(measurement.geometry_json);
+      } catch {
+        continue;
+      }
+      if (!Array.isArray(points) || points.length < 1) continue;
+      const screenPts = points.map((point) => pageToScreen(point.x, point.y, page.height_pts, pan, zoom));
+
+      // Count markers are hit by proximity to the point.
+      if (measurement.measurement_type === "count") {
+        if (screenPts.some((s) => Math.hypot(screenX - s.x, screenY - s.y) <= 8)) return measurement.id;
+        continue;
+      }
+      if (screenPts.length < 2) continue;
+
+      const isArea = isAreaType(measurement.measurement_type);
+      const segmentCount = isArea ? screenPts.length : screenPts.length - 1;
+      for (let i = 0; i < segmentCount; i += 1) {
+        const a = screenPts[i];
+        const b = screenPts[(i + 1) % screenPts.length];
+        if (distanceToSegment(screenX, screenY, a.x, a.y, b.x, b.y) <= tolerance) return measurement.id;
+      }
+    }
+    return null;
+  }
+
+  // Hover tooltip over committed measurements.
+  function updateHover(clientX: number, clientY: number) {
+    const element = viewportRef.current;
+    if (!element || !page) {
+      setHoverInfo(null);
+      return;
+    }
+    const rect = element.getBoundingClientRect();
+    const screenX = clientX - rect.left;
+    const screenY = clientY - rect.top;
+    const tolerance = 6;
+
+    for (const measurement of overlayMeasurements) {
+      if (measurement.page_index !== pageIndex) continue;
+      let points: PagePoint[];
+      try {
+        points = JSON.parse(measurement.geometry_json);
+      } catch {
+        continue;
+      }
+      if (!Array.isArray(points) || points.length < 1) continue;
+
+      const screenPts = points.map((point) => pageToScreen(point.x, point.y, page.height_pts, pan, zoom));
+      const props = groupProps[measurement.dimension_group_id];
+
+      // Count markers: hover by proximity to the point, showing the count value.
+      if (measurement.measurement_type === "count") {
+        if (screenPts.some((s) => Math.hypot(screenX - s.x, screenY - s.y) <= 8)) {
+          const quantity = props ? deriveQuantity(points, pageScale?.mm_per_point ?? null, props) : null;
+          setHoverInfo({ x: clientX, y: clientY, text: quantity ? formatQuantity(quantity) : "1" });
+          return;
+        }
+        continue;
+      }
+      if (screenPts.length < 2) continue;
+
+      const isArea = isAreaType(measurement.measurement_type);
+      const segmentCount = isArea ? screenPts.length : screenPts.length - 1;
+      for (let i = 0; i < segmentCount; i += 1) {
+        const a = screenPts[i];
+        const b = screenPts[(i + 1) % screenPts.length];
+        if (distanceToSegment(screenX, screenY, a.x, a.y, b.x, b.y) <= tolerance) {
+          if (measurement.measurement_type === "timber_framing") {
+            const settings = parseFramingSettings(props?.framing_props_json ?? null);
+            const q = computeFramingQuantities(points, settings, pageScale?.mm_per_point ?? null, parseWallFraming(measurement.framing_json));
+            const text = q ? `${q.studCount} studs · ${q.totalM.toFixed(2)} m` : formatLength(pathLengthPts(points), pageScale);
+            setHoverInfo({ x: clientX, y: clientY, text });
+            return;
+          }
+          const quantity = props ? deriveQuantity(points, pageScale?.mm_per_point ?? null, props) : null;
+          const text = quantity ? formatQuantity(quantity) : formatLength(pathLengthPts(points), pageScale);
+          setHoverInfo({ x: clientX, y: clientY, text });
+          return;
+        }
+      }
+    }
+    setHoverInfo(null);
   }
 
   function scheduleSnapResolution(clientX: number, clientY: number) {
@@ -538,8 +1990,14 @@ export function ViewerCanvas({ doc, pageIndex, onStatusChange, overlayMeasuremen
       const scale = (zoom * 96) / 72;
       const pagePtX = (screenX + pan.x) / scale;
       const pagePtY = page.height_pts - (screenY + pan.y) / scale;
-      const radiusPts = 12 / scale;
-      resolveSnap(pagePtX, pagePtY, pageIndex, radiusPts);
+      const currentDrawingType = useAppStore.getState().drawingType;
+      if (currentDrawingType === "line") {
+        const lineRadius = 20 / scale;
+        resolveLineSnap(pagePtX, pagePtY, pageIndex, lineRadius);
+      } else {
+        const radiusPts = 12 / scale;
+        resolveSnap(pagePtX, pagePtY, pageIndex, radiusPts);
+      }
     });
   }
 
@@ -573,20 +2031,117 @@ export function ViewerCanvas({ doc, pageIndex, onStatusChange, overlayMeasuremen
     return () => element.removeEventListener("wheel", handleWheel);
   });
 
+  // Linear-tool keyboard shortcuts: Esc cancels, Enter finishes a polyline, Backspace undoes a vertex.
+  useEffect(() => {
+    if (!measuring) return;
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        applyDraft([]);
+      } else if (event.key === "Enter") {
+        finishDraft();
+      } else if (event.key === "Backspace") {
+        event.preventDefault();
+        applyDraft((prev) => prev.slice(0, -1));
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+    // finishDraft is defined inline and stable enough for this listener's lifetime.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [measuring, commitDraft, applyDraft]);
+
+  // Opening placement: Esc cancels; leaving placement clears any ghost.
+  useEffect(() => {
+    if (!openingPlacement) {
+      setOpeningGhost(null);
+      return;
+    }
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") setOpeningPlacement(null);
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [openingPlacement, setOpeningPlacement]);
+
+  // Releasing Ctrl (or leaving select mode) clears the extra-stud ghost.
+  useEffect(() => {
+    if (!selectMode) {
+      setStudGhost(null);
+      return;
+    }
+    function onKeyUp(event: KeyboardEvent) {
+      if (event.key === "Control") setStudGhost(null);
+    }
+    window.addEventListener("keyup", onKeyUp);
+    return () => window.removeEventListener("keyup", onKeyUp);
+  }, [selectMode]);
+
+  // Select-mode: Delete (or Backspace) removes the selected dimension.
+  useEffect(() => {
+    if (!selectMode) return;
+    function onKeyDown(event: KeyboardEvent) {
+      if ((event.key === "Delete" || event.key === "Backspace") && selectedMeasurementId !== null) {
+        event.preventDefault();
+        void deleteMeasurement(selectedMeasurementId).catch((error) => onStatusChange(`ERROR: ${error}`));
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [selectMode, selectedMeasurementId, deleteMeasurement, onStatusChange]);
+
+  // Live length readout near the cursor, for either a dimension being drawn or a
+  // calibration line being placed. Shows real units once the page is scaled.
+  const liveReadout = (() => {
+    if (!cursorClient) return null;
+    const livePoint = snapPoint ?? cursorPagePoint;
+    if (calibrating && !calibDialog && calibPoints.length >= 1 && livePoint) {
+      return formatLength(pathLengthPts([...calibPoints, livePoint]), pageScale);
+    }
+    if (measuring && draftPoints.length >= 1) {
+      const pts = livePoint ? [...draftPoints, livePoint] : draftPoints;
+      if (pts.length < 2) return null;
+      if (drawingFraming) {
+        const settings = parseFramingSettings(activeProps?.framing_props_json ?? null);
+        const q = computeFramingQuantities(pts, settings, pageScale?.mm_per_point ?? null);
+        return q ? `${q.studCount} studs · ${q.totalM.toFixed(2)} m` : formatLength(pathLengthPts(pts), pageScale);
+      }
+      const quantity = activeProps ? deriveQuantity(pts, pageScale?.mm_per_point ?? null, activeProps) : null;
+      return quantity ? formatQuantity(quantity) : formatLength(pathLengthPts(pts), pageScale);
+    }
+    return null;
+  })();
+
   return (
+    <>
     <div
       ref={viewportRef}
       onPointerDown={handlePointerDown}
       onPointerMove={handlePointerMove}
       onPointerUp={handlePointerUp}
       onPointerCancel={handlePointerUp}
-      onPointerLeave={clearSnap}
+      onDoubleClick={handleDoubleClick}
+      onContextMenu={handleContextMenu}
+      onPointerLeave={() => {
+        clearSnap();
+        setHoverInfo(null);
+        setStudGhost(null);
+      }}
       style={{
         flex: 1,
         position: "relative",
         minHeight: 0,
         overflow: "hidden",
-        cursor: doc ? (dragRef.current ? "grabbing" : "grab") : "default",
+        cursor: doc
+          ? measuring || calibrating || openingPlacement
+            ? "crosshair"
+            : selectMode
+              ? hoverInfo
+                ? "pointer"
+                : "default"
+              : dragRef.current
+                ? "grabbing"
+                : "grab"
+          : "default",
         background: "#15171a",
         touchAction: "none",
       }}
@@ -600,6 +2155,122 @@ export function ViewerCanvas({ doc, pageIndex, onStatusChange, overlayMeasuremen
           pointerEvents: "none",
         }}
       />
+      {liveReadout && cursorClient ? (
+        <div
+          style={{
+            position: "fixed",
+            left: cursorClient.x + 14,
+            top: cursorClient.y + 14,
+            padding: "2px 6px",
+            background: "rgba(20,22,26,0.9)",
+            color: "#ffffff",
+            border: "1px solid rgba(255,255,255,0.25)",
+            borderRadius: 3,
+            fontSize: 11,
+            fontFamily: "Segoe UI, sans-serif",
+            pointerEvents: "none",
+            whiteSpace: "nowrap",
+            zIndex: 10,
+          }}
+        >
+          {liveReadout}
+        </div>
+      ) : null}
+      {hoverInfo && !liveReadout ? (
+        <div
+          style={{
+            position: "fixed",
+            left: hoverInfo.x + 14,
+            top: hoverInfo.y + 14,
+            padding: "2px 6px",
+            background: "rgba(20,22,26,0.9)",
+            color: "#ffffff",
+            border: "1px solid rgba(255,255,255,0.25)",
+            borderRadius: 3,
+            fontSize: 11,
+            fontFamily: "Segoe UI, sans-serif",
+            pointerEvents: "none",
+            whiteSpace: "nowrap",
+            zIndex: 10,
+          }}
+        >
+          {hoverInfo.text}
+        </div>
+      ) : null}
+      {calibDialog ? (
+        <CalibrationDialog
+          pixelLength={calibDialog.pixelLength}
+          onCancel={() => {
+            setCalibDialog(null);
+            applyCalib([]);
+            setCalibrating(false);
+          }}
+          onConfirm={(realMm, unit) => {
+            if (activeDrawingId === null) return;
+            const mmPerPoint = realMm / calibDialog.pixelLength;
+            void setPageScale(activeDrawingId, pageIndex, mmPerPoint, unit)
+              .then(() => {
+                setCalibDialog(null);
+                applyCalib([]);
+              })
+              .catch((error) => onStatusChange(`ERROR: ${error}`));
+          }}
+        />
+      ) : null}
     </div>
+    {/* Rendered as a sibling (not a child) of the viewport so its synthetic pointer
+        events don't bubble through the React tree into the viewport's pan handler. */}
+    {viewerMenu ? (
+      <ContextMenu x={viewerMenu.x} y={viewerMenu.y} items={viewerMenu.items} onClose={() => setViewerMenu(null)} />
+    ) : null}
+    {pendingOpeningEdit ? (
+      <OpeningDialog
+        title={pendingOpeningEdit.template.kind === "window" ? "Window options" : "Door options"}
+        initial={pendingOpeningEdit.template}
+        confirmLabel={pendingOpeningEdit.template.kind === "window" ? "Update Window" : "Update Door"}
+        onCancel={() => setPendingOpeningEdit(null)}
+        onConfirm={(template) => {
+          updateOpening(pendingOpeningEdit.measurementId, pendingOpeningEdit.index, template);
+          setPendingOpeningEdit(null);
+        }}
+      />
+    ) : null}
+    {pendingRake ? (
+      <RakingDialog
+        initialStart={pendingRake.start}
+        initialEnd={pendingRake.end}
+        onCancel={() => setPendingRake(null)}
+        onConfirm={(startMm, endMm) => {
+          setRake(pendingRake.measurementId, pendingRake.segmentIndex, startMm, endMm);
+          setPendingRake(null);
+        }}
+      />
+    ) : null}
+    {wall3dId !== null ? (
+      <div style={{ position: "fixed", inset: 0, zIndex: 1300, display: "grid", placeItems: "center", background: "rgba(0,0,0,0.55)" }} onClick={() => setWall3dId(null)}>
+        <div onClick={(e) => e.stopPropagation()} style={{ width: "82vw", height: "82vh", background: "#dfe4ea", border: `1px solid ${"#3c4048"}`, boxShadow: "0 18px 48px rgba(0,0,0,0.5)", display: "flex", flexDirection: "column", overflow: "hidden" }}>
+          <div style={{ height: 34, display: "flex", alignItems: "center", padding: "0 12px", background: "#2b2d31", color: "#e8e8e8", fontSize: 13, fontWeight: 600 }}>
+            Wall in 3D
+            <button onClick={() => setWall3dId(null)} style={{ marginLeft: "auto", width: 24, height: 24, background: "transparent", color: "#e8e8e8", border: "none", cursor: "pointer", fontSize: 16 }}>×</button>
+          </div>
+          <div style={{ flex: 1, minHeight: 0 }}>
+            {(() => {
+              const m = overlayMeasurements.find((x) => x.id === wall3dId);
+              let pts: PagePoint[] | null = null;
+              try {
+                pts = m ? JSON.parse(m.geometry_json) : null;
+              } catch {
+                pts = null;
+              }
+              if (!m || !Array.isArray(pts)) return null;
+              const settings = parseFramingSettings(groupProps[m.dimension_group_id]?.framing_props_json ?? null);
+              const members = computeWall3D(pts, settings, pageScale?.mm_per_point ?? null, parseWallFraming(m.framing_json));
+              return <Framing3DView members={members} />;
+            })()}
+          </div>
+        </div>
+      </div>
+    ) : null}
+    </>
   );
 }

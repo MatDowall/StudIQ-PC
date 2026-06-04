@@ -3,18 +3,29 @@ import { useAppStore } from "../store/appStore";
 
 const groups = [
   { label: "Dimension Group", tools: ["Add", "Properties", "Copy", "Import", "Export"] },
-  { label: "BIM", tools: ["Check BIM Objects", "Show All Objects"] },
-  { label: "Dimension", tools: ["Add", "Copy", "Select In Area", "Edit Controls"] },
-  { label: "Type", tools: ["Line", "Point", "Object"] },
-  { label: "Zones", tools: ["Edit Zones"] },
+  { label: "Type", tools: ["Point", "Line"] },
+  { label: "Drawing", tools: ["Plan View", "View in 3D"] },
   { label: "Snap", tools: ["Geometry", "Angle", "Rebar"] },
-  { label: "Mode", tools: ["Measured", "Legend"] },
   { label: "Show", tools: ["Labels", "Markups", "Properties on Add"] },
 ];
+
+// Tools in the "Dimension Group" group are wired to real actions; everything else in the
+// ribbon is still static CostX-style decoration.
+const DIMENSION_GROUP_TOOLS: Record<string, "add" | "properties" | "copy"> = {
+  Add: "add",
+  Properties: "properties",
+  Copy: "copy",
+};
 
 export function Ribbon() {
   const activeProject = useAppStore((state) => state.activeProject);
   const closeProject = useAppStore((state) => state.closeProject);
+  const activeDimensionGroupId = useAppStore((state) => state.activeDimensionGroupId);
+  const requestDgPaneCommand = useAppStore((state) => state.requestDgPaneCommand);
+  const drawingType = useAppStore((state) => state.drawingType);
+  const setDrawingType = useAppStore((state) => state.setDrawingType);
+  const view3d = useAppStore((state) => state.view3d);
+  const setView3d = useAppStore((state) => state.setView3d);
 
   return (
     <div
@@ -44,11 +55,46 @@ export function Ribbon() {
         >
           <div style={{ display: "flex", gap: 5, alignItems: "center", overflow: "hidden" }}>
             {group.tools.slice(0, 3).map((tool, toolIndex) => {
-              const active = tool === "Add" || tool === "Line" || tool === "Measured";
+              const dgCommand = groupIndex === 0 ? DIMENSION_GROUP_TOOLS[tool] : undefined;
+              const isTypeToggle = group.label === "Type" && (tool === "Point" || tool === "Line");
+              const isViewToggle = group.label === "Drawing" && (tool === "Plan View" || tool === "View in 3D");
+
+              let enabled: boolean;
+              let cursor: string;
+              let active: boolean;
+
+              if (dgCommand !== undefined) {
+                enabled = dgCommand === "add" || activeDimensionGroupId !== null;
+                active = enabled;
+                cursor = !enabled ? "not-allowed" : "pointer";
+              } else if (isTypeToggle) {
+                enabled = true;
+                active = (tool === "Point" && drawingType === "point") || (tool === "Line" && drawingType === "line");
+                cursor = "pointer";
+              } else if (isViewToggle) {
+                enabled = true;
+                active = (tool === "Plan View" && !view3d) || (tool === "View in 3D" && view3d);
+                cursor = "pointer";
+              } else {
+                // Static decorative tools.
+                enabled = toolIndex === 0;
+                active = enabled;
+                cursor = "default";
+              }
+
+              const handleClick = dgCommand !== undefined && enabled
+                ? () => requestDgPaneCommand(dgCommand)
+                : isTypeToggle
+                  ? () => setDrawingType(tool === "Line" ? "line" : "point")
+                  : isViewToggle
+                    ? () => setView3d(tool === "View in 3D")
+                    : undefined;
+
               return (
                 <button
                   key={`${group.label}-${tool}`}
-                  disabled={!active && toolIndex > 0}
+                  disabled={!enabled && !isTypeToggle}
+                  onClick={handleClick}
                   style={{
                     height: 20,
                     maxWidth: 70,
@@ -60,7 +106,7 @@ export function Ribbon() {
                     background: active ? theme.bg.active : theme.bg.input,
                     color: active ? theme.text.primary : theme.text.disabled,
                     fontSize: 10,
-                    cursor: active ? "default" : "not-allowed",
+                    cursor,
                   }}
                 >
                   {tool}
