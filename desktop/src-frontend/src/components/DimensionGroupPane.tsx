@@ -1,12 +1,17 @@
 import type { MouseEvent } from "react";
-import { useEffect, useState } from "react";
-import { useAppStore, TreeNodeDto } from "../store/appStore";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { useAppStore, TreeNodeDto, type DimensionGroupPropsDto, type FolderOption } from "../store/appStore";
 import { theme } from "../theme";
 import { ColourDialog } from "./ColourDialog";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { ContextMenu } from "./ContextMenu";
+import { DimensionGroupCopyDialog } from "./DimensionGroupCopyDialog";
 import { DimensionGroupDialog } from "./DimensionGroupDialog";
+import { DimensionGroupPropertiesDialog } from "./DimensionGroupPropertiesDialog";
 import { TextInputDialog } from "./TextInputDialog";
+import { groupNetQuantity, quantityValueText, type PagePoint, type Quantity } from "../lib/quantity";
+import { aggregateFramingGroup, parseFramingSettings, parseWallFraming, type FramingGroupBreakdown, type FramingWallInput } from "../lib/framing";
 
 const tabs = ["Dimension Groups", "Dimensions", "Auto Count"];
 const gridColumns = "22px minmax(150px, 1fr) 72px 48px 26px";
@@ -21,13 +26,9 @@ function findPath(nodes: TreeNodeDto[], targetId: number, childCache: Record<num
   return null;
 }
 
-function summaryForNode(node: TreeNodeDto) {
-  if (node.node_type !== "dimension_group") return { quantity: "", uom: "" };
-  const uoms = ["m3", "m2", "m", "ea", "kg"];
-  return {
-    quantity: String((node.id * 17 + node.name.length * 3) % 240),
-    uom: uoms[node.id % uoms.length],
-  };
+function summaryForNode(node: TreeNodeDto, total: Quantity | null | undefined) {
+  if (node.node_type !== "dimension_group" || !total) return { quantity: "", uom: "" };
+  return { quantity: quantityValueText(total), uom: total.uom };
 }
 
 function DimensionNodeIcon({ node }: { node: TreeNodeDto }) {
@@ -86,13 +87,19 @@ function DimensionTreeRow({
   node,
   depth,
   activeNodeId,
+  selectedGroupIds,
+  groupTotals,
+  groupFramingBreakdowns,
   onNodeClick,
   onContextMenu,
 }: {
   node: TreeNodeDto;
   depth: number;
   activeNodeId: number | null;
-  onNodeClick: (node: TreeNodeDto) => void;
+  selectedGroupIds: number[];
+  groupTotals: Record<number, Quantity | null>;
+  groupFramingBreakdowns: Record<number, FramingGroupBreakdown>;
+  onNodeClick: (node: TreeNodeDto, event: MouseEvent) => void;
   onContextMenu: (event: MouseEvent, node: TreeNodeDto) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
@@ -104,8 +111,21 @@ function DimensionTreeRow({
   const isFolder = node.node_type === "folder";
   const children = childCache[node.id] ?? [];
   const canExpand = isFolder && (node.has_children || children.length > 0);
-  const isActive = activeNodeId === node.id;
-  const summary = summaryForNode(node);
+  const isActive = activeNodeId === node.id || selectedGroupIds.includes(node.id);
+  const summary = summaryForNode(node, groupTotals[node.id]);
+  // Timber-framing groups append their framing size to the displayed name, e.g.
+  // "Framing - 90 × 45". Sourced from the node itself so it shows whether or not the group is
+  // selected/loaded.
+  const displayName = node.framing_size ? `${node.name} - ${node.framing_size.replace("x", " × ")}` : node.name;
+  // Itemised framing components shown as read-only child rows beneath a loaded framing group.
+  const framingBreakdown = node.node_type === "dimension_group" ? groupFramingBreakdowns[node.id] : undefined;
+  const framingComponentRows = framingBreakdown
+    ? framingBreakdown.components.map((c) => ({
+        key: c.kind,
+        label: c.count > 1 ? `${c.label} (${c.count})` : c.label,
+        total: c.totalM,
+      }))
+    : [];
 
   useEffect(() => {
     if (!canExpand && expanded) {
@@ -142,7 +162,7 @@ function DimensionTreeRow({
   return (
     <>
       <div
-        onClick={() => onNodeClick(node)}
+        onClick={(event) => onNodeClick(node, event)}
         onContextMenu={(event) => onContextMenu(event, node)}
         style={{
           display: "grid",
@@ -184,7 +204,7 @@ function DimensionTreeRow({
           }}
         >
           <DimensionNodeIcon node={node} />
-          <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{node.name}</span>
+          <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{displayName}</span>
         </div>
         <div style={{ paddingRight: 8, textAlign: "right", color: isActive ? "#FFFFFF" : theme.text.primary }}>{summary.quantity}</div>
         <div style={{ color: isActive ? "#FFFFFF" : theme.text.primary }}>{summary.uom}</div>
@@ -194,6 +214,31 @@ function DimensionTreeRow({
           ) : null}
         </div>
       </div>
+      {framingComponentRows.map((row) => (
+        <div
+          key={`${node.id}-${row.key}`}
+          style={{
+            display: "grid",
+            gridTemplateColumns: gridColumns,
+            alignItems: "center",
+            minWidth: 360,
+            height: theme.rowHeight,
+            color: theme.text.secondary,
+            fontSize: 11,
+            whiteSpace: "nowrap",
+            userSelect: "none",
+          }}
+        >
+          <div />
+          <div style={{ display: "flex", alignItems: "center", minWidth: 0, paddingLeft: (depth + 1) * theme.treeIndent + 8, overflow: "hidden" }}>
+            <span style={{ marginRight: 6, color: theme.text.disabled }}>└</span>
+            <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{row.label}</span>
+          </div>
+          <div style={{ paddingRight: 8, textAlign: "right" }}>{row.total.toFixed(3)}</div>
+          <div>m</div>
+          <div />
+        </div>
+      ))}
       {expanded
         ? children.map((child) => (
             <DimensionTreeRow
@@ -201,6 +246,9 @@ function DimensionTreeRow({
               node={child}
               depth={depth + 1}
               activeNodeId={activeNodeId}
+              selectedGroupIds={selectedGroupIds}
+              groupTotals={groupTotals}
+              groupFramingBreakdowns={groupFramingBreakdowns}
               onNodeClick={onNodeClick}
               onContextMenu={onContextMenu}
             />
@@ -221,9 +269,17 @@ export function DimensionGroupPane() {
   const updateDimensionGroupColour = useAppStore((state) => state.updateDimensionGroupColour);
   const selectDimensionGroup = useAppStore((state) => state.selectDimensionGroup);
   const activeDimensionGroupId = useAppStore((state) => state.activeDimensionGroupId);
+  const selectedGroupIds = useAppStore((state) => state.selectedGroupIds);
   const activeBreadcrumb = useAppStore((state) => state.activeBreadcrumb);
   const overlayMeasurements = useAppStore((state) => state.overlayMeasurements);
   const overlayColour = useAppStore((state) => state.overlayColour);
+  const deleteMeasurement = useAppStore((state) => state.deleteMeasurement);
+  const groupProps = useAppStore((state) => state.groupProps);
+  const scaleCache = useAppStore((state) => state.scaleCache);
+  const saveGroupProps = useAppStore((state) => state.saveGroupProps);
+  const listDimensionFolders = useAppStore((state) => state.listDimensionFolders);
+  const copyDimensionGroup = useAppStore((state) => state.copyDimensionGroup);
+  const dgPaneCommand = useAppStore((state) => state.dgPaneCommand);
   const [selectedFolderId, setSelectedFolderId] = useState<number | null>(null);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; node: TreeNodeDto } | null>(null);
   const [pendingAddGroupPath, setPendingAddGroupPath] = useState<string | null>(null);
@@ -231,7 +287,70 @@ export function DimensionGroupPane() {
   const [pendingRename, setPendingRename] = useState<TreeNodeDto | null>(null);
   const [pendingColour, setPendingColour] = useState<TreeNodeDto | null>(null);
   const [pendingDelete, setPendingDelete] = useState<TreeNodeDto | null>(null);
+  const [pendingProps, setPendingProps] = useState<{ node: TreeNodeDto; props: DimensionGroupPropsDto; framingWalls: FramingWallInput[] } | null>(null);
+  const [pendingCopy, setPendingCopy] = useState<{ node: TreeNodeDto; folders: FolderOption[]; defaultFolderId: number | null } | null>(null);
   const [status, setStatus] = useState("");
+  const lastCommandSeq = useRef(0);
+
+  const scaleFor = useCallback(
+    (drawingId: number, pageIndex: number) => scaleCache[`${drawingId}:${pageIndex}`]?.mm_per_point ?? null,
+    [scaleCache],
+  );
+
+  // Gathers a framing group's walls (parsed geometry + per-page scale) for the calc.
+  const framingWallsForGroup = useCallback(
+    (groupId: number): FramingWallInput[] => {
+      const walls: FramingWallInput[] = [];
+      for (const measurement of overlayMeasurements) {
+        if (measurement.dimension_group_id !== groupId) continue;
+        let points: PagePoint[];
+        try {
+          points = JSON.parse(measurement.geometry_json);
+        } catch {
+          continue;
+        }
+        if (!Array.isArray(points)) continue;
+        walls.push({
+          id: measurement.id,
+          points,
+          mmPerPoint: scaleFor(measurement.drawing_id, measurement.page_index),
+          framing: parseWallFraming(measurement.framing_json),
+        });
+      }
+      return walls;
+    },
+    [overlayMeasurements, scaleFor],
+  );
+
+  // NZS 3604 lineal-metre breakdowns for the loaded timber-framing groups (drives the sidebar
+  // total, the itemised component child rows, and the breakdown inspector).
+  const groupFramingBreakdowns = useMemo(() => {
+    const out: Record<number, FramingGroupBreakdown> = {};
+    for (const idText of Object.keys(groupProps)) {
+      const id = Number(idText);
+      const props = groupProps[id];
+      if (props?.measurement_type !== "timber_framing") continue;
+      out[id] = aggregateFramingGroup(framingWallsForGroup(id), parseFramingSettings(props.framing_props_json));
+    }
+    return out;
+  }, [groupProps, framingWallsForGroup]);
+
+  // Live per-group totals. Framing groups roll up total lineal metres of timber; the others use
+  // the standard CostX net quantity.
+  const groupTotals = useMemo(() => {
+    const totals: Record<number, Quantity | null> = {};
+    for (const idText of Object.keys(groupProps)) {
+      const id = Number(idText);
+      if (groupProps[id]?.measurement_type === "timber_framing") {
+        const breakdown = groupFramingBreakdowns[id];
+        totals[id] = breakdown && breakdown.totalM > 0 ? { value: breakdown.totalM, uom: "m" } : null;
+        continue;
+      }
+      const measurements = overlayMeasurements.filter((measurement) => measurement.dimension_group_id === id);
+      totals[id] = groupNetQuantity(measurements, groupProps[id], scaleFor);
+    }
+    return totals;
+  }, [groupProps, groupFramingBreakdowns, overlayMeasurements, scaleFor]);
 
   useEffect(() => {
     let cancelled = false;
@@ -247,11 +366,12 @@ export function DimensionGroupPane() {
     };
   }, [loadRoots]);
 
-  async function handleNodeClick(node: TreeNodeDto) {
+  async function handleNodeClick(node: TreeNodeDto, event?: MouseEvent) {
     if (node.node_type === "dimension_group") {
+      const additive = Boolean(event && (event.ctrlKey || event.metaKey));
       setStatus("Loading measurements...");
       try {
-        await selectDimensionGroup(node);
+        await selectDimensionGroup(node, additive);
         setSelectedFolderId(null);
         setStatus("");
       } catch (error) {
@@ -331,6 +451,111 @@ export function DimensionGroupPane() {
     }
   }
 
+  async function openProperties(node: TreeNodeDto) {
+    setStatus("Loading properties...");
+    try {
+      const props = await invoke<DimensionGroupPropsDto>("get_dimension_group_props", { nodeId: node.id });
+      setPendingProps({ node, props, framingWalls: framingWallsForGroup(node.id) });
+      setStatus("");
+    } catch (error) {
+      setStatus(`ERROR: ${error}`);
+    }
+  }
+
+  async function confirmProperties(props: DimensionGroupPropsDto) {
+    setStatus("Saving properties...");
+    try {
+      await saveGroupProps(props);
+      setPendingProps(null);
+      setStatus("");
+    } catch (error) {
+      setStatus(`ERROR: ${error}`);
+    }
+  }
+
+  async function openCopyDialog(node: TreeNodeDto) {
+    setStatus("Loading folders...");
+    try {
+      const folders = await listDimensionFolders();
+      // Preselect the source group's own folder when its path can be resolved.
+      const parentPath = activeBreadcrumb.split(" / ").filter(Boolean).slice(0, -1).join("/");
+      const defaultFolderId = folders.find((folder) => folder.path === parentPath)?.id ?? folders[0]?.id ?? null;
+      setPendingCopy({ node, folders, defaultFolderId });
+      setStatus("");
+    } catch (error) {
+      setStatus(`ERROR: ${error}`);
+    }
+  }
+
+  async function confirmCopy(targetFolderId: number, name: string, copyDimensions: boolean) {
+    if (!pendingCopy) return;
+    setStatus("Copying dimension group...");
+    try {
+      await copyDimensionGroup(pendingCopy.node.id, targetFolderId, name, copyDimensions);
+      setPendingCopy(null);
+      setStatus("");
+    } catch (error) {
+      setStatus(`ERROR: ${error}`);
+    }
+  }
+
+  // Ribbon → pane bridge: the ribbon's Dimension Group buttons bump `dgPaneCommand.seq`;
+  // open the matching dialog for the active group. Properties/Copy build a lightweight node
+  // from the active id + breadcrumb name (the tree's childCache may be cleared after refreshes).
+  useEffect(() => {
+    if (!dgPaneCommand || dgPaneCommand.seq === lastCommandSeq.current) return;
+    lastCommandSeq.current = dgPaneCommand.seq;
+
+    if (dgPaneCommand.action === "add") {
+      setPendingAddGroupPath("");
+      return;
+    }
+
+    if (activeDimensionGroupId === null) return;
+    const name = activeBreadcrumb.split(" / ").filter(Boolean).pop() ?? "Dimension Group";
+    const node: TreeNodeDto = {
+      id: activeDimensionGroupId,
+      tree: "dimensions",
+      node_type: "dimension_group",
+      parent_id: null,
+      name,
+      sort_order: 0,
+      has_children: false,
+      file_path: null,
+      page_count: null,
+      uom: null,
+      colour: null,
+      framing_size: null,
+    };
+
+    if (dgPaneCommand.action === "properties") {
+      void openProperties(node);
+    } else if (dgPaneCommand.action === "copy") {
+      void openCopyDialog(node);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dgPaneCommand]);
+
+  // Clears the active group's measurements — the only way to remove drawn dimensions
+  // until per-measurement delete lands in M5. Scoped to the active group so it never
+  // touches other concurrently-rendered groups.
+  const activeGroupMeasurements = overlayMeasurements.filter(
+    (measurement) => measurement.dimension_group_id === activeDimensionGroupId,
+  );
+
+  async function handleClearMeasures() {
+    setStatus("Clearing measurements...");
+    try {
+      for (const measurement of [...activeGroupMeasurements]) {
+        await deleteMeasurement(measurement.id);
+      }
+      setStatus("");
+    } catch (error) {
+      setStatus(`ERROR: ${error}`);
+    }
+  }
+  // -----------------------------------------------------------------------------
+
   const activeNodeId = activeDimensionGroupId ?? selectedFolderId;
 
   return (
@@ -355,7 +580,7 @@ export function DimensionGroupPane() {
       </div>
       <div style={{ display: "flex", gap: 6, padding: 6, borderBottom: `1px solid ${theme.border.subtle}` }}>
         <button
-          onClick={() => setPendingFolderParent({ id: 0, tree: "dimensions", node_type: "folder", parent_id: null, name: "root", sort_order: 0, has_children: false, file_path: null, page_count: null, uom: null, colour: null })}
+          onClick={() => setPendingFolderParent({ id: 0, tree: "dimensions", node_type: "folder", parent_id: null, name: "root", sort_order: 0, has_children: false, file_path: null, page_count: null, uom: null, colour: null, framing_size: null })}
           style={{
             height: 24,
             padding: "0 8px",
@@ -367,20 +592,6 @@ export function DimensionGroupPane() {
           }}
         >
           Add Folder
-        </button>
-        <button
-          onClick={() => setPendingAddGroupPath("")}
-          style={{
-            height: 24,
-            padding: "0 8px",
-            background: theme.bg.input,
-            color: theme.text.primary,
-            border: `1px solid ${theme.border.divider}`,
-            cursor: "pointer",
-            fontSize: 12,
-          }}
-        >
-          Add Group
         </button>
       </div>
       <div style={{ display: "grid", gridTemplateColumns: gridColumns, minWidth: 360, height: 24, borderBottom: `1px solid ${theme.border.subtle}`, background: theme.bg.shell, color: theme.text.primary, fontSize: 12 }}>
@@ -400,6 +611,9 @@ export function DimensionGroupPane() {
             node={node}
             depth={0}
             activeNodeId={activeNodeId}
+            selectedGroupIds={selectedGroupIds}
+            groupTotals={groupTotals}
+            groupFramingBreakdowns={groupFramingBreakdowns}
             onNodeClick={handleNodeClick}
             onContextMenu={handleContextMenu}
           />
@@ -420,7 +634,30 @@ export function DimensionGroupPane() {
             <div style={{ color: theme.text.primary, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{activeBreadcrumb}</div>
             <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 4 }}>
               <span style={{ width: 10, height: 10, background: overlayColour, border: `1px solid ${theme.border.divider}` }} />
-              <span>{overlayMeasurements.length} measurements loaded</span>
+              <span>{activeGroupMeasurements.length} dimensions</span>
+              {activeDimensionGroupId !== null && groupTotals[activeDimensionGroupId] ? (
+                <span style={{ marginLeft: "auto", color: theme.text.primary }}>
+                  {quantityValueText(groupTotals[activeDimensionGroupId]!)} {groupTotals[activeDimensionGroupId]!.uom}
+                </span>
+              ) : null}
+            </div>
+            <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+              <button
+                onClick={() => void handleClearMeasures()}
+                disabled={activeGroupMeasurements.length === 0}
+                title="Delete the active group's measurements"
+                style={{
+                  height: 22,
+                  padding: "0 8px",
+                  background: theme.bg.input,
+                  color: activeGroupMeasurements.length === 0 ? theme.text.disabled : theme.text.primary,
+                  border: `1px solid ${theme.border.divider}`,
+                  cursor: activeGroupMeasurements.length === 0 ? "default" : "pointer",
+                  fontSize: 11,
+                }}
+              >
+                Clear measures
+              </button>
             </div>
           </>
         ) : (
@@ -458,6 +695,12 @@ export function DimensionGroupPane() {
                     label: "Select Group",
                     action: () => {
                       void handleNodeClick(contextMenu.node);
+                    },
+                  },
+                  {
+                    label: "Properties",
+                    action: () => {
+                      void openProperties(contextMenu.node);
                     },
                   },
                   {
@@ -542,6 +785,28 @@ export function DimensionGroupPane() {
           onCancel={() => setPendingDelete(null)}
           onConfirm={() => {
             void confirmDeleteNode();
+          }}
+        />
+      ) : null}
+      {pendingProps ? (
+        <DimensionGroupPropertiesDialog
+          groupName={pendingProps.node.name}
+          initial={pendingProps.props}
+          framingWalls={pendingProps.framingWalls}
+          onCancel={() => setPendingProps(null)}
+          onConfirm={(props) => {
+            void confirmProperties(props);
+          }}
+        />
+      ) : null}
+      {pendingCopy ? (
+        <DimensionGroupCopyDialog
+          sourceName={pendingCopy.node.name}
+          folders={pendingCopy.folders}
+          defaultFolderId={pendingCopy.defaultFolderId}
+          onCancel={() => setPendingCopy(null)}
+          onConfirm={(targetFolderId, name, copyDimensions) => {
+            void confirmCopy(targetFolderId, name, copyDimensions);
           }}
         />
       ) : null}

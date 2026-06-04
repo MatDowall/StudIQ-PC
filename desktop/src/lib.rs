@@ -196,6 +196,9 @@ pub struct TreeNodeDto {
     pub page_count: Option<i64>,
     pub uom: Option<String>,
     pub colour: Option<String>,
+    /// Framing size (e.g. "90x45") for a timber-framing dimension group; `None` otherwise.
+    /// Surfaced on the node so the tree row can show it without loading the group's props.
+    pub framing_size: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
@@ -206,8 +209,62 @@ pub struct MeasurementDto {
     pub page_index: i64,
     pub measurement_type: String,
     pub geometry_json: String,
+    pub polarity: i64,
     pub quantity: Option<f64>,
     pub uom: Option<String>,
+    /// Per-wall timber-framing extras (door/window openings, raking, manual studs) as an opaque
+    /// JSON blob; `None` for non-framing measurements. The frontend owns the shape.
+    pub framing_json: Option<String>,
+}
+
+/// Per-drawing-page scale. `mm_per_point` converts PDF points to real-world millimetres
+/// (the canonical internal unit); `unit` is the user's preferred display unit (e.g. "m").
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct PageScaleDto {
+    pub drawing_id: i64,
+    pub page_index: i64,
+    pub mm_per_point: f64,
+    pub unit: String,
+}
+
+/// CostX-style dimension-group properties. Width/height/offset are in metres (the unit
+/// the dialog edits); multiplier is unitless. `measurement_type` is how dimensions are
+/// drawn; `default_display` is how the quantity is derived (see the derivation matrix).
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct DimensionGroupPropsDto {
+    pub node_id: i64,
+    pub measurement_type: String,
+    pub default_display: String,
+    pub default_multiplier: f64,
+    pub default_width: f64,
+    pub default_height: f64,
+    pub default_offset: f64,
+    pub add_to_gfa: bool,
+    pub pos_colour: String,
+    pub pos_style: String,
+    pub neg_colour: String,
+    pub neg_style: String,
+    pub weight_uom: Option<String>,
+    /// Timber-framing settings (framing size, stud spacing, plate config, wall height, dwang
+    /// centres) as an opaque JSON blob. `None` for non-framing groups. The frontend owns the
+    /// shape; the backend stores and round-trips it without interpreting it.
+    pub framing_props_json: Option<String>,
+}
+
+/// A selectable destination folder in the dimensions tree, with its full `/`-joined path.
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct FolderOptionDto {
+    pub id: i64,
+    pub path: String,
+}
+
+/// A single on-page vertex in PDF points, Y-up. Used to validate `geometry_json`.
+#[derive(serde::Deserialize)]
+struct GeometryPoint {
+    #[allow(dead_code)]
+    x: f64,
+    #[allow(dead_code)]
+    y: f64,
 }
 
 fn active_project_db(state: &AppState) -> Result<SqlitePool, String> {
@@ -797,6 +854,137 @@ async fn create_dimension_group_in_folder_path(
     create_dimension_group(Some(folder_id), name, colour, state).await
 }
 
+/// Lists every folder in the dimensions tree with its full `/`-joined path. Drives the
+/// "copy to folder" picker, which must show all folders regardless of tree expansion state.
+#[tauri::command]
+async fn list_dimension_folders(
+    state: State<'_, AppState>,
+) -> Result<Vec<FolderOptionDto>, String> {
+    let db = active_project_db(&state)?;
+    let rows = sqlx::query(
+        "SELECT id, parent_id, name FROM tree_nodes WHERE tree = 'dimensions' AND node_type = 'folder'",
+    )
+    .fetch_all(&db)
+    .await
+    .map_err(|e| format!("Failed to list dimension folders: {e}"))?;
+
+    // id -> (parent_id, name), so each folder's path can be walked up to the root.
+    let mut info: std::collections::HashMap<i64, (Option<i64>, String)> = std::collections::HashMap::new();
+    for row in &rows {
+        let id: i64 = row.try_get("id").map_err(|e: sqlx::Error| e.to_string())?;
+        let parent_id: Option<i64> = row.try_get("parent_id").map_err(|e: sqlx::Error| e.to_string())?;
+        let name: String = row.try_get("name").map_err(|e: sqlx::Error| e.to_string())?;
+        info.insert(id, (parent_id, name));
+    }
+
+    let mut options: Vec<FolderOptionDto> = info
+        .keys()
+        .map(|&id| {
+            let mut segments: Vec<String> = Vec::new();
+            let mut current = Some(id);
+            let mut guard = 0;
+            while let Some(node_id) = current {
+                let Some((parent, name)) = info.get(&node_id) else { break };
+                segments.push(name.clone());
+                current = *parent;
+                guard += 1;
+                if guard > 1000 {
+                    break; // defensive cycle guard
+                }
+            }
+            segments.reverse();
+            FolderOptionDto { id, path: segments.join("/") }
+        })
+        .collect();
+    options.sort_by(|a, b| a.path.to_lowercase().cmp(&b.path.to_lowercase()));
+    Ok(options)
+}
+
+/// Copies a dimension group into `target_folder_id` as a new group named `name`. The source
+/// colour and CostX props row are duplicated; measurements are duplicated only when
+/// `copy_dimensions` is set. Verifies node types before acting (per project convention).
+#[tauri::command]
+async fn copy_dimension_group(
+    source_node_id: i64,
+    target_folder_id: i64,
+    name: String,
+    copy_dimensions: bool,
+    state: State<'_, AppState>,
+) -> Result<TreeNodeDto, String> {
+    let db = active_project_db(&state)?;
+    verify_node_type(&db, source_node_id, "dimension_group").await?;
+    verify_node_type(&db, target_folder_id, "folder").await?;
+
+    let name = clean_node_name(&name)?;
+
+    let source_colour: String = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT colour FROM tree_nodes WHERE id = ?",
+    )
+    .bind(source_node_id)
+    .fetch_optional(&db)
+    .await
+    .map_err(|e| format!("Failed to read source colour: {e}"))?
+    .flatten()
+    .unwrap_or_else(|| "#4A9EFF".to_string());
+
+    let sort_order = next_sort_order(&db, "dimensions", Some(target_folder_id)).await?;
+
+    let result = sqlx::query(
+        r#"
+        INSERT INTO tree_nodes (tree, node_type, parent_id, name, sort_order, colour)
+        VALUES ('dimensions', 'dimension_group', ?, ?, ?, ?)
+        "#,
+    )
+    .bind(target_folder_id)
+    .bind(&name)
+    .bind(sort_order)
+    .bind(&source_colour)
+    .execute(&db)
+    .await
+    .map_err(|e| format!("Failed to create dimension group copy: {e}"))?;
+
+    let new_id = result.last_insert_rowid();
+
+    // Duplicate the CostX props row, if the source has one.
+    sqlx::query(
+        r#"
+        INSERT INTO dimension_group_props
+            (node_id, measurement_type, default_display, default_multiplier, default_width,
+             default_height, default_offset, add_to_gfa, pos_colour, pos_style, neg_colour,
+             neg_style, weight_uom, framing_props_json)
+        SELECT ?, measurement_type, default_display, default_multiplier, default_width,
+               default_height, default_offset, add_to_gfa, pos_colour, pos_style, neg_colour,
+               neg_style, weight_uom, framing_props_json
+        FROM dimension_group_props WHERE node_id = ?
+        "#,
+    )
+    .bind(new_id)
+    .bind(source_node_id)
+    .execute(&db)
+    .await
+    .map_err(|e| format!("Failed to copy dimension group props: {e}"))?;
+
+    if copy_dimensions {
+        sqlx::query(
+            r#"
+            INSERT INTO measurements
+                (dimension_group_id, drawing_id, page_index, measurement_type,
+                 geometry_json, polarity, quantity, uom, framing_json)
+            SELECT ?, drawing_id, page_index, measurement_type,
+                   geometry_json, polarity, quantity, uom, framing_json
+            FROM measurements WHERE dimension_group_id = ?
+            "#,
+        )
+        .bind(new_id)
+        .bind(source_node_id)
+        .execute(&db)
+        .await
+        .map_err(|e| format!("Failed to copy dimensions: {e}"))?;
+    }
+
+    get_tree_node(&db, new_id).await
+}
+
 #[tauri::command]
 async fn add_drawing_to_folder_path(
     folder_path: String,
@@ -942,8 +1130,10 @@ async fn get_measurements_for_group(
             page_index,
             measurement_type,
             geometry_json,
+            polarity,
             quantity,
-            uom
+            uom,
+            framing_json
         FROM measurements
         WHERE dimension_group_id = ?
         ORDER BY id
@@ -954,22 +1144,418 @@ async fn get_measurements_for_group(
     .await
     .map_err(|e| format!("Failed to load measurements: {e}"))?;
 
-    rows.into_iter()
-        .map(|row| {
-            Ok(MeasurementDto {
-                id: row.try_get("id").map_err(|e| e.to_string())?,
-                dimension_group_id: row
-                    .try_get("dimension_group_id")
-                    .map_err(|e| e.to_string())?,
-                drawing_id: row.try_get("drawing_id").map_err(|e| e.to_string())?,
-                page_index: row.try_get("page_index").map_err(|e| e.to_string())?,
-                measurement_type: row.try_get("measurement_type").map_err(|e| e.to_string())?,
-                geometry_json: row.try_get("geometry_json").map_err(|e| e.to_string())?,
-                quantity: row.try_get("quantity").map_err(|e| e.to_string())?,
-                uom: row.try_get("uom").map_err(|e| e.to_string())?,
-            })
+    rows.iter().map(measurement_from_row).collect()
+}
+
+/// Maps a `measurements` row (selected with the canonical column list) to a `MeasurementDto`.
+fn measurement_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<MeasurementDto, String> {
+    Ok(MeasurementDto {
+        id: row.try_get("id").map_err(|e| e.to_string())?,
+        dimension_group_id: row
+            .try_get("dimension_group_id")
+            .map_err(|e| e.to_string())?,
+        drawing_id: row.try_get("drawing_id").map_err(|e| e.to_string())?,
+        page_index: row.try_get("page_index").map_err(|e| e.to_string())?,
+        measurement_type: row.try_get("measurement_type").map_err(|e| e.to_string())?,
+        geometry_json: row.try_get("geometry_json").map_err(|e| e.to_string())?,
+        polarity: row.try_get("polarity").map_err(|e| e.to_string())?,
+        quantity: row.try_get("quantity").map_err(|e| e.to_string())?,
+        uom: row.try_get("uom").map_err(|e| e.to_string())?,
+        framing_json: row.try_get("framing_json").map_err(|e| e.to_string())?,
+    })
+}
+
+async fn get_measurement(pool: &SqlitePool, id: i64) -> Result<MeasurementDto, String> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            id,
+            dimension_group_id,
+            drawing_id,
+            page_index,
+            measurement_type,
+            geometry_json,
+            polarity,
+            quantity,
+            uom,
+            framing_json
+        FROM measurements
+        WHERE id = ?
+    "#,
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("Failed to load measurement: {e}"))?
+    .ok_or_else(|| "Measurement was not found".to_string())?;
+
+    measurement_from_row(&row)
+}
+
+/// Creates a measurement under a dimension group on a drawing page.
+///
+/// `geometry_json` must be a JSON array of `{ "x": <pt>, "y": <pt> }` in PDF points, Y-up.
+/// `polarity` is `1` (positive) or `-1` (negative/cutout). Quantity stays null until the
+/// quantity-calculation milestone wires scale + the display derivation.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn create_measurement(
+    dimension_group_id: i64,
+    drawing_id: i64,
+    page_index: i64,
+    measurement_type: String,
+    geometry_json: String,
+    polarity: i64,
+    quantity: Option<f64>,
+    uom: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<MeasurementDto, String> {
+    let db = active_project_db(&state)?;
+    verify_node_type(&db, dimension_group_id, "dimension_group").await?;
+    verify_node_type(&db, drawing_id, "drawing").await?;
+
+    if !matches!(measurement_type.as_str(), "count" | "length" | "area" | "timber_framing") {
+        return Err(format!(
+            "Unsupported measurement_type: {measurement_type}"
+        ));
+    }
+    if !matches!(polarity, 1 | -1) {
+        return Err("polarity must be 1 (positive) or -1 (negative)".to_string());
+    }
+
+    // Validate geometry parses as a non-empty array of {x, y} points before storing.
+    let points: Vec<GeometryPoint> = serde_json::from_str(&geometry_json)
+        .map_err(|e| format!("Invalid geometry_json: {e}"))?;
+    if points.is_empty() {
+        return Err("geometry_json must contain at least one point".to_string());
+    }
+
+    let result = sqlx::query(
+        r#"
+        INSERT INTO measurements
+            (dimension_group_id, drawing_id, page_index, measurement_type,
+             geometry_json, polarity, quantity, uom)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(dimension_group_id)
+    .bind(drawing_id)
+    .bind(page_index)
+    .bind(&measurement_type)
+    .bind(&geometry_json)
+    .bind(polarity)
+    .bind(quantity)
+    .bind(&uom)
+    .execute(&db)
+    .await
+    .map_err(|e| format!("Failed to create measurement: {e}"))?;
+
+    get_measurement(&db, result.last_insert_rowid()).await
+}
+
+/// Replaces a measurement's geometry (e.g. after dragging a vertex). `geometry_json`
+/// must be a JSON array of `{ "x": <pt>, "y": <pt> }` in PDF points, Y-up.
+#[tauri::command]
+async fn update_measurement_geometry(
+    measurement_id: i64,
+    geometry_json: String,
+    state: State<'_, AppState>,
+) -> Result<MeasurementDto, String> {
+    let db = active_project_db(&state)?;
+
+    let points: Vec<GeometryPoint> = serde_json::from_str(&geometry_json)
+        .map_err(|e| format!("Invalid geometry_json: {e}"))?;
+    if points.is_empty() {
+        return Err("geometry_json must contain at least one point".to_string());
+    }
+
+    let result = sqlx::query("UPDATE measurements SET geometry_json = ? WHERE id = ?")
+        .bind(&geometry_json)
+        .bind(measurement_id)
+        .execute(&db)
+        .await
+        .map_err(|e| format!("Failed to update measurement: {e}"))?;
+
+    if result.rows_affected() == 0 {
+        return Err("Measurement was not found".to_string());
+    }
+
+    get_measurement(&db, measurement_id).await
+}
+
+/// Replaces a measurement's per-wall framing extras (door/window openings, raking, manual studs).
+/// `framing_json` is stored opaquely; pass `None`/null to clear it.
+#[tauri::command]
+async fn update_measurement_framing(
+    measurement_id: i64,
+    framing_json: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<MeasurementDto, String> {
+    let db = active_project_db(&state)?;
+
+    let result = sqlx::query("UPDATE measurements SET framing_json = ? WHERE id = ?")
+        .bind(&framing_json)
+        .bind(measurement_id)
+        .execute(&db)
+        .await
+        .map_err(|e| format!("Failed to update measurement framing: {e}"))?;
+
+    if result.rows_affected() == 0 {
+        return Err("Measurement was not found".to_string());
+    }
+
+    get_measurement(&db, measurement_id).await
+}
+
+#[tauri::command]
+async fn delete_measurement(
+    measurement_id: i64,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let db = active_project_db(&state)?;
+
+    let result = sqlx::query("DELETE FROM measurements WHERE id = ?")
+        .bind(measurement_id)
+        .execute(&db)
+        .await
+        .map_err(|e| format!("Failed to delete measurement: {e}"))?;
+
+    if result.rows_affected() == 0 {
+        return Err("Measurement was not found".to_string());
+    }
+
+    Ok(())
+}
+
+/// Stores (or replaces) the scale for a drawing page. `mm_per_point` is real-world
+/// millimetres per PDF point; `unit` is the preferred display unit.
+#[tauri::command]
+async fn set_page_scale(
+    drawing_id: i64,
+    page_index: i64,
+    mm_per_point: f64,
+    unit: String,
+    state: State<'_, AppState>,
+) -> Result<PageScaleDto, String> {
+    let db = active_project_db(&state)?;
+    verify_node_type(&db, drawing_id, "drawing").await?;
+
+    if !(mm_per_point.is_finite() && mm_per_point > 0.0) {
+        return Err("mm_per_point must be a positive number".to_string());
+    }
+    if !matches!(unit.as_str(), "mm" | "cm" | "m") {
+        return Err(format!("Unsupported scale unit: {unit}"));
+    }
+
+    sqlx::query(
+        r#"
+        INSERT INTO page_scales (drawing_id, page_index, mm_per_point, unit)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(drawing_id, page_index)
+            DO UPDATE SET mm_per_point = excluded.mm_per_point, unit = excluded.unit
+        "#,
+    )
+    .bind(drawing_id)
+    .bind(page_index)
+    .bind(mm_per_point)
+    .bind(&unit)
+    .execute(&db)
+    .await
+    .map_err(|e| format!("Failed to set page scale: {e}"))?;
+
+    Ok(PageScaleDto {
+        drawing_id,
+        page_index,
+        mm_per_point,
+        unit,
+    })
+}
+
+#[tauri::command]
+async fn get_page_scale(
+    drawing_id: i64,
+    page_index: i64,
+    state: State<'_, AppState>,
+) -> Result<Option<PageScaleDto>, String> {
+    let db = active_project_db(&state)?;
+
+    let row = sqlx::query(
+        r#"
+        SELECT drawing_id, page_index, mm_per_point, unit
+        FROM page_scales
+        WHERE drawing_id = ? AND page_index = ?
+        "#,
+    )
+    .bind(drawing_id)
+    .bind(page_index)
+    .fetch_optional(&db)
+    .await
+    .map_err(|e| format!("Failed to load page scale: {e}"))?;
+
+    row.map(|row| {
+        Ok(PageScaleDto {
+            drawing_id: row.try_get("drawing_id").map_err(|e: sqlx::Error| e.to_string())?,
+            page_index: row.try_get("page_index").map_err(|e: sqlx::Error| e.to_string())?,
+            mm_per_point: row.try_get("mm_per_point").map_err(|e: sqlx::Error| e.to_string())?,
+            unit: row.try_get("unit").map_err(|e: sqlx::Error| e.to_string())?,
         })
-        .collect()
+    })
+    .transpose()
+}
+
+const MEASUREMENT_TYPES: [&str; 4] = ["count", "length", "area", "timber_framing"];
+const DISPLAY_TYPES: [&str; 6] = ["count", "length", "area", "wall_area", "volume", "weight"];
+const LINE_STYLES: [&str; 4] = ["solid", "dashed", "dotted", "dash_dot"];
+
+/// Returns a dimension group's properties, or sensible defaults if none are stored yet
+/// (defaulting `pos_colour` to the group's tree colour).
+#[tauri::command]
+async fn get_dimension_group_props(
+    node_id: i64,
+    state: State<'_, AppState>,
+) -> Result<DimensionGroupPropsDto, String> {
+    let db = active_project_db(&state)?;
+    verify_node_type(&db, node_id, "dimension_group").await?;
+
+    // `tree_nodes.colour` is the single source of truth for the positive colour (kept in
+    // sync by both "Change Colour" and the properties dialog), so always source it from there.
+    let pos_colour: String = sqlx::query_scalar::<_, Option<String>>("SELECT colour FROM tree_nodes WHERE id = ?")
+        .bind(node_id)
+        .fetch_optional(&db)
+        .await
+        .map_err(|e| format!("Failed to read group colour: {e}"))?
+        .flatten()
+        .unwrap_or_else(|| "#4A9EFF".to_string());
+
+    let row = sqlx::query(
+        r#"
+        SELECT measurement_type, default_display, default_multiplier, default_width,
+               default_height, default_offset, add_to_gfa, pos_style,
+               neg_colour, neg_style, weight_uom, framing_props_json
+        FROM dimension_group_props
+        WHERE node_id = ?
+        "#,
+    )
+    .bind(node_id)
+    .fetch_optional(&db)
+    .await
+    .map_err(|e| format!("Failed to load dimension group props: {e}"))?;
+
+    if let Some(row) = row {
+        return Ok(DimensionGroupPropsDto {
+            node_id,
+            measurement_type: row.try_get("measurement_type").map_err(|e| e.to_string())?,
+            default_display: row.try_get("default_display").map_err(|e| e.to_string())?,
+            default_multiplier: row.try_get("default_multiplier").map_err(|e| e.to_string())?,
+            default_width: row.try_get("default_width").map_err(|e| e.to_string())?,
+            default_height: row.try_get("default_height").map_err(|e| e.to_string())?,
+            default_offset: row.try_get("default_offset").map_err(|e| e.to_string())?,
+            add_to_gfa: row.try_get::<i64, _>("add_to_gfa").map_err(|e| e.to_string())? != 0,
+            pos_colour,
+            pos_style: row.try_get("pos_style").map_err(|e| e.to_string())?,
+            neg_colour: row.try_get("neg_colour").map_err(|e| e.to_string())?,
+            neg_style: row.try_get("neg_style").map_err(|e| e.to_string())?,
+            weight_uom: row.try_get("weight_uom").map_err(|e| e.to_string())?,
+            framing_props_json: row.try_get("framing_props_json").map_err(|e| e.to_string())?,
+        });
+    }
+
+    // No stored row yet — derive defaults.
+    Ok(DimensionGroupPropsDto {
+        node_id,
+        measurement_type: "length".to_string(),
+        default_display: "length".to_string(),
+        default_multiplier: 1.0,
+        default_width: 0.0,
+        default_height: 0.0,
+        default_offset: 0.0,
+        add_to_gfa: false,
+        pos_colour,
+        pos_style: "solid".to_string(),
+        neg_colour: "#FF0000".to_string(),
+        neg_style: "solid".to_string(),
+        weight_uom: None,
+        framing_props_json: None,
+    })
+}
+
+#[tauri::command]
+async fn set_dimension_group_props(
+    props: DimensionGroupPropsDto,
+    state: State<'_, AppState>,
+) -> Result<DimensionGroupPropsDto, String> {
+    let db = active_project_db(&state)?;
+    verify_node_type(&db, props.node_id, "dimension_group").await?;
+
+    if !MEASUREMENT_TYPES.contains(&props.measurement_type.as_str()) {
+        return Err(format!("Unsupported measurement_type: {}", props.measurement_type));
+    }
+    if !DISPLAY_TYPES.contains(&props.default_display.as_str()) {
+        return Err(format!("Unsupported default_display: {}", props.default_display));
+    }
+    if !LINE_STYLES.contains(&props.pos_style.as_str()) || !LINE_STYLES.contains(&props.neg_style.as_str()) {
+        return Err("Unsupported line style".to_string());
+    }
+    if !props.default_multiplier.is_finite() {
+        return Err("default_multiplier must be a finite number".to_string());
+    }
+    let pos_colour = clean_colour(&props.pos_colour)?;
+    let neg_colour = clean_colour(&props.neg_colour)?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO dimension_group_props
+            (node_id, measurement_type, default_display, default_multiplier, default_width,
+             default_height, default_offset, add_to_gfa, pos_colour, pos_style, neg_colour,
+             neg_style, weight_uom, framing_props_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(node_id) DO UPDATE SET
+            measurement_type = excluded.measurement_type,
+            default_display = excluded.default_display,
+            default_multiplier = excluded.default_multiplier,
+            default_width = excluded.default_width,
+            default_height = excluded.default_height,
+            default_offset = excluded.default_offset,
+            add_to_gfa = excluded.add_to_gfa,
+            pos_colour = excluded.pos_colour,
+            pos_style = excluded.pos_style,
+            neg_colour = excluded.neg_colour,
+            neg_style = excluded.neg_style,
+            weight_uom = excluded.weight_uom,
+            framing_props_json = excluded.framing_props_json
+        "#,
+    )
+    .bind(props.node_id)
+    .bind(&props.measurement_type)
+    .bind(&props.default_display)
+    .bind(props.default_multiplier)
+    .bind(props.default_width)
+    .bind(props.default_height)
+    .bind(props.default_offset)
+    .bind(props.add_to_gfa as i64)
+    .bind(&pos_colour)
+    .bind(&props.pos_style)
+    .bind(&neg_colour)
+    .bind(&props.neg_style)
+    .bind(&props.weight_uom)
+    .bind(&props.framing_props_json)
+    .execute(&db)
+    .await
+    .map_err(|e| format!("Failed to save dimension group props: {e}"))?;
+
+    // Keep the tree node's colour in sync with the positive colour (drives the tree swatch).
+    sqlx::query("UPDATE tree_nodes SET colour = ? WHERE id = ? AND node_type = 'dimension_group'")
+        .bind(&pos_colour)
+        .bind(props.node_id)
+        .execute(&db)
+        .await
+        .map_err(|e| format!("Failed to sync group colour: {e}"))?;
+
+    Ok(DimensionGroupPropsDto {
+        pos_colour,
+        neg_colour,
+        ..props
+    })
 }
 
 async fn init_database(db_path: &Path) -> Result<SqlitePool, String> {
@@ -1190,8 +1776,10 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), String> {
             page_index          INTEGER NOT NULL,
             measurement_type    TEXT    NOT NULL,
             geometry_json       TEXT    NOT NULL,
+            polarity            INTEGER NOT NULL DEFAULT 1,
             quantity            REAL,
             uom                 TEXT,
+            framing_json        TEXT,
             created_at          TEXT    NOT NULL DEFAULT (datetime('now'))
         );
         "#,
@@ -1199,6 +1787,30 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), String> {
     .execute(pool)
     .await
     .map_err(|e| format!("Failed to create measurements: {e}"))?;
+
+    // Project DBs created before the Timber Framing openings work lack `framing_json`; add it
+    // idempotently (same guard pattern as measurements.polarity above).
+    if let Err(e) = sqlx::query("ALTER TABLE measurements ADD COLUMN framing_json TEXT")
+        .execute(pool)
+        .await
+    {
+        let msg = e.to_string();
+        if !msg.contains("duplicate column name") {
+            return Err(format!("Failed to add measurements.framing_json: {msg}"));
+        }
+    }
+
+    // Project DBs created before Phase 3 lack `polarity`; add it idempotently.
+    if let Err(e) =
+        sqlx::query("ALTER TABLE measurements ADD COLUMN polarity INTEGER NOT NULL DEFAULT 1")
+            .execute(pool)
+            .await
+    {
+        let msg = e.to_string();
+        if !msg.contains("duplicate column name") {
+            return Err(format!("Failed to add measurements.polarity: {msg}"));
+        }
+    }
 
     sqlx::query(
         r#"
@@ -1209,6 +1821,64 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), String> {
     .execute(pool)
     .await
     .map_err(|e| format!("Failed to create idx_measurements_group: {e}"))?;
+
+    // CostX-style dimension-group properties (measurement type, display derivation,
+    // per-polarity styling). One row per dimension_group tree node. Populated in M4.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS dimension_group_props (
+            node_id            INTEGER PRIMARY KEY REFERENCES tree_nodes(id) ON DELETE CASCADE,
+            measurement_type   TEXT    NOT NULL DEFAULT 'area',
+            default_display    TEXT    NOT NULL DEFAULT 'area',
+            default_multiplier REAL    NOT NULL DEFAULT 1.0,
+            default_width      REAL    NOT NULL DEFAULT 0.0,
+            default_height     REAL    NOT NULL DEFAULT 0.0,
+            default_offset     REAL    NOT NULL DEFAULT 0.0,
+            add_to_gfa         INTEGER NOT NULL DEFAULT 0,
+            pos_colour         TEXT    NOT NULL DEFAULT '#00FF00',
+            pos_style          TEXT    NOT NULL DEFAULT 'solid',
+            neg_colour         TEXT    NOT NULL DEFAULT '#FF0000',
+            neg_style          TEXT    NOT NULL DEFAULT 'solid',
+            weight_uom         TEXT,
+            framing_props_json TEXT
+        );
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| format!("Failed to create dimension_group_props: {e}"))?;
+
+    // Project DBs created before the Timber Framing feature lack `framing_props_json`; add it
+    // idempotently (same pattern as the measurements.polarity migration above).
+    if let Err(e) =
+        sqlx::query("ALTER TABLE dimension_group_props ADD COLUMN framing_props_json TEXT")
+            .execute(pool)
+            .await
+    {
+        let msg = e.to_string();
+        if !msg.contains("duplicate column name") {
+            return Err(format!(
+                "Failed to add dimension_group_props.framing_props_json: {msg}"
+            ));
+        }
+    }
+
+    // Per-drawing-page scale calibration (M3). One row per (drawing, page).
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS page_scales (
+            drawing_id    INTEGER NOT NULL REFERENCES tree_nodes(id) ON DELETE CASCADE,
+            page_index    INTEGER NOT NULL,
+            mm_per_point  REAL    NOT NULL,
+            unit          TEXT    NOT NULL DEFAULT 'm',
+            created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (drawing_id, page_index)
+        );
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| format!("Failed to create page_scales: {e}"))?;
 
     Ok(())
 }
@@ -1233,8 +1903,11 @@ async fn query_tree_nodes(
                     n.file_path,
                     n.page_count,
                     n.uom,
-                    n.colour
+                    n.colour,
+                    CASE WHEN p.measurement_type = 'timber_framing'
+                         THEN json_extract(p.framing_props_json, '$.framingSize') END AS framing_size
                 FROM tree_nodes n
+                LEFT JOIN dimension_group_props p ON p.node_id = n.id
                 WHERE n.tree = ? AND n.parent_id IS NULL
                 ORDER BY n.sort_order, n.name, n.id
                 "#,
@@ -1257,8 +1930,11 @@ async fn query_tree_nodes(
                     n.file_path,
                     n.page_count,
                     n.uom,
-                    n.colour
+                    n.colour,
+                    CASE WHEN p.measurement_type = 'timber_framing'
+                         THEN json_extract(p.framing_props_json, '$.framingSize') END AS framing_size
                 FROM tree_nodes n
+                LEFT JOIN dimension_group_props p ON p.node_id = n.id
                 WHERE n.parent_id = ?
                 ORDER BY n.sort_order, n.name, n.id
                 "#,
@@ -1288,6 +1964,7 @@ async fn query_tree_nodes(
                 page_count: row.try_get("page_count").map_err(|e| e.to_string())?,
                 uom: row.try_get("uom").map_err(|e| e.to_string())?,
                 colour: row.try_get("colour").map_err(|e| e.to_string())?,
+                framing_size: row.try_get("framing_size").map_err(|e| e.to_string())?,
             })
         })
         .collect()
@@ -1516,8 +2193,11 @@ async fn get_tree_node(pool: &SqlitePool, node_id: i64) -> Result<TreeNodeDto, S
             n.file_path,
             n.page_count,
             n.uom,
-            n.colour
+            n.colour,
+            CASE WHEN p.measurement_type = 'timber_framing'
+                 THEN json_extract(p.framing_props_json, '$.framingSize') END AS framing_size
         FROM tree_nodes n
+        LEFT JOIN dimension_group_props p ON p.node_id = n.id
         WHERE n.id = ?
         "#,
     )
@@ -1541,6 +2221,7 @@ async fn get_tree_node(pool: &SqlitePool, node_id: i64) -> Result<TreeNodeDto, S
         page_count: row.try_get("page_count").map_err(|e| e.to_string())?,
         uom: row.try_get("uom").map_err(|e| e.to_string())?,
         colour: row.try_get("colour").map_err(|e| e.to_string())?,
+        framing_size: row.try_get("framing_size").map_err(|e| e.to_string())?,
     })
 }
 
@@ -1639,12 +2320,22 @@ pub fn run() {
             create_folder,
             create_dimension_group,
             create_dimension_group_in_folder_path,
+            list_dimension_folders,
+            copy_dimension_group,
             add_drawing,
             add_drawing_to_folder_path,
             delete_node,
             rename_node,
             update_dimension_group_colour,
-            get_measurements_for_group
+            get_measurements_for_group,
+            create_measurement,
+            update_measurement_geometry,
+            update_measurement_framing,
+            delete_measurement,
+            set_page_scale,
+            get_page_scale,
+            get_dimension_group_props,
+            set_dimension_group_props
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

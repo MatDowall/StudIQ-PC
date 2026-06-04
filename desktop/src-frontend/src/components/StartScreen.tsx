@@ -55,8 +55,8 @@ export function StartScreen() {
   return (
     <main
       style={{
-        minHeight: "100vh",
-        width: "100vw",
+        minHeight: "100%",
+        width: "100%",
         display: "flex",
         flexDirection: "column",
         alignItems: "center",
@@ -78,8 +78,24 @@ export function StartScreen() {
         }}
       >
         <header style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          <div style={{ fontSize: 13, color: theme.text.secondary }}>Take-it-Off</div>
-          <h1 style={{ margin: 0, color: theme.text.primary, fontSize: 36, fontWeight: 500, lineHeight: "42px" }}>Take-it-Off</h1>
+          {/* Placeholder for the project logo — swap for an <img> once the asset is defined. */}
+          <div
+            aria-label="Project logo placeholder"
+            style={{
+              width: 220,
+              height: 72,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              border: `1px dashed ${theme.border.divider}`,
+              borderRadius: 4,
+              color: theme.text.disabled,
+              fontSize: 13,
+              letterSpacing: 1,
+            }}
+          >
+            LOGO
+          </div>
         </header>
 
         <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>

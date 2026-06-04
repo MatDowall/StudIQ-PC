@@ -44,8 +44,8 @@ export default function App() {
         display: "grid",
         gridTemplateRows: `${theme.ribbonHeight}px 1fr`,
         gridTemplateColumns: `${leftWidth}px 1fr`,
-        height: "100vh",
-        width: "100vw",
+        height: "100%",
+        width: "100%",
         overflow: "hidden",
         background: theme.bg.shell,
       }}

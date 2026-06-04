@@ -24,6 +24,6 @@ export const theme = {
   rowHeight: 22,
   ribbonHeight: 48,
   tabHeight: 28,
-  leftPaneWidth: 320,
+  leftPaneWidth: 380,
 };
 
