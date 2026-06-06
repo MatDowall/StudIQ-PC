@@ -20,6 +20,8 @@ export interface TreeNodeDto {
   // Framing size (e.g. "90x45") for timber-framing groups; null otherwise. Lets the tree row
   // show the size without loading the group's props.
   framing_size: string | null;
+  // measurement_type from dimension_group_props; null for non-dimension-group nodes.
+  measurement_type: string | null;
 }
 
 export interface MeasurementDto {
@@ -60,6 +62,7 @@ export interface ProjectMeta {
   name: string;
   client: string;
   contract_number: string;
+  status: string;
   file_path: string;
   created_at: string;
   last_opened_at: string;
@@ -69,6 +72,7 @@ export interface RecentProject {
   name: string;
   client: string;
   contract_number: string;
+  status: string;
   file_path: string;
   last_opened_at: string;
   file_exists: boolean;
@@ -146,6 +150,7 @@ interface AppStore {
   vectorIndex: Record<number, IndexedPrimitive[]>;
   snapPoint: SnapPoint | null;
   snapType: SnapType | null;
+  snapEnabled: boolean;
   // "point" = click-to-place vertices (default); "line" = auto-detect wall segment on hover.
   drawingType: "point" | "line";
   // Live proposed measurement for line mode: the detected wall extended to its intersections.
@@ -162,12 +167,14 @@ interface AppStore {
   overlayColour: string;
   // "add" = click to place new dimensions; "select" = pick/edit/delete existing ones.
   viewerMode: ViewerMode;
-  selectedMeasurementId: number | null;
+  selectedMeasurementIds: number[];
   // When set, the viewer is placing a door/window opening: hovering a framing wall shows a ghost
   // that commits onto the wall on click. Overrides add/select while active.
   openingPlacement: OpeningTemplate | null;
   // Drawing ribbon: false = 2D plan view (default), true = 3D framing view.
   view3d: boolean;
+  // 0..1: opacity of PDF linework (1 = full, no dimming). Lets measurements stand out.
+  drawingDimmer: number;
   // Scale of the active drawing page, and whether the calibration capture is in progress.
   pageScale: PageScaleDto | null;
   calibrating: boolean;
@@ -181,10 +188,14 @@ interface AppStore {
   dgPaneCommand: { action: DgPaneCommand; seq: number } | null;
 
   setActiveProject: (project: ProjectMeta | null) => void;
+  setSnapEnabled: (on: boolean) => void;
   setViewerMode: (mode: ViewerMode) => void;
   setOpeningPlacement: (template: OpeningTemplate | null) => void;
   setView3d: (on: boolean) => void;
+  setDrawingDimmer: (value: number) => void;
   selectMeasurement: (measurementId: number | null) => void;
+  toggleSelectMeasurement: (measurementId: number) => void;
+  setSelectedMeasurementIds: (ids: number[]) => void;
   updateMeasurementGeometry: (measurementId: number, geometryJson: string) => Promise<void>;
   updateMeasurementFraming: (measurementId: number, framingJson: string | null) => Promise<void>;
   setCalibrating: (calibrating: boolean) => void;
@@ -195,13 +206,16 @@ interface AppStore {
   createProject: (name: string, client: string, contractNumber: string, filePath: string) => Promise<void>;
   openProject: (filePath: string) => Promise<void>;
   closeProject: () => Promise<void>;
+  exportProject: (destPath: string) => Promise<void>;
+  removeRecentProject: (filePath: string) => Promise<void>;
+  updateProjectMeta: (name: string, client: string, contractNumber: string, status: string) => Promise<void>;
   loadRecentProjects: () => Promise<void>;
   loadRoots: (tree: "drawings" | "dimensions") => Promise<void>;
   loadChildren: (parentId: number, force?: boolean) => Promise<void>;
   createFolder: (tree: string, parentId: number | null, name: string) => Promise<TreeNodeDto>;
   addDrawing: (parentId: number | null, name: string, filePath: string) => Promise<void>;
   addDrawingToFolderPath: (folderPath: string, name: string, filePath: string) => Promise<void>;
-  createDimensionGroupInFolderPath: (folderPath: string, name: string, colour: string) => Promise<void>;
+  createDimensionGroupInFolderPath: (folderPath: string, name: string, colour: string, measurementType: string) => Promise<void>;
   listDimensionFolders: () => Promise<FolderOption[]>;
   copyDimensionGroup: (sourceNodeId: number, targetFolderId: number, name: string, copyDimensions: boolean) => Promise<void>;
   requestDgPaneCommand: (action: DgPaneCommand) => void;
@@ -469,6 +483,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
   vectorIndex: {},
   snapPoint: null,
   snapType: null,
+  snapEnabled: true,
   drawingType: "point",
   lineSnapResult: null,
 
@@ -480,9 +495,10 @@ export const useAppStore = create<AppStore>((set, get) => ({
   overlayMeasurements: [],
   overlayColour: "#4A9EFF",
   viewerMode: "add",
-  selectedMeasurementId: null,
+  selectedMeasurementIds: [],
   openingPlacement: null,
   view3d: false,
+  drawingDimmer: 1,
   pageScale: null,
   calibrating: false,
   groupProps: {},
@@ -492,6 +508,10 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   setActiveProject: (project) => {
     set({ activeProject: project });
+  },
+
+  setSnapEnabled: (on) => {
+    set({ snapEnabled: on, snapPoint: null, snapType: null, lineSnapResult: null });
   },
 
   setDrawPolarity: (polarity) => {
@@ -540,7 +560,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   setViewerMode: (mode) => {
     // Switching mode cancels any in-progress door/window placement.
-    set((state) => ({ viewerMode: mode, openingPlacement: null, selectedMeasurementId: mode === "add" ? null : state.selectedMeasurementId }));
+    set((state) => ({ viewerMode: mode, openingPlacement: null, selectedMeasurementIds: mode === "add" ? [] : state.selectedMeasurementIds }));
   },
 
   setOpeningPlacement: (template) => {
@@ -551,8 +571,24 @@ export const useAppStore = create<AppStore>((set, get) => ({
     set({ view3d: on });
   },
 
+  setDrawingDimmer: (value) => {
+    set({ drawingDimmer: value });
+  },
+
   selectMeasurement: (measurementId) => {
-    set({ selectedMeasurementId: measurementId });
+    set({ selectedMeasurementIds: measurementId !== null ? [measurementId] : [] });
+  },
+
+  toggleSelectMeasurement: (measurementId) => {
+    set((state) => ({
+      selectedMeasurementIds: state.selectedMeasurementIds.includes(measurementId)
+        ? state.selectedMeasurementIds.filter((id) => id !== measurementId)
+        : [...state.selectedMeasurementIds, measurementId],
+    }));
+  },
+
+  setSelectedMeasurementIds: (ids) => {
+    set({ selectedMeasurementIds: ids });
   },
 
   updateMeasurementGeometry: async (measurementId, geometryJson) => {
@@ -610,10 +646,11 @@ export const useAppStore = create<AppStore>((set, get) => ({
       activeDimensionGroupId: null,
       selectedGroupIds: [],
       groupColours: {},
-      selectedMeasurementId: null,
+      selectedMeasurementIds: [],
       viewerMode: "add",
       openingPlacement: null,
       view3d: false,
+      drawingDimmer: 1,
       pageScale: null,
       calibrating: false,
       groupProps: {},
@@ -623,6 +660,21 @@ export const useAppStore = create<AppStore>((set, get) => ({
       overlayMeasurements: [],
       overlayColour: "#4A9EFF",
     }));
+    await get().loadRecentProjects();
+  },
+
+  exportProject: async (destPath) => {
+    await invoke<void>("export_project", { destPath });
+  },
+
+  removeRecentProject: async (filePath) => {
+    await invoke<void>("remove_recent_project", { filePath });
+    await get().loadRecentProjects();
+  },
+
+  updateProjectMeta: async (name, client, contractNumber, status) => {
+    const meta = await invoke<ProjectMeta>("update_project_meta", { name, client, contractNumber, status });
+    set({ activeProject: meta });
     await get().loadRecentProjects();
   },
 
@@ -687,8 +739,8 @@ export const useAppStore = create<AppStore>((set, get) => ({
     await refreshTree("drawings", set);
   },
 
-  createDimensionGroupInFolderPath: async (folderPath, name, colour) => {
-    await invoke<TreeNodeDto>("create_dimension_group_in_folder_path", { folderPath, name, colour });
+  createDimensionGroupInFolderPath: async (folderPath, name, colour, measurementType) => {
+    await invoke<TreeNodeDto>("create_dimension_group_in_folder_path", { folderPath, name, colour, measurementType });
     await refreshTree("dimensions", set);
   },
 
@@ -722,7 +774,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
         selectedGroupIds: [],
         groupColours: {},
         groupProps: {},
-        selectedMeasurementId: null,
+        selectedMeasurementIds: [],
         activeBreadcrumb: "",
         overlayMeasurements: [],
         overlayColour: "#4A9EFF",
@@ -836,7 +888,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
       groupColours,
       groupProps,
       scaleCache,
-      selectedMeasurementId: null,
+      selectedMeasurementIds: [],
       activeBreadcrumb: breadcrumb,
       overlayMeasurements: measurements,
       overlayColour: (activeId !== null ? groupColours[activeId] : activeNode?.colour) ?? "#4A9EFF",
@@ -879,7 +931,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
     await invoke("delete_measurement", { measurementId });
     set((state) => ({
       overlayMeasurements: state.overlayMeasurements.filter((measurement) => measurement.id !== measurementId),
-      selectedMeasurementId: state.selectedMeasurementId === measurementId ? null : state.selectedMeasurementId,
+      selectedMeasurementIds: state.selectedMeasurementIds.filter((id) => id !== measurementId),
     }));
   },
 

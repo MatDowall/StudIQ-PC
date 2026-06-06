@@ -148,6 +148,7 @@ pub struct ProjectMeta {
     pub name: String,
     pub client: String,
     pub contract_number: String,
+    pub status: String,
     pub file_path: String,
     pub created_at: String,
     pub last_opened_at: String,
@@ -158,6 +159,7 @@ pub struct RecentProject {
     pub name: String,
     pub client: String,
     pub contract_number: String,
+    pub status: String,
     pub file_path: String,
     pub last_opened_at: String,
     pub file_exists: bool,
@@ -199,6 +201,9 @@ pub struct TreeNodeDto {
     /// Framing size (e.g. "90x45") for a timber-framing dimension group; `None` otherwise.
     /// Surfaced on the node so the tree row can show it without loading the group's props.
     pub framing_size: Option<String>,
+    /// Measurement type from dimension_group_props for dimension_group nodes; `None` for all
+    /// other node types. Surfaced here so icons can be shown without loading full props.
+    pub measurement_type: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
@@ -419,6 +424,68 @@ async fn close_project(state: State<'_, AppState>) -> Result<(), String> {
     let _ = std::fs::create_dir_all(&state.tile_cache_dir);
     refresh_recent_projects(state.inner()).await?;
     Ok(())
+}
+
+#[tauri::command]
+async fn remove_recent_project(file_path: String, state: State<'_, AppState>) -> Result<(), String> {
+    sqlx::query("DELETE FROM recent_projects WHERE file_path = ?")
+        .bind(&file_path)
+        .execute(&state.registry_db)
+        .await
+        .map_err(|e| format!("Failed to remove recent project: {e}"))?;
+    refresh_recent_projects(state.inner()).await
+}
+
+#[tauri::command]
+async fn export_project(dest_path: String, state: State<'_, AppState>) -> Result<(), String> {
+    let src_path = {
+        let guard = state.active_project.lock();
+        guard.as_ref().ok_or("No project open")?.meta.file_path.clone()
+    };
+    std::fs::copy(&src_path, &dest_path).map_err(|e| format!("Failed to export project: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn update_project_meta(
+    name: String,
+    client: String,
+    contract_number: String,
+    status: String,
+    state: State<'_, AppState>,
+) -> Result<ProjectMeta, String> {
+    let name = clean_required_field(&name, "Project name")?;
+    let client = clean_required_field(&client, "Client")?;
+    let contract_number = clean_required_field(&contract_number, "Contract number")?;
+    let status = clean_required_field(&status, "Status")?;
+
+    let db = active_project_db(&state)?;
+    sqlx::query("UPDATE project_meta SET name = ?, client = ?, contract_number = ?, status = ? WHERE id = 1")
+        .bind(&name)
+        .bind(&client)
+        .bind(&contract_number)
+        .bind(&status)
+        .execute(&db)
+        .await
+        .map_err(|e| format!("Failed to update project metadata: {e}"))?;
+
+    let file_path = {
+        let guard = state.active_project.lock();
+        guard.as_ref().ok_or("No project open")?.meta.file_path.clone()
+    };
+    let meta = read_project_meta(&db, &file_path).await?;
+
+    {
+        let mut guard = state.active_project.lock();
+        if let Some(project) = guard.as_mut() {
+            project.meta = meta.clone();
+        }
+    }
+
+    upsert_recent_project(&state.registry_db, &meta).await?;
+    refresh_recent_projects(state.inner()).await?;
+
+    Ok(meta)
 }
 
 #[tauri::command]
@@ -812,6 +879,7 @@ async fn create_dimension_group(
     parent_id: Option<i64>,
     name: String,
     colour: String,
+    measurement_type: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<TreeNodeDto, String> {
     let db = active_project_db(&state)?;
@@ -823,6 +891,10 @@ async fn create_dimension_group(
 
     let name = clean_node_name(&name)?;
     let colour = clean_colour(&colour)?;
+    let mtype = measurement_type.unwrap_or_else(|| "length".to_string());
+    if !MEASUREMENT_TYPES.contains(&mtype.as_str()) {
+        return Err(format!("Unsupported measurement_type: {mtype}"));
+    }
     let sort_order = next_sort_order(&db, "dimensions", parent_id).await?;
 
     let result = sqlx::query(
@@ -834,12 +906,31 @@ async fn create_dimension_group(
     .bind(parent_id)
     .bind(name)
     .bind(sort_order)
-    .bind(colour)
+    .bind(&colour)
     .execute(&db)
     .await
     .map_err(|e| format!("Failed to create dimension group: {e}"))?;
 
-    get_tree_node(&db, result.last_insert_rowid()).await
+    let node_id = result.last_insert_rowid();
+    let default_display = if mtype == "timber_framing" { "length" } else { mtype.as_str() };
+
+    sqlx::query(
+        r#"
+        INSERT INTO dimension_group_props
+            (node_id, measurement_type, default_display, default_multiplier, default_width,
+             default_height, default_offset, add_to_gfa, pos_colour, pos_style, neg_colour, neg_style)
+        VALUES (?, ?, ?, 1.0, 0.0, 0.0, 0.0, 0, ?, 'solid', '#FF0000', 'solid')
+        "#,
+    )
+    .bind(node_id)
+    .bind(&mtype)
+    .bind(default_display)
+    .bind(&colour)
+    .execute(&db)
+    .await
+    .map_err(|e| format!("Failed to create dimension group props: {e}"))?;
+
+    get_tree_node(&db, node_id).await
 }
 
 #[tauri::command]
@@ -847,11 +938,12 @@ async fn create_dimension_group_in_folder_path(
     folder_path: String,
     name: String,
     colour: String,
+    measurement_type: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<TreeNodeDto, String> {
     let db = active_project_db(&state)?;
     let folder_id = ensure_folder_path(&db, "dimensions", &folder_path).await?;
-    create_dimension_group(Some(folder_id), name, colour, state).await
+    create_dimension_group(Some(folder_id), name, colour, measurement_type, state).await
 }
 
 /// Lists every folder in the dimensions tree with its full `/`-joined path. Drives the
@@ -1602,6 +1694,13 @@ async fn init_registry_database(
     .await
     .map_err(|e| format!("Failed to create recent_projects registry: {e}"))?;
 
+    // Additive migration: add status column to existing registry.
+    let _ = sqlx::query(
+        "ALTER TABLE recent_projects ADD COLUMN status TEXT NOT NULL DEFAULT 'Tendering'",
+    )
+    .execute(&pool)
+    .await;
+
     let projects = load_recent_projects_from_registry(&pool).await?;
 
     Ok((pool, projects))
@@ -1612,7 +1711,7 @@ async fn load_recent_projects_from_registry(
 ) -> Result<Vec<RecentProject>, String> {
     let rows = sqlx::query(
         r#"
-        SELECT file_path, name, client, contract_number, last_opened_at
+        SELECT file_path, name, client, contract_number, status, last_opened_at
         FROM recent_projects
         ORDER BY last_opened_at DESC
         LIMIT 10
@@ -1631,6 +1730,7 @@ async fn load_recent_projects_from_registry(
                 name: row.try_get("name").map_err(|e| e.to_string())?,
                 client: row.try_get("client").map_err(|e| e.to_string())?,
                 contract_number: row.try_get("contract_number").map_err(|e| e.to_string())?,
+                status: row.try_get("status").map_err(|e| e.to_string())?,
                 last_opened_at: row.try_get("last_opened_at").map_err(|e| e.to_string())?,
             })
         })
@@ -1641,13 +1741,14 @@ async fn upsert_recent_project(pool: &SqlitePool, meta: &ProjectMeta) -> Result<
     sqlx::query(
         r#"
         INSERT INTO recent_projects
-            (file_path, name, client, contract_number, last_opened_at)
+            (file_path, name, client, contract_number, status, last_opened_at)
         VALUES
-            (?, ?, ?, ?, ?)
+            (?, ?, ?, ?, ?, ?)
         ON CONFLICT(file_path) DO UPDATE SET
             name = excluded.name,
             client = excluded.client,
             contract_number = excluded.contract_number,
+            status = excluded.status,
             last_opened_at = excluded.last_opened_at
         "#,
     )
@@ -1655,6 +1756,7 @@ async fn upsert_recent_project(pool: &SqlitePool, meta: &ProjectMeta) -> Result<
     .bind(&meta.name)
     .bind(&meta.client)
     .bind(&meta.contract_number)
+    .bind(&meta.status)
     .bind(&meta.last_opened_at)
     .execute(pool)
     .await
@@ -1686,7 +1788,7 @@ async fn refresh_recent_projects(state: &AppState) -> Result<(), String> {
 async fn read_project_meta(pool: &SqlitePool, file_path: &str) -> Result<ProjectMeta, String> {
     let row = sqlx::query(
         r#"
-        SELECT name, client, contract_number, created_at, last_opened_at
+        SELECT name, client, contract_number, status, created_at, last_opened_at
         FROM project_meta
         WHERE id = 1
         "#,
@@ -1703,6 +1805,7 @@ async fn read_project_meta(pool: &SqlitePool, file_path: &str) -> Result<Project
         name: row.try_get("name").map_err(|e| e.to_string())?,
         client: row.try_get("client").map_err(|e| e.to_string())?,
         contract_number: row.try_get("contract_number").map_err(|e| e.to_string())?,
+        status: row.try_get("status").map_err(|e| e.to_string())?,
         file_path: file_path.to_string(),
         created_at: row.try_get("created_at").map_err(|e| e.to_string())?,
         last_opened_at: row.try_get("last_opened_at").map_err(|e| e.to_string())?,
@@ -1725,6 +1828,13 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), String> {
     .execute(pool)
     .await
     .map_err(|e| format!("Failed to create project_meta: {e}"))?;
+
+    // Additive migration: add status column to existing project files.
+    let _ = sqlx::query(
+        "ALTER TABLE project_meta ADD COLUMN status TEXT NOT NULL DEFAULT 'Tendering'",
+    )
+    .execute(pool)
+    .await;
 
     sqlx::query(
         r#"
@@ -1904,6 +2014,7 @@ async fn query_tree_nodes(
                     n.page_count,
                     n.uom,
                     n.colour,
+                    p.measurement_type,
                     CASE WHEN p.measurement_type = 'timber_framing'
                          THEN json_extract(p.framing_props_json, '$.framingSize') END AS framing_size
                 FROM tree_nodes n
@@ -1931,6 +2042,7 @@ async fn query_tree_nodes(
                     n.page_count,
                     n.uom,
                     n.colour,
+                    p.measurement_type,
                     CASE WHEN p.measurement_type = 'timber_framing'
                          THEN json_extract(p.framing_props_json, '$.framingSize') END AS framing_size
                 FROM tree_nodes n
@@ -1965,6 +2077,7 @@ async fn query_tree_nodes(
                 uom: row.try_get("uom").map_err(|e| e.to_string())?,
                 colour: row.try_get("colour").map_err(|e| e.to_string())?,
                 framing_size: row.try_get("framing_size").map_err(|e| e.to_string())?,
+                measurement_type: row.try_get("measurement_type").map_err(|e| e.to_string())?,
             })
         })
         .collect()
@@ -2194,6 +2307,7 @@ async fn get_tree_node(pool: &SqlitePool, node_id: i64) -> Result<TreeNodeDto, S
             n.page_count,
             n.uom,
             n.colour,
+            p.measurement_type,
             CASE WHEN p.measurement_type = 'timber_framing'
                  THEN json_extract(p.framing_props_json, '$.framingSize') END AS framing_size
         FROM tree_nodes n
@@ -2222,6 +2336,7 @@ async fn get_tree_node(pool: &SqlitePool, node_id: i64) -> Result<TreeNodeDto, S
         uom: row.try_get("uom").map_err(|e| e.to_string())?,
         colour: row.try_get("colour").map_err(|e| e.to_string())?,
         framing_size: row.try_get("framing_size").map_err(|e| e.to_string())?,
+        measurement_type: row.try_get("measurement_type").map_err(|e| e.to_string())?,
     })
 }
 
@@ -2307,9 +2422,12 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_active_project,
             get_recent_projects,
+            remove_recent_project,
             create_project,
             open_project,
             close_project,
+            export_project,
+            update_project_meta,
             open_document,
             get_page_vectors,
             render_preview,

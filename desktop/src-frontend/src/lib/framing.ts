@@ -485,9 +485,12 @@ const KIND_LABEL: Record<FramingComponentKind, string> = {
 };
 
 /** One line of a wall's framing makeup. `count`/`eachM` are the human-readable factors; the
- *  quantity that rolls up is `totalM` (lineal metres). `detail` is the intermediate math. */
+ *  quantity that rolls up is `totalM` (lineal metres). `detail` is the intermediate math.
+ *  `sizeOverride` is present when this is a lintel whose size differs from the group's framingSize. */
 export interface FramingComponent {
   kind: FramingComponentKind;
+  /** Present when this lintel row uses a size other than the group's framingSize. */
+  sizeOverride?: FramingSize;
   label: string;
   count: number;
   totalM: number;
@@ -517,9 +520,12 @@ export function topLayerCount(s: FramingSettings): number {
 
 /** A single framing member with its 3D box placement (world metres, Y up) and its lineal length
  *  (metres) for the takeoff. The 2D quantities and the 3D view both derive from this list, so they
- *  always agree. */
+ *  always agree. `sizeOverride` is set on lintel members whose size differs from the group's
+ *  `framingSize` (e.g. a 140×45 lintel in a 90×45 group). */
 export interface WallMember {
   kind: FramingComponentKind;
+  /** Lintel-only: the lintel's FramingSize when it differs from the group's framingSize. */
+  sizeOverride?: FramingSize;
   lengthM: number;
   position: [number, number, number];
   size: [number, number, number]; // [along, vertical thickness/height, depth across the wall]
@@ -569,9 +575,9 @@ export function wallMembers(
 
   layout.forEach((seg, segIndex) => {
     const dir = seg.dir;
-    const yaw = Math.atan2(-dir.y, dir.x);
+    const yaw = Math.atan2(dir.y, dir.x);
     const fx = (s: number) => (seg.a.x + dir.x * s) * S;
-    const fz = (s: number) => (seg.a.y + dir.y * s) * S;
+    const fz = (s: number) => -(seg.a.y + dir.y * s) * S;
     const segRunMm = seg.segLen * mmPerPoint;
     const segLenM = M(segRunMm);
     const midS = seg.segLen / 2;
@@ -620,9 +626,10 @@ export function wallMembers(
       for (const k of jambs.kings) addV("king", k, bottomMakeup, heightAt(segIndex, k / seg.segLen) - topMakeup); // full, follows rake
       for (const t of jambs.trimmers) addV("trimmer", t, bottomMakeup, head); // full: bottom plate → underside of lintel
       const lintelLenM = M(o.daylightWidthMm + 2 * STUD_THICKNESS_MM);
+      const lintelSizeOverride = o.lintelSize !== settings.framingSize ? o.lintelSize : undefined;
       // Lintel ply rendered as `ply` stacked beams across the depth (for legibility); length counts ×ply.
       for (let p = 0; p < o.lintelPly; p += 1) {
-        members.push({ kind: "lintel", lengthM: lintelLenM, position: [fx(centrePts), M(head + lintelDepth / 2), fz(centrePts)], size: [lintelLenM, M(lintelDepth), depthM / Math.max(1, o.lintelPly)], yaw, pitch: 0 });
+        members.push({ kind: "lintel", sizeOverride: lintelSizeOverride, lengthM: lintelLenM, position: [fx(centrePts), M(head + lintelDepth / 2), fz(centrePts)], size: [lintelLenM, M(lintelDepth), depthM / Math.max(1, o.lintelPly)], yaw, pitch: 0 });
       }
       const jackPositions = seg.regular.filter((s) => Math.abs(s - centrePts) < dwHalf);
       for (const s of jackPositions) addV("jack", s, head + lintelDepth, heightAt(segIndex, s / seg.segLen) - topMakeup);
@@ -657,13 +664,13 @@ export function wallMembers(
     const seg = layout[es.segmentIndex];
     if (!seg) continue;
     const sPts = es.centreMm / mmPerPoint;
-    const yaw = Math.atan2(-seg.dir.y, seg.dir.x);
+    const yaw = Math.atan2(seg.dir.y, seg.dir.x);
     const yT = heightAt(es.segmentIndex, seg.segLen > 0 ? sPts / seg.segLen : 0) - topMakeup;
     if (yT - bottomMakeup <= 0) continue;
     members.push({
       kind: "stud",
       lengthM: M(yT - bottomMakeup),
-      position: [(seg.a.x + seg.dir.x * sPts) * S, M((bottomMakeup + yT) / 2), (seg.a.y + seg.dir.y * sPts) * S],
+      position: [(seg.a.x + seg.dir.x * sPts) * S, M((bottomMakeup + yT) / 2), -(seg.a.y + seg.dir.y * sPts) * S],
       size: [thkM, M(yT - bottomMakeup), depthM],
       yaw,
       pitch: 0,
@@ -671,6 +678,28 @@ export function wallMembers(
   }
 
   return members;
+}
+
+/** Composite map key for a framing component — includes size when it's a non-default lintel. */
+function framingComponentKey(kind: FramingComponentKind, sizeOverride?: FramingSize): string {
+  return sizeOverride ? `${kind}:${sizeOverride}` : kind;
+}
+
+/** Human label for a framing component row, including size suffix for non-default lintels. */
+function framingComponentLabel(kind: FramingComponentKind, sizeOverride?: FramingSize): string {
+  return sizeOverride ? `${KIND_LABEL[kind]} - ${sizeOverride.replace("x", " × ")}` : KIND_LABEL[kind];
+}
+
+/** Sort comparator for component entries: follows KIND_ORDER; within lintels, default size first. */
+function compareComponents(
+  a: { kind: FramingComponentKind; sizeOverride?: FramingSize },
+  b: { kind: FramingComponentKind; sizeOverride?: FramingSize },
+): number {
+  const kindDiff = KIND_ORDER.indexOf(a.kind) - KIND_ORDER.indexOf(b.kind);
+  if (kindDiff !== 0) return kindDiff;
+  if (!a.sizeOverride && b.sizeOverride) return -1;
+  if (a.sizeOverride && !b.sizeOverride) return 1;
+  return (a.sizeOverride ?? "").localeCompare(b.sizeOverride ?? "");
 }
 
 /**
@@ -686,20 +715,22 @@ export function computeFramingQuantities(
   if (path.length < 2 || !mmPerPoint || !(mmPerPoint > 0)) return null;
 
   const members = wallMembers(path, settings, mmPerPoint, framing);
-  const byKind = new Map<FramingComponentKind, { count: number; totalM: number }>();
+  type ComponentAcc = { count: number; totalM: number; kind: FramingComponentKind; sizeOverride?: FramingSize };
+  const byComponent = new Map<string, ComponentAcc>();
   for (const member of members) {
-    const acc = byKind.get(member.kind) ?? { count: 0, totalM: 0 };
+    const key = framingComponentKey(member.kind, member.sizeOverride);
+    const acc = byComponent.get(key) ?? { count: 0, totalM: 0, kind: member.kind, sizeOverride: member.sizeOverride };
     acc.count += 1;
     acc.totalM += member.lengthM;
-    byKind.set(member.kind, acc);
+    byComponent.set(key, acc);
   }
 
   const components: FramingComponent[] = [];
   let totalM = 0;
-  for (const kind of KIND_ORDER) {
-    const acc = byKind.get(kind);
-    if (!acc || acc.totalM <= 1e-9) continue;
-    components.push({ kind, label: KIND_LABEL[kind], count: acc.count, totalM: acc.totalM, detail: `${acc.count} × ${KIND_LABEL[kind].toLowerCase()}` });
+  for (const acc of [...byComponent.values()].sort(compareComponents)) {
+    if (acc.totalM <= 1e-9) continue;
+    const label = framingComponentLabel(acc.kind, acc.sizeOverride);
+    components.push({ kind: acc.kind, sizeOverride: acc.sizeOverride, label, count: acc.count, totalM: acc.totalM, detail: `${acc.count} × ${label.toLowerCase()}` });
     totalM += acc.totalM;
   }
 
@@ -708,7 +739,7 @@ export function computeFramingQuantities(
     totalM,
     wallLengthM: (pathLengthPts(path) * mmPerPoint) / MM_PER_M,
     studHeightMm: studHeightMm(settings),
-    studCount: byKind.get("stud")?.count ?? 0,
+    studCount: byComponent.get("stud")?.count ?? 0,
     plateLayers: plateLayerCount(settings),
     dwangRows: dwangRowCount(settings),
   };
@@ -722,18 +753,26 @@ export interface FramingWallInput {
   framing?: WallFraming;
 }
 
-/** An aggregated component line across a group's walls. */
+/** An aggregated component line across a group's walls.
+ *  `sizeOverride` is present when this lintel row uses a size other than the group's framingSize. */
 export interface FramingComponentTotal {
   kind: FramingComponentKind;
+  sizeOverride?: FramingSize;
   label: string;
   count: number;
   totalM: number;
 }
 
-/** Group-level makeup: per-wall quantities plus component totals aggregated across all walls. */
+/** Group-level makeup: per-wall quantities plus component totals aggregated across all walls.
+ *  `matchingTotalM` counts only timber matching the group's own framingSize (no sizeOverride) —
+ *  this is the canonical group quantity shown in the sidebar and used for worksheet line items.
+ *  `totalM` is the all-in sum across all sizes, kept for CSV export / reference. */
 export interface FramingGroupBreakdown {
   perWall: { id: number; quantities: FramingQuantities }[];
   components: FramingComponentTotal[];
+  /** Canonical group quantity: timber matching the group's framingSize only. */
+  matchingTotalM: number;
+  /** All-in total across all framing sizes (matching + override lintels). */
   totalM: number;
 }
 
@@ -743,27 +782,30 @@ export function aggregateFramingGroup(
   settings: FramingSettings,
 ): FramingGroupBreakdown {
   const perWall: { id: number; quantities: FramingQuantities }[] = [];
-  const byKind = new Map<FramingComponentKind, { count: number; totalM: number }>();
+  type TotalAcc = { count: number; totalM: number; kind: FramingComponentKind; sizeOverride?: FramingSize };
+  const byComponent = new Map<string, TotalAcc>();
   for (const wall of walls) {
     const q = computeFramingQuantities(wall.points, settings, wall.mmPerPoint, wall.framing);
     if (!q) continue;
     perWall.push({ id: wall.id, quantities: q });
     for (const c of q.components) {
-      const acc = byKind.get(c.kind) ?? { count: 0, totalM: 0 };
+      const key = framingComponentKey(c.kind, c.sizeOverride);
+      const acc = byComponent.get(key) ?? { count: 0, totalM: 0, kind: c.kind, sizeOverride: c.sizeOverride };
       acc.count += c.count;
       acc.totalM += c.totalM;
-      byKind.set(c.kind, acc);
+      byComponent.set(key, acc);
     }
   }
   const components: FramingComponentTotal[] = [];
   let totalM = 0;
-  for (const kind of KIND_ORDER) {
-    const acc = byKind.get(kind);
-    if (!acc || acc.totalM <= 1e-9) continue;
-    components.push({ kind, label: KIND_LABEL[kind], count: acc.count, totalM: acc.totalM });
+  let matchingTotalM = 0;
+  for (const acc of [...byComponent.values()].sort(compareComponents)) {
+    if (acc.totalM <= 1e-9) continue;
+    components.push({ kind: acc.kind, sizeOverride: acc.sizeOverride, label: framingComponentLabel(acc.kind, acc.sizeOverride), count: acc.count, totalM: acc.totalM });
     totalM += acc.totalM;
+    if (!acc.sizeOverride) matchingTotalM += acc.totalM;
   }
-  return { perWall, components, totalM };
+  return { perWall, components, matchingTotalM, totalM };
 }
 
 /** Render geometry for a single opening (its daylight gap + jamb studs), for ghost previews. */

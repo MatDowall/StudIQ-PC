@@ -252,6 +252,7 @@ model.
 - **Known v1 limitations (to refine with user feedback in 3D):** member cross-section *roll* is not
   individually oriented (boxes use yaw/pitch only — fine for legibility); lintel `ply` shows as one
   box; the floor-plane orientation/handedness may need a sign flip once viewed.
+  _(Handedness flip + PDF page as the ground plane both resolved 2026-06-06 — see "3D fixes" below.)_
 
 ## Unified member model (2026-06-04, post-M9 first-look fixes)
 
@@ -275,6 +276,59 @@ unchanged and footprint-only.) Fixes from the first 3D look:
   earlier per-bay model for openingless walls (SketchUp wall still 14 / 7.635 m). New opening dwang
   totals: door 5.28 m, window 5.72 m (4 m wall, 800 cts).
 - **Lintel** rendered as `ply` stacked beams in 3D (length still ×ply in the takeoff).
+
+## 3D fixes — horizontal flip + PDF page as ground (2026-06-06, user feedback)
+
+Resolves two of the M9 "known v1 limitations": the handedness/flip and the floor plane. Both the
+full-building view (`Viewer.tsx`) **and** the single-wall modal (`ViewerCanvas.tsx`) host a
+`Framing3DView`; fixes had to land in both call sites (see the "wrong component" trap below).
+
+### 1. Horizontal flip — `wallMembers` Z mapping (`framing.ts`)
+
+The scene was mirrored left-for-right. Cause: PDF Y was mapped straight to world **+Z** while the
+camera sits on the +X/+Z side, so north pointed *toward* the camera and the plan read reversed.
+Fix — map PDF Y to world **−Z** and drop the matching sign flip on the yaw:
+
+- `fz(s) = -(seg.a.y + dir.y*s) * S` (was `+`). Same change applied to the extra-studs branch.
+- `yaw = Math.atan2(dir.y, dir.x)` (was `atan2(-dir.y, dir.x)`).
+
+Convention now: **PDF X → world +X, PDF Y → world −Z**, page footprint `X:[0,widthM] × Z:[−heightM,0]`.
+The ground plane (below) uses the same mapping, so plan and 3D agree.
+
+### 2. PDF page as ground — `PageGround` in `Framing3DView.tsx`
+
+A textured plane at `y ≈ 0`, sized `pageWidthM × pageHeightM` (`= width_pts/height_pts × mm_per_point ÷ 1000`),
+centred at `(widthM/2, -0.002, -heightM/2)`. The preview PNG comes from the existing `render_preview`
+command (`$APPCACHE/tiles/preview_page_N.png`, already inside the asset-protocol scope). `Viewer.tsx`
+fetches it on demand when `view3d` flips on and passes `pageWidthM/pageHeightM/previewUrl` to the view.
+
+**Three traps cost several iterations — read before touching this:**
+
+1. **Wrong component.** The full-building 3D view lives in **`Viewer.tsx`** (line ~225), not
+   `ViewerCanvas.tsx` (which only hosts the right-click single-wall modal). Early prop wiring went to
+   `ViewerCanvas` only, so the page never showed in the view the user was actually opening. *Both*
+   call sites need the page props.
+2. **Cross-origin taint (silent).** The app runs on `localhost` (dev) but the preview is served from
+   `asset.localhost`. Pointing an `<img>` straight at the asset URL loads it for display but **taints
+   the WebGL context**, so `texImage2D` is silently dropped and the plane renders the material's
+   default **white** — *no console error*. Fix: `fetch(url)` → `blob` → same-origin `blob:` object URL,
+   which can never taint. (`csp: null` in `tauri.conf.json` permits the fetch.)
+3. **Material shader not recompiling (the white-rectangle killer).** Rendering one `<mesh>` with a
+   placeholder `<meshBasicMaterial color>` and then swapping to `<meshBasicMaterial map>` on the *same*
+   mesh does **not** work: react-three-fiber reuses the material instance and assigns `.map`, but a
+   `MeshBasicMaterial` compiled without a map uses a shader with **no texture sampler** — so it keeps
+   rendering white. Fix: render the mesh **only once the texture is ready** (return `null` before), so
+   the material is created in one shot with `map` already set. Never swap null→texture on a live material.
+
+Also set on the texture (NPOT 1200×849 PNG): `minFilter/magFilter = LinearFilter`,
+`generateMipmaps = false` (mipmaps need POT or WebGL drops the texture), `colorSpace = SRGBColorSpace`
+(correct brightness), and `toneMapped={false}` on the material. The ground grid is kept just *below*
+the plane (`y = -0.004`) as spatial reference while the texture loads.
+
+**Debugging lesson:** "image loads (1200×849) but plane is white, no errors" points at the *GPU upload*,
+not the *image load*. White plane = material's default colour showing through = sampler has no data →
+either a tainted upload (trap 2) or a map-less compiled shader (trap 3). Don't keep re-checking the
+image fetch once `onload` has fired with valid dimensions.
 
 ## Tunables (in `framing.ts`)
 
