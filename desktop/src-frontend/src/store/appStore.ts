@@ -139,6 +139,10 @@ interface AppStore {
   activeProject: ProjectMeta | null;
   recentProjects: RecentProject[];
 
+  /** Which top-level workflow tab is active. */
+  activeTab: "dimensions" | "workbook";
+  setActiveTab: (tab: "dimensions" | "workbook") => void;
+
   drawingRoots: TreeNodeDto[];
   childCache: Record<number, TreeNodeDto[]>;
   treeRevision: number;
@@ -471,6 +475,9 @@ function infiniteLineSegmentT(S: LineSegment, Q: LineSegment): number | null {
 export const useAppStore = create<AppStore>((set, get) => ({
   activeProject: null,
   recentProjects: [],
+
+  activeTab: "dimensions",
+  setActiveTab: (tab) => set({ activeTab: tab }),
 
   drawingRoots: [],
   childCache: {},

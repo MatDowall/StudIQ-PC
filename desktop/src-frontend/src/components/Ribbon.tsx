@@ -3,6 +3,7 @@ import { save } from "@tauri-apps/plugin-dialog";
 import { theme } from "../theme";
 import { useAppStore } from "../store/appStore";
 import { ProjectInfoDialog } from "./ProjectInfoDialog";
+import { WorkbookRibbon } from "./WorkbookRibbon";
 
 // Material Symbol icon name for each ribbon button label.
 const BUTTON_ICONS: Record<string, string> = {
@@ -55,6 +56,7 @@ export function Ribbon() {
   const setDrawingDimmer = useAppStore((state) => state.setDrawingDimmer);
   const snapEnabled = useAppStore((state) => state.snapEnabled);
   const setSnapEnabled = useAppStore((state) => state.setSnapEnabled);
+  const activeTab = useAppStore((state) => state.activeTab);
 
   const [showProjectInfo, setShowProjectInfo] = useState(false);
   const [exportStatus, setExportStatus] = useState("");
@@ -92,137 +94,141 @@ export function Ribbon() {
           fontFamily: "Segoe UI, sans-serif",
         }}
       >
-        {groups.map((group, groupIndex) => {
-          const isDrawingGroup = group.label === "Drawing";
-          return (
-            <div
-              key={group.label}
-              style={{
-                display: "flex",
-                flexDirection: "column",
-                minWidth: groupIndex === 0 ? 138 : isDrawingGroup ? 148 : 72,
-                padding: "4px 8px 0",
-                borderRight: `1px solid ${theme.border.divider}`,
-              }}
-            >
-              <div style={{ display: "flex", gap: 5, alignItems: "center", overflow: "hidden" }}>
-                {group.tools.slice(0, 3).map((tool, toolIndex) => {
-                  const dgCommand = groupIndex === 0 ? DIMENSION_GROUP_TOOLS[tool] : undefined;
-                  const isTypeToggle = group.label === "Type" && (tool === "Point" || tool === "Line");
-                  const isViewToggle = group.label === "Drawing" && (tool === "Plan View" || tool === "View in 3D");
-                  const isDimToggle = group.label === "Drawing" && tool === "Dim";
-                  const isSnapToggle = group.label === "Snap" && tool === "Geometry";
+        {activeTab === "workbook" ? (
+          <WorkbookRibbon />
+        ) : (
+          groups.map((group, groupIndex) => {
+            const isDrawingGroup = group.label === "Drawing";
+            return (
+              <div
+                key={group.label}
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  minWidth: groupIndex === 0 ? 138 : isDrawingGroup ? 148 : 72,
+                  padding: "4px 8px 0",
+                  borderRight: `1px solid ${theme.border.divider}`,
+                }}
+              >
+                <div style={{ display: "flex", gap: 5, alignItems: "center", overflow: "hidden" }}>
+                  {group.tools.slice(0, 3).map((tool, toolIndex) => {
+                    const dgCommand = groupIndex === 0 ? DIMENSION_GROUP_TOOLS[tool] : undefined;
+                    const isTypeToggle = group.label === "Type" && (tool === "Point" || tool === "Line");
+                    const isViewToggle = group.label === "Drawing" && (tool === "Plan View" || tool === "View in 3D");
+                    const isDimToggle = group.label === "Drawing" && tool === "Dim";
+                    const isSnapToggle = group.label === "Snap" && tool === "Geometry";
 
-                  let enabled: boolean;
-                  let cursor: string;
-                  let active: boolean;
+                    let enabled: boolean;
+                    let cursor: string;
+                    let active: boolean;
 
-                  if (dgCommand !== undefined) {
-                    enabled = dgCommand === "add" || activeDimensionGroupId !== null;
-                    active = enabled;
-                    cursor = !enabled ? "not-allowed" : "pointer";
-                  } else if (isTypeToggle) {
-                    enabled = true;
-                    active = (tool === "Point" && drawingType === "point") || (tool === "Line" && drawingType === "line");
-                    cursor = "pointer";
-                  } else if (isViewToggle) {
-                    enabled = true;
-                    active = (tool === "Plan View" && !view3d) || (tool === "View in 3D" && view3d);
-                    cursor = "pointer";
-                  } else if (isDimToggle) {
-                    enabled = true;
-                    active = dimActive;
-                    cursor = "pointer";
-                  } else if (isSnapToggle) {
-                    enabled = true;
-                    active = snapEnabled;
-                    cursor = "pointer";
-                  } else {
-                    enabled = toolIndex === 0;
-                    active = enabled;
-                    cursor = "default";
-                  }
+                    if (dgCommand !== undefined) {
+                      enabled = dgCommand === "add" || activeDimensionGroupId !== null;
+                      active = enabled;
+                      cursor = !enabled ? "not-allowed" : "pointer";
+                    } else if (isTypeToggle) {
+                      enabled = true;
+                      active = (tool === "Point" && drawingType === "point") || (tool === "Line" && drawingType === "line");
+                      cursor = "pointer";
+                    } else if (isViewToggle) {
+                      enabled = true;
+                      active = (tool === "Plan View" && !view3d) || (tool === "View in 3D" && view3d);
+                      cursor = "pointer";
+                    } else if (isDimToggle) {
+                      enabled = true;
+                      active = dimActive;
+                      cursor = "pointer";
+                    } else if (isSnapToggle) {
+                      enabled = true;
+                      active = snapEnabled;
+                      cursor = "pointer";
+                    } else {
+                      enabled = toolIndex === 0;
+                      active = enabled;
+                      cursor = "default";
+                    }
 
-                  const handleClick = dgCommand !== undefined && enabled
-                    ? () => requestDgPaneCommand(dgCommand)
-                    : isTypeToggle
-                      ? () => setDrawingType(tool === "Line" ? "line" : "point")
-                      : isViewToggle
-                        ? () => setView3d(tool === "View in 3D")
-                        : isDimToggle
-                          ? () => setDrawingDimmer(dimActive ? 1 : 0.4)
-                          : isSnapToggle
-                            ? () => setSnapEnabled(!snapEnabled)
-                            : undefined;
+                    const handleClick = dgCommand !== undefined && enabled
+                      ? () => requestDgPaneCommand(dgCommand)
+                      : isTypeToggle
+                        ? () => setDrawingType(tool === "Line" ? "line" : "point")
+                        : isViewToggle
+                          ? () => setView3d(tool === "View in 3D")
+                          : isDimToggle
+                            ? () => setDrawingDimmer(dimActive ? 1 : 0.4)
+                            : isSnapToggle
+                              ? () => setSnapEnabled(!snapEnabled)
+                              : undefined;
 
-                  const iconName = BUTTON_ICONS[tool];
+                    const iconName = BUTTON_ICONS[tool];
 
-                  return (
-                    <button
-                      key={`${group.label}-${tool}`}
-                      disabled={!enabled && !isTypeToggle}
-                      onClick={handleClick}
-                      title={tool}
-                      style={{
-                        minWidth: 44,
-                        height: 50,
-                        padding: "4px 6px 3px",
-                        display: "flex",
-                        flexDirection: "column",
-                        alignItems: "center",
-                        justifyContent: "center",
-                        gap: 2,
-                        overflow: "hidden",
-                        border: `1px solid ${active ? theme.accent : theme.border.divider}`,
-                        background: active ? theme.bg.active : theme.bg.input,
-                        color: active ? theme.text.primary : theme.text.disabled,
-                        fontSize: 9,
-                        cursor,
-                        flexShrink: 0,
-                      }}
-                    >
-                      {iconName ? <Icon name={iconName} size={32} /> : null}
-                      <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", lineHeight: 1 }}>
-                        {tool}
-                      </span>
-                    </button>
-                  );
-                })}
+                    return (
+                      <button
+                        key={`${group.label}-${tool}`}
+                        disabled={!enabled && !isTypeToggle}
+                        onClick={handleClick}
+                        title={tool}
+                        style={{
+                          minWidth: 44,
+                          height: 50,
+                          padding: "4px 6px 3px",
+                          display: "flex",
+                          flexDirection: "column",
+                          alignItems: "center",
+                          justifyContent: "center",
+                          gap: 2,
+                          overflow: "hidden",
+                          border: `1px solid ${active ? theme.accent : theme.border.divider}`,
+                          background: active ? theme.bg.active : theme.bg.input,
+                          color: active ? theme.text.primary : theme.text.disabled,
+                          fontSize: 9,
+                          cursor,
+                          flexShrink: 0,
+                        }}
+                      >
+                        {iconName ? <Icon name={iconName} size={32} /> : null}
+                        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", lineHeight: 1 }}>
+                          {tool}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+                {isDrawingGroup && dimActive ? (
+                  <div style={{ display: "flex", alignItems: "center", gap: 4, marginTop: "auto", paddingBottom: 3 }}>
+                    <input
+                      type="range"
+                      min={0.1}
+                      max={0.95}
+                      step={0.05}
+                      value={drawingDimmer}
+                      onChange={(e) => setDrawingDimmer(Number(e.target.value))}
+                      style={{ flex: 1, height: 12, cursor: "pointer", accentColor: theme.accent }}
+                    />
+                    <span style={{ fontSize: 9, color: theme.text.secondary, flexShrink: 0 }}>
+                      {Math.round(drawingDimmer * 100)}%
+                    </span>
+                  </div>
+                ) : (
+                  <div
+                    style={{
+                      marginTop: "auto",
+                      paddingBottom: 3,
+                      fontSize: 10,
+                      lineHeight: "12px",
+                      color: theme.text.secondary,
+                      whiteSpace: "nowrap",
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                    }}
+                  >
+                    {group.label}
+                  </div>
+                )}
               </div>
-              {isDrawingGroup && dimActive ? (
-                <div style={{ display: "flex", alignItems: "center", gap: 4, marginTop: "auto", paddingBottom: 3 }}>
-                  <input
-                    type="range"
-                    min={0.1}
-                    max={0.95}
-                    step={0.05}
-                    value={drawingDimmer}
-                    onChange={(e) => setDrawingDimmer(Number(e.target.value))}
-                    style={{ flex: 1, height: 12, cursor: "pointer", accentColor: theme.accent }}
-                  />
-                  <span style={{ fontSize: 9, color: theme.text.secondary, flexShrink: 0 }}>
-                    {Math.round(drawingDimmer * 100)}%
-                  </span>
-                </div>
-              ) : (
-                <div
-                  style={{
-                    marginTop: "auto",
-                    paddingBottom: 3,
-                    fontSize: 10,
-                    lineHeight: "12px",
-                    color: theme.text.secondary,
-                    whiteSpace: "nowrap",
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                  }}
-                >
-                  {group.label}
-                </div>
-              )}
-            </div>
-          );
-        })}
+            );
+          })
+        )}
         {activeProject ? (
           <div
             style={{

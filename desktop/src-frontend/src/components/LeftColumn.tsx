@@ -1,9 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { DimensionGroupPane } from "./DimensionGroupPane";
 import { DrawingRegisterPane } from "./DrawingRegisterPane";
+import { WorkbookSidebarPane } from "./WorkbookSidebarPane";
 import { theme } from "../theme";
+import { useAppStore } from "../store/appStore";
 
 export function LeftColumn() {
+  const activeTab = useAppStore((state) => state.activeTab);
   const [topHeight, setTopHeight] = useState<number | null>(null);
   const [dragging, setDragging] = useState(false);
   const containerRef = useRef<HTMLElement | null>(null);
@@ -59,7 +62,7 @@ export function LeftColumn() {
         fontFamily: "Segoe UI, sans-serif",
       }}
     >
-      <DrawingRegisterPane />
+      {activeTab === "workbook" ? <WorkbookSidebarPane /> : <DrawingRegisterPane />}
       <div
         onPointerDown={(event) => {
           event.preventDefault();
