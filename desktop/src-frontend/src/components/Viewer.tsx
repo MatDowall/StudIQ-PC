@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../store/appStore";
 import { theme } from "../theme";
 import { DocumentMeta, ViewerCanvas } from "./ViewerCanvas";
@@ -29,6 +30,26 @@ export function Viewer() {
   const view3d = useAppStore((state) => state.view3d);
   const activeIsFraming =
     activeDimensionGroupId !== null && groupProps[activeDimensionGroupId]?.measurement_type === "timber_framing";
+
+  // Preview image URL for the current page — loaded on demand when view3d is active.
+  const [previewUrl3d, setPreviewUrl3d] = useState<string | undefined>(undefined);
+  useEffect(() => {
+    if (!view3d || !doc) { setPreviewUrl3d(undefined); return; }
+    let alive = true;
+    invoke<{ page: number; width: number; height: number; image_path: string }>(
+      "render_preview", { pageIndex }
+    ).then((data) => {
+      if (alive) setPreviewUrl3d(convertFileSrc(data.image_path));
+    }).catch(() => { /* preview unavailable — ground stays as grid */ });
+    return () => { alive = false; };
+  }, [view3d, doc, pageIndex]);
+
+  // Page dimensions in world metres for the ground plane.
+  const mmpp3d = pageScale?.mm_per_point ?? null;
+  const S3d = mmpp3d ? mmpp3d / 1000 : null;
+  const currentPage3d = doc?.pages[pageIndex] ?? null;
+  const pageWidthM3d = S3d && currentPage3d ? currentPage3d.width_pts * S3d : undefined;
+  const pageHeightM3d = S3d && currentPage3d ? currentPage3d.height_pts * S3d : undefined;
 
   // 3D members for the framing walls on the displayed page.
   const members3d = useMemo<Member3D[]>(() => {
@@ -222,7 +243,7 @@ export function Viewer() {
       <div style={{ flex: 1, minHeight: 0, position: "relative", display: "flex", flexDirection: "column" }}>
         {view3d ? (
           members3d.length > 0 ? (
-            <Framing3DView members={members3d} />
+            <Framing3DView members={members3d} pageWidthM={pageWidthM3d} pageHeightM={pageHeightM3d} previewUrl={previewUrl3d} />
           ) : (
             <div style={{ flex: 1, display: "grid", placeItems: "center", background: "#dfe4ea", color: "#5a636c", fontSize: 13 }}>
               No timber framing on this page to show in 3D (draw a wall on a scaled page).

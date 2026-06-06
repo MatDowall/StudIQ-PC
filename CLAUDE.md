@@ -107,6 +107,28 @@ Positive/Negative toggle live in the viewer toolbar.
 roll-up, persisting quantities, per-dimension overrides ("Use Default"), costing/reporting,
 snap settings UI, perpendicular/nearest-edge/arc snap, dimension cutouts.
 
+## Design decisions
+
+### Timber framing: one quantity per framing size
+
+A framing dimension group has a single `framingSize` (e.g. 90×45). Its **canonical quantity is
+`matchingTotalM`** — the sum of all components whose `sizeOverride` is absent (i.e. timber that
+matches the group's own size). This is what the group header displays.
+
+Lintels with a *different* size (e.g. a 140×45 lintel in a 90×45 group) are excluded from
+`matchingTotalM` and shown as **virtual sub-quantity rows** below the component breakdown — visually
+distinct, with their own total.
+
+**Worksheet implication (not yet built):** when a framing group is dragged onto a takeoff
+worksheet it must emit **one row per distinct framing size present**:
+- One row for `!sizeOverride` components → quantity = `matchingTotalM`, size = group's `framingSize`
+- One row per unique `sizeOverride` value → quantity = sum of that override's `totalM`
+
+Never use `FramingGroupBreakdown.totalM` as the worksheet quantity — it combines all sizes.
+
+The `sizeOverride` field on `FramingComponent` / `FramingComponentTotal` drives all of this: it
+is set only when a lintel's size differs from the group's `framingSize`.
+
 ## Docs & process
 
 `docs/` holds the phase **prompts** (specs), **handovers** (architecture/state between
@@ -115,6 +137,92 @@ phases), and **completion reports**. The most recent state is
 milestone-by-milestone with
 explicit verification gates — keep that discipline: implement a milestone, verify it produces
 visible/testable proof, then move on.
+
+## UI styling rules
+
+### Theme
+All colours, spacing, and sizing constants live in `desktop/src-frontend/src/theme.ts`. Never
+hardcode a colour or size that already exists in the theme — always reference `theme.*`.
+Current key values:
+- `theme.ribbonHeight` = 76 px — ribbon row in the App grid is driven by this value; changing it
+  resizes both the CSS grid row (`App.tsx`) and the ribbon container together.
+- `theme.rowHeight` = 22 px — used for tree rows throughout both sidebar panes.
+- `theme.treeIndent` = 16 px — per-depth indent for tree rows.
+
+### Icons — Google Material Symbols
+The app uses **Google Material Symbols Outlined** loaded from the Google Fonts CDN in
+`desktop/src-frontend/index.html`. Render icons as:
+
+```tsx
+<span className="material-symbols-outlined" style={{ fontSize: <px>, lineHeight: 1 }}>
+  icon_name_here
+</span>
+```
+
+Icon names use **snake_case** exactly as listed on fonts.google.com/icons (e.g. `save_as`,
+`view_in_ar`, `calendar_view_week`). Do not use the older Material Icons font — always use
+Material Symbols Outlined.
+
+**Established icon assignments** (do not reassign without a design reason):
+
+| UI element | Icon name |
+|---|---|
+| Add dimension group | `add` |
+| Properties | `tune` |
+| Copy | `copy_all` |
+| Point drawing type | `polyline` |
+| Line drawing type | `show_chart` |
+| Plan View | `architecture` |
+| View in 3D | `view_in_ar` |
+| Dim (drawing dimmer) | `contrast` |
+| Geometry (snap toggle) | `my_location` |
+| Export project | `save_as` |
+| Edit / Project Info | `edit` |
+| Timber Framing group | `calendar_view_week` |
+| Area group | `crop_free` |
+| Count group | `123` |
+| Length group | `straighten` |
+
+### Ribbon layout rules
+- The ribbon uses `display: flex; align-items: stretch` — group divs fill the full ribbon height.
+- Each group div uses `flex-direction: column` with **no** `justify-content: space-between`.
+  The group label sits at the bottom via `margin-top: auto` on the label element. Using
+  `space-between` when content height ≥ container height causes flex items to overlap and get
+  clipped by the ribbon's `overflow: hidden` — avoid it.
+- Ribbon buttons stack the icon **above** the label text (`flex-direction: column`). Icon size
+  is 32 px; label font-size is 9 px. Button height is 50 px.
+- Only add a group to `groups` in `Ribbon.tsx` if it has real wired behaviour. Static
+  decorative-only groups were removed.
+
+### Snap group
+The Snap group contains only the **Geometry** button, which toggles `snapEnabled` in the store.
+The Angle and Rebar buttons were removed as they had no wired behaviour. Do not re-add
+dummy buttons to the ribbon.
+
+### Sidebar trees — default expanded
+Both `TreeNode` (`DrawingRegisterPane`) and `DimensionTreeRow` (`DimensionGroupPane`) initialise
+`expanded` to `true` for folder nodes so all folders are open when a project loads. This is
+intentional — do not change the default back to `false`.
+
+### Dimension group icons
+`measurement_type` is included on every `TreeNodeDto` via a `LEFT JOIN dimension_group_props`
+in `query_tree_nodes` and `get_tree_node`. This means the icon for a dimension group is always
+known from the node itself — no need to load full props first, and no glyph fallback.
+When adding new measurement types, add an entry to `MEASUREMENT_TYPE_ICONS` in
+`DimensionGroupPane.tsx` and a row to the table above.
+
+### Project status
+Projects have a `status` field (`TEXT NOT NULL DEFAULT 'Tendering'`) in `project_meta` and
+in `recent_projects` (registry DB). Valid values are **"Tendering"** and **"Closed"** —
+enforced by the dropdown in `ProjectInfoDialog`. The status is shown in the Recent Projects
+list on the splash screen. If new status values are added, update both `STATUS_OPTIONS` in
+`ProjectInfoDialog.tsx` and the docs here.
+
+### Additive DB migrations
+New columns are added with bare `ALTER TABLE … ADD COLUMN` executed at startup and the error
+silently ignored (`.await` result discarded with `let _ = …`). This keeps existing project
+files working without a versioned migration system. Follow this pattern for any new nullable or
+`DEFAULT`-valued columns — never drop or rename columns.
 
 ## Conventions
 

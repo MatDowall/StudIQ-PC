@@ -88,7 +88,7 @@ function NodeIcon({ node }: { node: TreeNodeDto }) {
 }
 
 export function TreeNode({ node, depth, activeNodeId, onNodeClick, onContextMenu }: TreeNodeProps) {
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useState(node.node_type === "folder");
   const [loading, setLoading] = useState(false);
   const childCache = useAppStore((state) => state.childCache);
   const loadChildren = useAppStore((state) => state.loadChildren);
@@ -111,6 +111,7 @@ export function TreeNode({ node, depth, activeNodeId, onNodeClick, onContextMenu
         uom: node.uom,
         colour: node.colour,
         framing_size: null,
+        measurement_type: null,
       }))
     : [];
   const children = isDrawing ? pageChildren : cachedChildren;

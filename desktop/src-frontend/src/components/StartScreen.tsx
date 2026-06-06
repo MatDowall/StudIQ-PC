@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useAppStore } from "../store/appStore";
 import { theme } from "../theme";
+import { ConfirmDialog } from "./ConfirmDialog";
 import { NewProjectDialog } from "./NewProjectDialog";
 
 export function StartScreen() {
@@ -9,22 +10,17 @@ export function StartScreen() {
   const loadRecentProjects = useAppStore((state) => state.loadRecentProjects);
   const createProject = useAppStore((state) => state.createProject);
   const openProject = useAppStore((state) => state.openProject);
+  const removeRecentProject = useAppStore((state) => state.removeRecentProject);
   const [showNewProject, setShowNewProject] = useState(false);
+  const [pendingRemove, setPendingRemove] = useState<string | null>(null);
   const [status, setStatus] = useState("");
 
   useEffect(() => {
     let cancelled = false;
     loadRecentProjects()
-      .then(() => {
-        if (!cancelled) setStatus("");
-      })
-      .catch((error) => {
-        if (!cancelled) setStatus(`ERROR: ${error}`);
-      });
-
-    return () => {
-      cancelled = true;
-    };
+      .then(() => { if (!cancelled) setStatus(""); })
+      .catch((error) => { if (!cancelled) setStatus(`ERROR: ${error}`); });
+    return () => { cancelled = true; };
   }, [loadRecentProjects]);
 
   async function chooseProjectToOpen() {
@@ -32,9 +28,7 @@ export function StartScreen() {
       filters: [{ name: "Take-it-Off Project", extensions: ["tcop"] }],
       multiple: false,
     });
-
     if (!selected || typeof selected !== "string") return;
-
     setStatus("");
     try {
       await openProject(selected);
@@ -49,6 +43,17 @@ export function StartScreen() {
       await openProject(filePath);
     } catch (error) {
       setStatus(`ERROR: ${error}`);
+    }
+  }
+
+  async function confirmRemove() {
+    if (!pendingRemove) return;
+    try {
+      await removeRecentProject(pendingRemove);
+    } catch (error) {
+      setStatus(`ERROR: ${error}`);
+    } finally {
+      setPendingRemove(null);
     }
   }
 
@@ -78,7 +83,6 @@ export function StartScreen() {
         }}
       >
         <header style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          {/* Placeholder for the project logo — swap for an <img> once the asset is defined. */}
           <div
             aria-label="Project logo placeholder"
             style={{
@@ -117,9 +121,7 @@ export function StartScreen() {
           </button>
           <button
             type="button"
-            onClick={() => {
-              void chooseProjectToOpen();
-            }}
+            onClick={() => { void chooseProjectToOpen(); }}
             style={{
               height: 48,
               minWidth: 180,
@@ -147,7 +149,7 @@ export function StartScreen() {
             <div
               style={{
                 display: "grid",
-                gridTemplateColumns: "2fr 1.2fr 1fr 120px",
+                gridTemplateColumns: "2fr 1.2fr 1fr 120px 32px",
                 gap: 12,
                 padding: "10px 12px",
                 borderBottom: `1px solid ${theme.border.subtle}`,
@@ -159,6 +161,7 @@ export function StartScreen() {
               <span>Client</span>
               <span>Contract</span>
               <span>Status</span>
+              <span />
             </div>
             {recentProjects.length === 0 ? (
               <div style={{ padding: 12, color: theme.text.disabled, fontSize: 13 }}>No recent projects</div>
@@ -166,24 +169,76 @@ export function StartScreen() {
               recentProjects.map((project) => (
                 <div
                   key={project.file_path}
-                  onClick={() => {
-                    if (project.file_exists) void openRecentProject(project.file_path);
-                  }}
                   style={{
                     display: "grid",
-                    gridTemplateColumns: "2fr 1.2fr 1fr 120px",
+                    gridTemplateColumns: "2fr 1.2fr 1fr 120px 32px",
                     gap: 12,
                     padding: "9px 12px",
                     borderBottom: `1px solid ${theme.border.subtle}`,
                     color: project.file_exists ? theme.text.primary : theme.text.disabled,
-                    cursor: project.file_exists ? "pointer" : "default",
                     fontSize: 13,
+                    alignItems: "center",
                   }}
                 >
-                  <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{project.name}</span>
-                  <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{project.client}</span>
-                  <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{project.contract_number}</span>
-                  <span>{project.file_exists ? "" : "File not found"}</span>
+                  <span
+                    onClick={() => { if (project.file_exists) void openRecentProject(project.file_path); }}
+                    style={{
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                      cursor: project.file_exists ? "pointer" : "default",
+                    }}
+                  >
+                    {project.name}
+                  </span>
+                  <span
+                    onClick={() => { if (project.file_exists) void openRecentProject(project.file_path); }}
+                    style={{
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                      cursor: project.file_exists ? "pointer" : "default",
+                    }}
+                  >
+                    {project.client}
+                  </span>
+                  <span
+                    onClick={() => { if (project.file_exists) void openRecentProject(project.file_path); }}
+                    style={{
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                      cursor: project.file_exists ? "pointer" : "default",
+                    }}
+                  >
+                    {project.contract_number}
+                  </span>
+                  <span style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                    <span>{project.status}</span>
+                    {!project.file_exists ? <span style={{ fontSize: 11, color: theme.danger }}>File not found</span> : null}
+                  </span>
+                  <button
+                    type="button"
+                    title="Remove from recent projects"
+                    onClick={() => setPendingRemove(project.file_path)}
+                    style={{
+                      width: 24,
+                      height: 24,
+                      padding: 0,
+                      background: "transparent",
+                      color: theme.text.disabled,
+                      border: `1px solid transparent`,
+                      cursor: "pointer",
+                      fontSize: 14,
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                    }}
+                    onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = theme.danger; }}
+                    onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.color = theme.text.disabled; }}
+                  >
+                    ×
+                  </button>
                 </div>
               ))
             )}
@@ -191,6 +246,7 @@ export function StartScreen() {
           {status ? <div style={{ color: theme.danger, fontSize: 12 }}>{status}</div> : null}
         </section>
       </section>
+
       {showNewProject ? (
         <NewProjectDialog
           onCancel={() => setShowNewProject(false)}
@@ -198,6 +254,16 @@ export function StartScreen() {
             await createProject(name, client, contractNumber, filePath);
             setShowNewProject(false);
           }}
+        />
+      ) : null}
+
+      {pendingRemove ? (
+        <ConfirmDialog
+          title="Remove from recent projects"
+          body={`Remove "${recentProjects.find((p) => p.file_path === pendingRemove)?.name ?? pendingRemove}" from the recent projects list?\n\nThe project file itself will not be deleted.`}
+          confirmLabel="Remove"
+          onCancel={() => setPendingRemove(null)}
+          onConfirm={() => { void confirmRemove(); }}
         />
       ) : null}
     </main>

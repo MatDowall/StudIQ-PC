@@ -322,7 +322,7 @@ export function DimensionGroupPropertiesDialog({
                   </thead>
                   <tbody>
                     {framingSummary.components.map((c) => (
-                      <tr key={c.kind}>
+                      <tr key={c.kind + (c.sizeOverride ?? "")}>
                         <td style={{ padding: "3px 8px" }}>{c.count > 1 ? `${c.label} (${c.count})` : c.label}</td>
                         <td style={{ padding: "3px 8px", textAlign: "right" }}>{c.totalM.toFixed(3)}</td>
                       </tr>

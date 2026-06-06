@@ -14,7 +14,7 @@ export function FramingBreakdownPanel({ onClose }: { onClose: () => void }) {
   const groupProps = useAppStore((s) => s.groupProps);
   const overlayMeasurements = useAppStore((s) => s.overlayMeasurements);
   const scaleCache = useAppStore((s) => s.scaleCache);
-  const selectedMeasurementId = useAppStore((s) => s.selectedMeasurementId);
+  const selectedMeasurementIds = useAppStore((s) => s.selectedMeasurementIds);
   const activeBreadcrumb = useAppStore((s) => s.activeBreadcrumb);
   const [copied, setCopied] = useState(false);
 
@@ -103,7 +103,7 @@ export function FramingBreakdownPanel({ onClose }: { onClose: () => void }) {
           <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: 8 }}>
             <div style={{ color: theme.text.secondary, marginBottom: 6 }}>{groupName} — {breakdown.perWall.length} wall{breakdown.perWall.length > 1 ? "s" : ""}</div>
             {breakdown.perWall.map((wall, index) => {
-              const highlighted = wall.id === selectedMeasurementId;
+              const highlighted = selectedMeasurementIds.includes(wall.id);
               return (
                 <div key={wall.id} style={{ marginBottom: 8, border: `1px solid ${highlighted ? theme.accent : theme.border.subtle}`, background: theme.bg.input }}>
                   <div style={{ padding: "3px 6px", borderBottom: `1px solid ${theme.border.subtle}`, fontWeight: 600 }}>
@@ -112,7 +112,7 @@ export function FramingBreakdownPanel({ onClose }: { onClose: () => void }) {
                   </div>
                   <div style={{ padding: "4px 6px", display: "flex", flexDirection: "column", gap: 3 }}>
                     {wall.quantities.components.map((c) => (
-                      <div key={c.kind} style={{ display: "flex", flexDirection: "column" }}>
+                      <div key={c.kind + (c.sizeOverride ?? "")} style={{ display: "flex", flexDirection: "column" }}>
                         <div style={{ display: "flex" }}>
                           <span>{c.label}</span>
                           <span style={{ marginLeft: "auto" }}>{c.totalM.toFixed(3)} m</span>
@@ -127,15 +127,26 @@ export function FramingBreakdownPanel({ onClose }: { onClose: () => void }) {
           </div>
 
           <div style={{ borderTop: `1px solid ${theme.border.subtle}`, padding: "6px 8px" }}>
-            {breakdown.components.map((c) => (
-              <div key={c.kind} style={{ display: "flex", color: theme.text.secondary }}>
+            {breakdown.components.filter((c) => !c.sizeOverride).map((c) => (
+              <div key={c.kind + (c.sizeOverride ?? "")} style={{ display: "flex", color: theme.text.secondary }}>
                 <span>{c.count > 1 ? `${c.label} (${c.count})` : c.label}</span>
                 <span style={{ marginLeft: "auto" }}>{c.totalM.toFixed(3)} m</span>
               </div>
             ))}
             <div style={{ display: "flex", fontWeight: 600, marginTop: 2 }}>
-              <span>Total</span><span style={{ marginLeft: "auto" }}>{breakdown.totalM.toFixed(3)} m</span>
+              <span>Total</span><span style={{ marginLeft: "auto" }}>{breakdown.matchingTotalM.toFixed(3)} m</span>
             </div>
+            {breakdown.components.some((c) => !!c.sizeOverride) && (
+              <>
+                <div style={{ borderTop: `1px solid ${theme.border.subtle}`, marginTop: 6, paddingTop: 6, color: theme.text.disabled, fontSize: 10 }}>Separate timber sizes</div>
+                {breakdown.components.filter((c) => !!c.sizeOverride).map((c) => (
+                  <div key={c.kind + (c.sizeOverride ?? "")} style={{ display: "flex", color: theme.accent, fontWeight: 600 }}>
+                    <span>{c.count > 1 ? `${c.label} (${c.count})` : c.label}</span>
+                    <span style={{ marginLeft: "auto" }}>{c.totalM.toFixed(3)} m</span>
+                  </div>
+                ))}
+              </>
+            )}
             <button
               onClick={copyCsv}
               style={{ marginTop: 8, width: "100%", height: 26, background: theme.bg.input, color: theme.text.primary, border: `1px solid ${theme.border.divider}`, cursor: "pointer", fontSize: 11 }}

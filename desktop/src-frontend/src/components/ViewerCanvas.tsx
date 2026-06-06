@@ -383,7 +383,7 @@ function drawOverlays(
   zoom: number,
   page: PageMeta,
   pageIndex: number,
-  selectedId: number | null,
+  selectedIds: ReadonlySet<number>,
   editPreview: { id: number; points: PagePoint[] } | null,
   mmPerPoint: number | null,
 ) {
@@ -415,7 +415,7 @@ function drawOverlays(
       ? props?.neg_colour ?? "#FF0000"
       : groupColours[measurement.dimension_group_id] ?? props?.pos_colour ?? fallbackColour;
     const style = negative ? props?.neg_style : props?.pos_style;
-    const selected = measurement.id === selectedId;
+    const selected = selectedIds.has(measurement.id);
 
     // Count dimensions are point markers, not paths.
     if (measurement.measurement_type === "count") {
@@ -584,6 +584,38 @@ function drawLineSnapPreview(
   ctx.restore();
 }
 
+/** Returns copies of measurements with all geometry points shifted by (dx, dy) in PDF points. */
+function shiftMeasurements(measurements: MeasurementDto[], dx: number, dy: number): MeasurementDto[] {
+  return measurements.map((m) => {
+    try {
+      const pts = JSON.parse(m.geometry_json) as PagePoint[];
+      return { ...m, geometry_json: JSON.stringify(pts.map((p) => ({ x: p.x + dx, y: p.y + dy }))) };
+    } catch {
+      return m;
+    }
+  });
+}
+
+/** Centroid (average of all vertices) of a set of measurements, in PDF points. */
+function measurementsCentroid(measurements: MeasurementDto[]): PagePoint {
+  let sumX = 0;
+  let sumY = 0;
+  let count = 0;
+  for (const m of measurements) {
+    try {
+      const pts = JSON.parse(m.geometry_json) as PagePoint[];
+      for (const p of pts) {
+        sumX += p.x;
+        sumY += p.y;
+        count += 1;
+      }
+    } catch {
+      // skip unparseable
+    }
+  }
+  return count > 0 ? { x: sumX / count, y: sumY / count } : { x: 0, y: 0 };
+}
+
 type ScaleUnit = "mm" | "cm" | "m";
 
 /** Prompts for the real-world length of a drawn calibration line, then reports it in mm. */
@@ -724,8 +756,23 @@ export function ViewerCanvas({
   const [studGhost, setStudGhost] = useState<{ measurementId: number; segmentIndex: number; centreMm: number } | null>(null);
   // Right-click → View wall in 3D: the wall shown in the isolated 3D modal.
   const [wall3dId, setWall3dId] = useState<number | null>(null);
+  // Marquee rubber-band selection
+  const [marqueeState, setMarqueeState] = useState<{ startClient: { x: number; y: number }; endClient: { x: number; y: number } } | null>(null);
+  const marqueeRef = useRef<{ startClient: { x: number; y: number }; pointerId: number } | null>(null);
+  // Move mode: selected measurements follow the cursor; anchorPage = centroid when move started
+  const [moveMode, setMoveMode] = useState<{ anchorPage: PagePoint } | null>(null);
+  const moveModeRef = useRef<{ anchorPage: PagePoint } | null>(null);
+  // Copy/paste clipboard
+  const [clipboard, setClipboard] = useState<MeasurementDto[]>([]);
+  const clipboardRef = useRef<MeasurementDto[]>([]);
+  // Paste ghost mode: centroid = clipboard centroid; ghost follows cursor
+  const [pasteMode, setPasteMode] = useState<{ centroid: PagePoint } | null>(null);
+  const pasteModeRef = useRef<{ centroid: PagePoint } | null>(null);
+
   const vertexDragRef = useRef<{ measurementId: number; vertexIndex: number } | null>(null);
   const draftPointsRef = useRef<PagePoint[]>([]);
+  const shiftHeldRef = useRef(false);
+  const [shiftHeld, setShiftHeld] = useState(false);
   // Scale-calibration capture: up to two clicked points, then the length dialog.
   const [calibPoints, setCalibPoints] = useState<PagePoint[]>([]);
   const [calibDialog, setCalibDialog] = useState<{ pixelLength: number } | null>(null);
@@ -751,6 +798,7 @@ export function ViewerCanvas({
   const resolveSnap = useAppStore((state) => state.resolveSnap);
   const resolveLineSnap = useAppStore((state) => state.resolveLineSnap);
   const clearSnap = useAppStore((state) => state.clearSnap);
+  const snapEnabled = useAppStore((state) => state.snapEnabled);
   const createMeasurement = useAppStore((state) => state.createMeasurement);
   const updateMeasurementGeometry = useAppStore((state) => state.updateMeasurementGeometry);
   const updateMeasurementFraming = useAppStore((state) => state.updateMeasurementFraming);
@@ -760,8 +808,10 @@ export function ViewerCanvas({
   const activeDimensionGroupId = useAppStore((state) => state.activeDimensionGroupId);
   const activeDrawingId = useAppStore((state) => state.activeDrawingId);
   const viewerMode = useAppStore((state) => state.viewerMode);
-  const selectedMeasurementId = useAppStore((state) => state.selectedMeasurementId);
+  const selectedMeasurementIds = useAppStore((state) => state.selectedMeasurementIds);
   const selectMeasurement = useAppStore((state) => state.selectMeasurement);
+  const toggleSelectMeasurement = useAppStore((state) => state.toggleSelectMeasurement);
+  const setSelectedMeasurementIds = useAppStore((state) => state.setSelectedMeasurementIds);
   const pageScale = useAppStore((state) => state.pageScale);
   const calibrating = useAppStore((state) => state.calibrating);
   const setCalibrating = useAppStore((state) => state.setCalibrating);
@@ -769,6 +819,7 @@ export function ViewerCanvas({
   const loadPageScale = useAppStore((state) => state.loadPageScale);
   const groupProps = useAppStore((state) => state.groupProps);
   const drawPolarity = useAppStore((state) => state.drawPolarity);
+  const drawingDimmer = useAppStore((state) => state.drawingDimmer);
 
   // Colour/style the in-progress draft takes from the active group + current polarity.
   const activeProps = activeDimensionGroupId !== null ? groupProps[activeDimensionGroupId] : undefined;
@@ -779,6 +830,10 @@ export function ViewerCanvas({
   const drawingArea = activeProps?.measurement_type === "area";
   const drawingCount = activeProps?.measurement_type === "count";
   const drawingFraming = activeProps?.measurement_type === "timber_framing";
+
+  const selectedSet = useMemo(() => new Set(selectedMeasurementIds), [selectedMeasurementIds]);
+  // Vertex drag only available when exactly one measurement is selected.
+  const singleSelectedId = selectedMeasurementIds.length === 1 ? selectedMeasurementIds[0] : null;
 
   const page = doc?.pages[pageIndex] ?? null;
   // Add-mode is active when a dimension group is selected, a page is open, and the
@@ -846,11 +901,14 @@ export function ViewerCanvas({
     [page, pan.x, pan.y, zoom],
   );
 
-  // The point to commit at a click: snap target if one is live, else the raw cursor.
+  // The point to commit at a click: snap target if one is live (and Shift is not held), else raw cursor.
   const placementPoint = useCallback(
     (clientX: number, clientY: number): PagePoint | null => {
-      const snap = useAppStore.getState().snapPoint;
-      return snap ?? clientToPagePoint(clientX, clientY);
+      if (!shiftHeldRef.current) {
+        const snap = useAppStore.getState().snapPoint;
+        if (snap) return snap;
+      }
+      return clientToPagePoint(clientX, clientY);
     },
     [clientToPagePoint],
   );
@@ -1114,8 +1172,15 @@ export function ViewerCanvas({
       );
     }
 
+    // Dimmer: white overlay over the page linework so measurements stand out.
+    // We overlay rather than reducing tile alpha to avoid ghosting against the preview image.
+    if (drawingDimmer < 1) {
+      ctx.fillStyle = `rgba(247,247,247,${1 - drawingDimmer})`;
+      ctx.fillRect(pageLeft, pageTop, pageSize.width, pageSize.height);
+    }
+
     ctx.restore();
-  }, [activeZoomBucket, doc, imageVersion, page, pageIndex, pageSize.height, pageSize.width, pan.x, pan.y, preview, tiles, viewportSize.height, viewportSize.width, zoom]);
+  }, [activeZoomBucket, doc, drawingDimmer, imageVersion, page, pageIndex, pageSize.height, pageSize.width, pan.x, pan.y, preview, tiles, viewportSize.height, viewportSize.width, zoom]);
 
   useEffect(() => {
     const canvas = overlayCanvasRef.current;
@@ -1143,7 +1208,7 @@ export function ViewerCanvas({
     ctx.beginPath();
     ctx.rect(-pan.x, -pan.y, pageSize.width, pageSize.height);
     ctx.clip();
-    drawOverlays(ctx, overlayMeasurements, groupColours, groupProps, overlayColour, pan, zoom, page, pageIndex, selectedMeasurementId, editPreview, pageScale?.mm_per_point ?? null);
+    drawOverlays(ctx, overlayMeasurements, groupColours, groupProps, overlayColour, pan, zoom, page, pageIndex, selectedSet, editPreview, pageScale?.mm_per_point ?? null);
     if (measuring) {
       if (drawingType === "line") {
         // Line mode: draw the detected wall segment as the live preview instead of a rubber-band.
@@ -1152,9 +1217,9 @@ export function ViewerCanvas({
         }
       } else if (drawingFraming) {
         // Framing: preview plates + studs live as the wall is drawn (incl. the rubber-band point),
-        // with the live segment constrained to 90° off the previous one.
+        // with the live segment constrained to 90° off the previous one (unless Shift overrides).
         const rawLive = snapPoint ?? cursorPagePoint;
-        const livePoint = rawLive ? orthogonalConstrain(draftPoints, rawLive) : rawLive;
+        const livePoint = rawLive ? (shiftHeld ? rawLive : orthogonalConstrain(draftPoints, rawLive)) : rawLive;
         const draftPath = livePoint ? [...draftPoints, livePoint] : draftPoints;
         const settings = parseFramingSettings(activeProps?.framing_props_json ?? null);
         drawFraming(ctx, draftPath, settings, pageScale?.mm_per_point ?? null, draftColour, draftStyle, pan, zoom, page, false, true);
@@ -1240,12 +1305,72 @@ export function ViewerCanvas({
         }
       }
     }
+    // Move ghost: selected measurements rendered semi-transparent at the offset position.
+    if (moveMode && cursorPagePoint) {
+      const dx = cursorPagePoint.x - moveMode.anchorPage.x;
+      const dy = cursorPagePoint.y - moveMode.anchorPage.y;
+      const movingMs = overlayMeasurements.filter((m) => selectedSet.has(m.id) && m.page_index === pageIndex);
+      if (movingMs.length > 0) {
+        const shifted = shiftMeasurements(movingMs, dx, dy);
+        ctx.save();
+        ctx.globalAlpha = 0.65;
+        drawOverlays(ctx, shifted, groupColours, groupProps, overlayColour, pan, zoom, page, pageIndex, new Set(), null, pageScale?.mm_per_point ?? null);
+        ctx.restore();
+      }
+    }
+    // Paste ghost: clipboard measurements rendered semi-transparent at the cursor-centroid offset.
+    if (pasteMode && clipboardRef.current.length > 0 && cursorPagePoint) {
+      const dx = cursorPagePoint.x - pasteMode.centroid.x;
+      const dy = cursorPagePoint.y - pasteMode.centroid.y;
+      const shifted = shiftMeasurements(clipboardRef.current, dx, dy);
+      ctx.save();
+      ctx.globalAlpha = 0.55;
+      drawOverlays(ctx, shifted, groupColours, groupProps, overlayColour, pan, zoom, page, pageIndex, new Set(), null, pageScale?.mm_per_point ?? null);
+      ctx.restore();
+    }
+
     // Show the point-snap indicator only in point mode; line mode uses the segment preview.
     if (drawingType !== "line") {
       drawSnapIndicator(ctx, snapPoint, snapType, pan, zoom, page);
     }
     ctx.restore();
-  }, [activeProps, calibDialog, calibPoints, calibrating, cursorPagePoint, doc, draftColour, draftPoints, draftStyle, drawingArea, drawingFraming, drawingType, editPreview, groupColours, groupProps, lineSnapResult, measuring, openingGhost, openingPlacement, overlayColour, overlayMeasurements, page, pageIndex, pageScale, pageSize.height, pageSize.width, pan, selectedMeasurementId, snapPoint, snapType, studGhost, viewportSize.height, viewportSize.width, zoom]);
+
+    // Marquee: drawn outside the page clip so it spans the full viewport.
+    if (marqueeState) {
+      const el = viewportRef.current;
+      if (el) {
+        const domRect = el.getBoundingClientRect();
+        const x1 = marqueeState.startClient.x - domRect.left;
+        const y1 = marqueeState.startClient.y - domRect.top;
+        const x2 = marqueeState.endClient.x - domRect.left;
+        const y2 = marqueeState.endClient.y - domRect.top;
+        const leftToRight = x2 >= x1;
+        const rx = Math.min(x1, x2);
+        const ry = Math.min(y1, y2);
+        const rw = Math.abs(x2 - x1);
+        const rh = Math.abs(y2 - y1);
+        if (rw > 2 || rh > 2) {
+          ctx.save();
+          ctx.lineWidth = 1;
+          if (leftToRight) {
+            // Window select — solid blue border, light blue fill
+            ctx.setLineDash([]);
+            ctx.fillStyle = "rgba(74, 158, 255, 0.10)";
+            ctx.strokeStyle = "rgba(74, 158, 255, 0.85)";
+          } else {
+            // Crossing select — dashed green border, light green fill
+            ctx.setLineDash([5, 3]);
+            ctx.fillStyle = "rgba(80, 220, 100, 0.08)";
+            ctx.strokeStyle = "rgba(80, 220, 100, 0.85)";
+          }
+          ctx.fillRect(rx, ry, rw, rh);
+          ctx.strokeRect(rx, ry, rw, rh);
+          ctx.setLineDash([]);
+          ctx.restore();
+        }
+      }
+    }
+  }, [activeProps, calibDialog, calibPoints, calibrating, clipboard, cursorPagePoint, doc, draftColour, draftPoints, draftStyle, drawingArea, drawingFraming, drawingType, editPreview, groupColours, groupProps, lineSnapResult, marqueeState, measuring, moveMode, openingGhost, openingPlacement, overlayColour, overlayMeasurements, page, pageIndex, pageScale, pageSize.height, pageSize.width, pan, pasteMode, selectedSet, shiftHeld, snapPoint, snapType, studGhost, viewportSize.height, viewportSize.width, zoom]);
 
   function clampPan(nextPan: { x: number; y: number }, nextZoom = zoom) {
     if (!page) return nextPan;
@@ -1321,8 +1446,8 @@ export function ViewerCanvas({
         return;
       }
 
-      // Framing corners can only be 90°, so each new segment is forced orthogonal to the previous.
-      const point = drawingFraming ? orthogonalConstrain(draftPointsRef.current, rawPoint) : rawPoint;
+      // Framing corners are forced orthogonal to the previous segment, unless Shift overrides.
+      const point = drawingFraming && !shiftHeldRef.current ? orthogonalConstrain(draftPointsRef.current, rawPoint) : rawPoint;
 
       // Click-to-place: each click drops a vertex (at the snap target if one is live).
       applyDraft((prev) => {
@@ -1338,32 +1463,50 @@ export function ViewerCanvas({
     }
 
     if (selectMode && page) {
+      // Move mode: left-click commits the move at the current cursor position.
+      if (moveMode && cursorPagePoint) {
+        void commitMove(cursorPagePoint);
+        return;
+      }
+      // Paste mode: left-click commits the paste at the current cursor position.
+      if (pasteMode && cursorPagePoint) {
+        void commitPaste(cursorPagePoint);
+        return;
+      }
       // Ctrl+click places a manually-positioned extra stud on the ghosted wall.
       if (event.ctrlKey && studGhost) {
         commitExtraStud();
         return;
       }
       // Drag a handle of the already-selected dimension to move that vertex.
-      if (selectedMeasurementId !== null) {
-        const vertexIndex = hitTestVertex(event.clientX, event.clientY, selectedMeasurementId);
+      if (singleSelectedId !== null) {
+        const vertexIndex = hitTestVertex(event.clientX, event.clientY, singleSelectedId);
         if (vertexIndex >= 0) {
-          const points = measurementPoints(selectedMeasurementId);
+          const points = measurementPoints(singleSelectedId);
           if (points) {
             event.currentTarget.setPointerCapture(event.pointerId);
-            vertexDragRef.current = { measurementId: selectedMeasurementId, vertexIndex };
-            setEditPreview({ id: selectedMeasurementId, points });
+            vertexDragRef.current = { measurementId: singleSelectedId, vertexIndex };
+            setEditPreview({ id: singleSelectedId, points });
             return;
           }
         }
       }
-      // Otherwise select the dimension under the cursor, or pan on empty space.
+      // Hit-test for a dimension under the cursor.
       const hitId = hitTestMeasurementId(event.clientX, event.clientY);
       if (hitId !== null) {
-        selectMeasurement(hitId);
+        if (event.ctrlKey) {
+          toggleSelectMeasurement(hitId);
+        } else {
+          selectMeasurement(hitId);
+        }
         return;
       }
-      selectMeasurement(null);
-      startPan(event);
+      // Empty space: Ctrl+click just keeps the current selection; plain click clears it.
+      if (!event.ctrlKey) selectMeasurement(null);
+      // Start a marquee rubber-band selection (replaces pan in select mode).
+      event.currentTarget.setPointerCapture(event.pointerId);
+      marqueeRef.current = { startClient: { x: event.clientX, y: event.clientY }, pointerId: event.pointerId };
+      setMarqueeState({ startClient: { x: event.clientX, y: event.clientY }, endClient: { x: event.clientX, y: event.clientY } });
       return;
     }
 
@@ -1393,6 +1536,12 @@ export function ViewerCanvas({
 
     scheduleSnapResolution(event.clientX, event.clientY);
 
+    // Marquee update — track the drag end point while rubber-banding.
+    if (marqueeRef.current) {
+      setMarqueeState((prev) => (prev ? { ...prev, endClient: { x: event.clientX, y: event.clientY } } : null));
+      return;
+    }
+
     // Vertex drag takes priority — move the dragged handle to the snapped cursor.
     const vertexDrag = vertexDragRef.current;
     if (vertexDrag) {
@@ -1418,8 +1567,9 @@ export function ViewerCanvas({
       );
     }
 
-    if (measuring || calibrating) {
-      // Drive the live rubber-band endpoint (drawing a dimension or a calibration line).
+    if (measuring || calibrating || moveMode || pasteMode) {
+      // Drive the live rubber-band endpoint (drawing a dimension, a calibration line,
+      // or a move/paste ghost).
       setCursorClient({ x: event.clientX, y: event.clientY });
       const raw = clientToPagePoint(event.clientX, event.clientY);
       if (raw) setCursorPagePoint(raw);
@@ -1434,6 +1584,22 @@ export function ViewerCanvas({
   }
 
   function handlePointerUp(event: React.PointerEvent<HTMLDivElement>) {
+    // Marquee: finalise selection based on drag direction.
+    if (marqueeRef.current?.pointerId === event.pointerId) {
+      const mq = marqueeRef.current;
+      marqueeRef.current = null;
+      if (marqueeState) {
+        const dx = marqueeState.endClient.x - mq.startClient.x;
+        const dy = marqueeState.endClient.y - mq.startClient.y;
+        if (Math.abs(dx) > 4 || Math.abs(dy) > 4) {
+          const ids = marqueeSelectIds(marqueeState.startClient, marqueeState.endClient);
+          setSelectedMeasurementIds(ids);
+        }
+        setMarqueeState(null);
+      }
+      return;
+    }
+
     const vertexDrag = vertexDragRef.current;
     if (vertexDrag) {
       vertexDragRef.current = null;
@@ -1516,10 +1682,20 @@ export function ViewerCanvas({
 
       const id = hitTestMeasurementId(event.clientX, event.clientY);
       if (id === null) {
-        setViewerMenu(null);
+        // Empty space: offer Paste if there's content on the clipboard.
+        if (clipboardRef.current.length > 0) {
+          setViewerMenu({
+            x: event.clientX,
+            y: event.clientY,
+            items: [{ label: "Paste", action: () => startPaste() }],
+          });
+        } else {
+          setViewerMenu(null);
+        }
         return;
       }
-      selectMeasurement(id);
+      // Right-click on a measurement: if it's not already in the selection, single-select it.
+      if (!selectedSet.has(id)) selectMeasurement(id);
 
       const measurement = overlayMeasurements.find((m) => m.id === id);
       const points = measurementPoints(id);
@@ -1527,45 +1703,58 @@ export function ViewerCanvas({
       const isArea = isAreaType(measurement.measurement_type);
       const minPoints = isArea ? 3 : 2;
 
-      // On a vertex → delete it; on a segment between vertices → add one. These are
-      // mutually exclusive so the obvious action sits directly under the cursor.
       const items: ViewerMenuItem[] = [];
-      const vertexIndex = nearestVertex(event.clientX, event.clientY, id, VERTEX_RADIUS + 8);
-      if (vertexIndex >= 0 && points.length > minPoints) {
-        items.push({ label: "Delete point", danger: true, action: () => deleteVertex(id, vertexIndex) });
-      } else {
-        const segment = hitTestSegment(event.clientX, event.clientY, id);
-        if (segment) {
-          items.push({ label: "Add point", action: () => addVertex(id, segment.segmentIndex, segment.point) });
+      const multiSelected = selectedMeasurementIds.length > 1 && selectedSet.has(id);
+
+      if (!multiSelected) {
+        // Single-measurement geometry editing: delete/add vertex.
+        const vertexIndex = nearestVertex(event.clientX, event.clientY, id, VERTEX_RADIUS + 8);
+        if (vertexIndex >= 0 && points.length > minPoints) {
+          items.push({ label: "Delete point", danger: true, action: () => deleteVertex(id, vertexIndex) });
+        } else {
+          const segment = hitTestSegment(event.clientX, event.clientY, id);
+          if (segment) {
+            items.push({ label: "Add point", action: () => addVertex(id, segment.segmentIndex, segment.point) });
+          }
+        }
+        // Timber-framing extras (3D view, raking frames).
+        if (measurement.measurement_type === "timber_framing") {
+          items.push({ label: "View wall in 3D", action: () => setWall3dId(id) });
+          const seg = hitTestSegment(event.clientX, event.clientY, id);
+          if (seg) {
+            const framing = parseWallFraming(measurement.framing_json);
+            const existingRake = framing.rakes.find((r) => r.segmentIndex === seg.segmentIndex);
+            const groupSettings = parseFramingSettings(groupProps[measurement.dimension_group_id]?.framing_props_json ?? null);
+            items.push({
+              label: existingRake ? "Edit raking frame…" : "Set raking frame…",
+              action: () =>
+                setPendingRake({
+                  measurementId: id,
+                  segmentIndex: seg.segmentIndex,
+                  start: existingRake?.startMm ?? groupSettings.wallHeightMm,
+                  end: existingRake?.endMm ?? groupSettings.wallHeightMm,
+                }),
+            });
+            if (existingRake) items.push({ label: "Clear raking frame", danger: true, action: () => clearRake(id, seg.segmentIndex) });
+          }
         }
       }
 
-      // Timber-framing walls: view in 3D + set/clear a raking frame on the segment under the cursor.
-      if (measurement.measurement_type === "timber_framing") {
-        items.push({ label: "View wall in 3D", action: () => setWall3dId(id) });
-        const seg = hitTestSegment(event.clientX, event.clientY, id);
-        if (seg) {
-          const framing = parseWallFraming(measurement.framing_json);
-          const existingRake = framing.rakes.find((r) => r.segmentIndex === seg.segmentIndex);
-          const groupSettings = parseFramingSettings(groupProps[measurement.dimension_group_id]?.framing_props_json ?? null);
-          items.push({
-            label: existingRake ? "Edit raking frame…" : "Set raking frame…",
-            action: () =>
-              setPendingRake({
-                measurementId: id,
-                segmentIndex: seg.segmentIndex,
-                start: existingRake?.startMm ?? groupSettings.wallHeightMm,
-                end: existingRake?.endMm ?? groupSettings.wallHeightMm,
-              }),
-          });
-          if (existingRake) items.push({ label: "Clear raking frame", danger: true, action: () => clearRake(id, seg.segmentIndex) });
-        }
+      // Move, Copy, Delete work for any selection (single or multi).
+      const selectionLabel = multiSelected ? `${selectedMeasurementIds.length} measurements` : "measurement";
+      items.push({ label: "Move", action: () => startMove() });
+      items.push({ label: "Copy", action: () => copySelected() });
+      if (clipboardRef.current.length > 0) {
+        items.push({ label: "Paste", action: () => startPaste() });
       }
+      items.push({
+        label: `Delete ${selectionLabel}`,
+        danger: true,
+        action: () => {
+          void deleteSelectedMeasurements();
+        },
+      });
 
-      if (items.length === 0) {
-        setViewerMenu(null);
-        return;
-      }
       setViewerMenu({ x: event.clientX, y: event.clientY, items });
       return;
     }
@@ -1912,6 +2101,130 @@ export function ViewerCanvas({
     return null;
   }
 
+  // Returns the IDs of measurements on this page that fall inside (or overlap) the marquee box.
+  // Left-to-right (window): all vertices must be inside. Right-to-left (crossing): bounding box overlaps.
+  function marqueeSelectIds(startClient: { x: number; y: number }, endClient: { x: number; y: number }): number[] {
+    const element = viewportRef.current;
+    if (!element || !page) return [];
+    const domRect = element.getBoundingClientRect();
+    const sx1 = startClient.x - domRect.left;
+    const sy1 = startClient.y - domRect.top;
+    const sx2 = endClient.x - domRect.left;
+    const sy2 = endClient.y - domRect.top;
+    const leftToRight = sx2 >= sx1;
+    const minX = Math.min(sx1, sx2);
+    const maxX = Math.max(sx1, sx2);
+    const minY = Math.min(sy1, sy2);
+    const maxY = Math.max(sy1, sy2);
+    const ids: number[] = [];
+    for (const m of overlayMeasurements) {
+      if (m.page_index !== pageIndex) continue;
+      let pts: PagePoint[];
+      try {
+        pts = JSON.parse(m.geometry_json);
+      } catch {
+        continue;
+      }
+      if (!Array.isArray(pts) || pts.length < 1) continue;
+      const screenPts = pts.map((p) => pageToScreen(p.x, p.y, page.height_pts, pan, zoom));
+      if (leftToRight) {
+        if (screenPts.every((s) => s.x >= minX && s.x <= maxX && s.y >= minY && s.y <= maxY)) ids.push(m.id);
+      } else {
+        const bMinX = Math.min(...screenPts.map((s) => s.x));
+        const bMaxX = Math.max(...screenPts.map((s) => s.x));
+        const bMinY = Math.min(...screenPts.map((s) => s.y));
+        const bMaxY = Math.max(...screenPts.map((s) => s.y));
+        if (bMaxX >= minX && bMinX <= maxX && bMaxY >= minY && bMinY <= maxY) ids.push(m.id);
+      }
+    }
+    return ids;
+  }
+
+  function copySelected() {
+    const selected = overlayMeasurements.filter((m) => selectedSet.has(m.id) && m.page_index === pageIndex);
+    if (selected.length === 0) return;
+    setClipboard(selected);
+    clipboardRef.current = selected;
+  }
+
+  function startMove() {
+    const pageIds = selectedMeasurementIds.filter((id) => overlayMeasurements.find((m) => m.id === id)?.page_index === pageIndex);
+    if (pageIds.length === 0) return;
+    const selected = overlayMeasurements.filter((m) => pageIds.includes(m.id));
+    const centroid = measurementsCentroid(selected);
+    moveModeRef.current = { anchorPage: centroid };
+    setMoveMode({ anchorPage: centroid });
+  }
+
+  async function commitMove(cursor: PagePoint) {
+    const anchor = moveModeRef.current;
+    if (!anchor) return;
+    moveModeRef.current = null;
+    setMoveMode(null);
+    const dx = cursor.x - anchor.anchorPage.x;
+    const dy = cursor.y - anchor.anchorPage.y;
+    for (const id of selectedMeasurementIds) {
+      const m = overlayMeasurements.find((x) => x.id === id);
+      if (!m) continue;
+      try {
+        const pts = JSON.parse(m.geometry_json) as PagePoint[];
+        const newPts = pts.map((p) => ({ x: p.x + dx, y: p.y + dy }));
+        await updateMeasurementGeometry(id, JSON.stringify(newPts)).catch((e) => onStatusChange(`ERROR: ${e}`));
+      } catch {
+        // skip unparseable
+      }
+    }
+  }
+
+  function startPaste() {
+    const cb = clipboardRef.current;
+    if (cb.length === 0) return;
+    const centroid = measurementsCentroid(cb);
+    pasteModeRef.current = { centroid };
+    setPasteMode({ centroid });
+    // Ensure cursor tracking is active so the ghost appears immediately.
+  }
+
+  async function commitPaste(cursor: PagePoint) {
+    const pm = pasteModeRef.current;
+    const cb = clipboardRef.current;
+    if (!pm || cb.length === 0) return;
+    pasteModeRef.current = null;
+    setPasteMode(null);
+    const dx = cursor.x - pm.centroid.x;
+    const dy = cursor.y - pm.centroid.y;
+    const newIds: number[] = [];
+    for (const m of cb) {
+      try {
+        const pts = JSON.parse(m.geometry_json) as PagePoint[];
+        const newPts = pts.map((p) => ({ x: p.x + dx, y: p.y + dy }));
+        const created = await createMeasurement({
+          measurementType: m.measurement_type,
+          geometryJson: JSON.stringify(newPts),
+          polarity: m.polarity,
+        }).catch((e) => { onStatusChange(`ERROR: ${e}`); return null; });
+        if (created) {
+          // For timber-framing walls, carry over openings (doors/windows), extra studs,
+          // and raking frames.  These are all stored as arc-length positions along the
+          // wall path (in mm), so they're valid regardless of where the wall is placed.
+          if (m.framing_json) {
+            await updateMeasurementFraming(created.id, m.framing_json).catch((e) => onStatusChange(`ERROR: ${e}`));
+          }
+          newIds.push(created.id);
+        }
+      } catch {
+        // skip
+      }
+    }
+    if (newIds.length > 0) setSelectedMeasurementIds(newIds);
+  }
+
+  async function deleteSelectedMeasurements() {
+    await Promise.all(
+      selectedMeasurementIds.map((id) => deleteMeasurement(id).catch((e) => onStatusChange(`ERROR: ${e}`))),
+    );
+  }
+
   // Hover tooltip over committed measurements.
   function updateHover(clientX: number, clientY: number) {
     const element = viewportRef.current;
@@ -1980,6 +2293,12 @@ export function ViewerCanvas({
       const latest = latestSnapPointerRef.current;
       const element = viewportRef.current;
       if (!latest || !element || !doc || !page) {
+        clearSnap();
+        return;
+      }
+
+      // Shift held or snap disabled: free-cursor mode — no snapping, no ortho-lock.
+      if (shiftHeldRef.current || !useAppStore.getState().snapEnabled) {
         clearSnap();
         return;
       }
@@ -2076,18 +2395,71 @@ export function ViewerCanvas({
     return () => window.removeEventListener("keyup", onKeyUp);
   }, [selectMode]);
 
-  // Select-mode: Delete (or Backspace) removes the selected dimension.
+  // Shift held: temporarily disables snapping and ortho-lock for all measurement types.
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Shift" && !shiftHeldRef.current) {
+        shiftHeldRef.current = true;
+        setShiftHeld(true);
+        clearSnap();
+      }
+    }
+    function onKeyUp(event: KeyboardEvent) {
+      if (event.key === "Shift") {
+        shiftHeldRef.current = false;
+        setShiftHeld(false);
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+    };
+  }, [clearSnap]);
+
+  // Select-mode keyboard shortcuts.
   useEffect(() => {
     if (!selectMode) return;
     function onKeyDown(event: KeyboardEvent) {
-      if ((event.key === "Delete" || event.key === "Backspace") && selectedMeasurementId !== null) {
+      // Esc cancels move or paste ghost mode.
+      if (event.key === "Escape") {
+        if (moveModeRef.current) { moveModeRef.current = null; setMoveMode(null); }
+        if (pasteModeRef.current) { pasteModeRef.current = null; setPasteMode(null); }
+        return;
+      }
+      // Delete / Backspace — remove all selected measurements.
+      if ((event.key === "Delete" || event.key === "Backspace") && selectedMeasurementIds.length > 0) {
         event.preventDefault();
-        void deleteMeasurement(selectedMeasurementId).catch((error) => onStatusChange(`ERROR: ${error}`));
+        void Promise.all(
+          selectedMeasurementIds.map((id) => deleteMeasurement(id).catch((e) => onStatusChange(`ERROR: ${e}`))),
+        );
+        return;
+      }
+      // Ctrl+A — select all measurements on this page.
+      if (event.ctrlKey && event.key === "a") {
+        event.preventDefault();
+        const pageIds = overlayMeasurements.filter((m) => m.page_index === pageIndex).map((m) => m.id);
+        setSelectedMeasurementIds(pageIds);
+        return;
+      }
+      // Ctrl+C — copy selected measurements.
+      if (event.ctrlKey && event.key === "c" && selectedMeasurementIds.length > 0) {
+        const selected = overlayMeasurements.filter((m) => selectedSet.has(m.id) && m.page_index === pageIndex);
+        if (selected.length > 0) { setClipboard(selected); clipboardRef.current = selected; }
+        return;
+      }
+      // Ctrl+V — enter paste ghost mode.
+      if (event.ctrlKey && event.key === "v") {
+        if (clipboardRef.current.length > 0) startPaste();
+        return;
       }
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [selectMode, selectedMeasurementId, deleteMeasurement, onStatusChange]);
+    // startPaste is defined in the component body (stable for this effect's lifetime).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectMode, selectedMeasurementIds, selectedSet, overlayMeasurements, pageIndex, deleteMeasurement, setSelectedMeasurementIds, onStatusChange]);
 
   // Live length readout near the cursor, for either a dimension being drawn or a
   // calibration line being placed. Shows real units once the page is scaled.
@@ -2134,13 +2506,15 @@ export function ViewerCanvas({
         cursor: doc
           ? measuring || calibrating || openingPlacement
             ? "crosshair"
-            : selectMode
-              ? hoverInfo
-                ? "pointer"
-                : "default"
-              : dragRef.current
-                ? "grabbing"
-                : "grab"
+            : moveMode || pasteMode
+              ? "crosshair"
+              : selectMode
+                ? hoverInfo
+                  ? "pointer"
+                  : "default"
+                : dragRef.current
+                  ? "grabbing"
+                  : "grab"
           : "default",
         background: "#15171a",
         touchAction: "none",
@@ -2264,8 +2638,20 @@ export function ViewerCanvas({
               }
               if (!m || !Array.isArray(pts)) return null;
               const settings = parseFramingSettings(groupProps[m.dimension_group_id]?.framing_props_json ?? null);
-              const members = computeWall3D(pts, settings, pageScale?.mm_per_point ?? null, parseWallFraming(m.framing_json));
-              return <Framing3DView members={members} />;
+              const mmpp = pageScale?.mm_per_point ?? null;
+              const members = computeWall3D(pts, settings, mmpp, parseWallFraming(m.framing_json));
+              const page3d = doc?.pages[m.page_index] ?? null;
+              const S = mmpp ? mmpp / 1000 : null;
+              const pageWidthM = S && page3d ? page3d.width_pts * S : undefined;
+              const pageHeightM = S && page3d ? page3d.height_pts * S : undefined;
+              // Use the current page's preview; fall back through all loaded previews for this page.
+              const previewEntry = preview?.image_path
+                ? preview
+                : (previews.get(m.page_index) ?? null);
+              const previewUrl = previewEntry?.image_path
+                ? convertFileSrc(previewEntry.image_path)
+                : undefined;
+              return <Framing3DView members={members} pageWidthM={pageWidthM} pageHeightM={pageHeightM} previewUrl={previewUrl} />;
             })()}
           </div>
         </div>

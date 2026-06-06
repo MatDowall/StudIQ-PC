@@ -22,7 +22,7 @@ export const theme = {
   danger: "#F44747",
   treeIndent: 16,
   rowHeight: 22,
-  ribbonHeight: 48,
+  ribbonHeight: 76,
   tabHeight: 28,
   leftPaneWidth: 380,
 };
