@@ -31,7 +31,14 @@ function summaryForNode(node: TreeNodeDto, total: Quantity | null | undefined) {
   return { quantity: quantityValueText(total), uom: total.uom };
 }
 
-function DimensionNodeIcon({ node }: { node: TreeNodeDto }) {
+const MEASUREMENT_TYPE_ICONS: Record<string, string> = {
+  timber_framing: "calendar_view_week",
+  area: "crop_free",
+  count: "123",
+  length: "straighten",
+};
+
+function DimensionNodeIcon({ node, measurementType }: { node: TreeNodeDto; measurementType?: string }) {
   if (node.node_type === "folder") {
     return (
       <span
@@ -68,17 +75,25 @@ function DimensionNodeIcon({ node }: { node: TreeNodeDto }) {
     );
   }
 
+  // measurement_type is always present on the node (sourced from the DB join), so no fallback.
+  const resolvedType = measurementType ?? node.measurement_type ?? "length";
+  const iconName = MEASUREMENT_TYPE_ICONS[resolvedType] ?? MEASUREMENT_TYPE_ICONS["length"];
+
   return (
     <span
       style={{
-        width: 18,
-        marginRight: 8,
+        width: 28,
+        marginRight: 4,
         color: theme.text.secondary,
-        fontSize: 13,
         lineHeight: 1,
+        display: "flex",
+        alignItems: "center",
+        flexShrink: 0,
       }}
     >
-      ◈
+      <span className="material-symbols-outlined" style={{ fontSize: 28, lineHeight: 1 }}>
+        {iconName}
+      </span>
     </span>
   );
 }
@@ -90,6 +105,7 @@ function DimensionTreeRow({
   selectedGroupIds,
   groupTotals,
   groupFramingBreakdowns,
+  groupProps,
   onNodeClick,
   onContextMenu,
 }: {
@@ -99,16 +115,17 @@ function DimensionTreeRow({
   selectedGroupIds: number[];
   groupTotals: Record<number, Quantity | null>;
   groupFramingBreakdowns: Record<number, FramingGroupBreakdown>;
+  groupProps: Record<number, DimensionGroupPropsDto>;
   onNodeClick: (node: TreeNodeDto, event: MouseEvent) => void;
   onContextMenu: (event: MouseEvent, node: TreeNodeDto) => void;
 }) {
-  const [expanded, setExpanded] = useState(false);
+  const isFolder = node.node_type === "folder";
+  const [expanded, setExpanded] = useState(isFolder);
   const [loading, setLoading] = useState(false);
   const [loadedRevision, setLoadedRevision] = useState(-1);
   const childCache = useAppStore((state) => state.childCache);
   const loadChildren = useAppStore((state) => state.loadChildren);
   const treeRevision = useAppStore((state) => state.treeRevision);
-  const isFolder = node.node_type === "folder";
   const children = childCache[node.id] ?? [];
   const canExpand = isFolder && (node.has_children || children.length > 0);
   const isActive = activeNodeId === node.id || selectedGroupIds.includes(node.id);
@@ -118,13 +135,26 @@ function DimensionTreeRow({
   // selected/loaded.
   const displayName = node.framing_size ? `${node.name} - ${node.framing_size.replace("x", " × ")}` : node.name;
   // Itemised framing components shown as read-only child rows beneath a loaded framing group.
+  // Split into matching-size components (normal rows) and override-size lintels (sub-quantity rows).
   const framingBreakdown = node.node_type === "dimension_group" ? groupFramingBreakdowns[node.id] : undefined;
   const framingComponentRows = framingBreakdown
-    ? framingBreakdown.components.map((c) => ({
-        key: c.kind,
-        label: c.count > 1 ? `${c.label} (${c.count})` : c.label,
-        total: c.totalM,
-      }))
+    ? framingBreakdown.components
+        .filter((c) => !c.sizeOverride)
+        .map((c) => ({
+          key: c.kind,
+          label: c.count > 1 ? `${c.label} (${c.count})` : c.label,
+          total: c.totalM,
+        }))
+    : [];
+  // Non-matching lintel sizes — each is a separate orderable timber size (future worksheet rows).
+  const framingOverrideRows = framingBreakdown
+    ? framingBreakdown.components
+        .filter((c) => !!c.sizeOverride)
+        .map((c) => ({
+          key: c.kind + c.sizeOverride,
+          label: c.count > 1 ? `${c.label} (${c.count})` : c.label,
+          total: c.totalM,
+        }))
     : [];
 
   useEffect(() => {
@@ -203,7 +233,7 @@ function DimensionTreeRow({
             overflow: "hidden",
           }}
         >
-          <DimensionNodeIcon node={node} />
+          <DimensionNodeIcon node={node} measurementType={groupProps[node.id]?.measurement_type} />
           <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{displayName}</span>
         </div>
         <div style={{ paddingRight: 8, textAlign: "right", color: isActive ? "#FFFFFF" : theme.text.primary }}>{summary.quantity}</div>
@@ -239,6 +269,33 @@ function DimensionTreeRow({
           <div />
         </div>
       ))}
+      {framingOverrideRows.map((row) => (
+        <div
+          key={`${node.id}-override-${row.key}`}
+          title="Separate timber size — will be a distinct worksheet line item"
+          style={{
+            display: "grid",
+            gridTemplateColumns: gridColumns,
+            alignItems: "center",
+            minWidth: 360,
+            height: theme.rowHeight,
+            color: theme.accent,
+            fontSize: 11,
+            fontWeight: 600,
+            whiteSpace: "nowrap",
+            userSelect: "none",
+          }}
+        >
+          <div />
+          <div style={{ display: "flex", alignItems: "center", minWidth: 0, paddingLeft: (depth + 1) * theme.treeIndent + 8, overflow: "hidden" }}>
+            <span style={{ marginRight: 6 }}>◆</span>
+            <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{row.label}</span>
+          </div>
+          <div style={{ paddingRight: 8, textAlign: "right" }}>{row.total.toFixed(3)}</div>
+          <div>m</div>
+          <div />
+        </div>
+      ))}
       {expanded
         ? children.map((child) => (
             <DimensionTreeRow
@@ -249,6 +306,7 @@ function DimensionTreeRow({
               selectedGroupIds={selectedGroupIds}
               groupTotals={groupTotals}
               groupFramingBreakdowns={groupFramingBreakdowns}
+              groupProps={groupProps}
               onNodeClick={onNodeClick}
               onContextMenu={onContextMenu}
             />
@@ -343,7 +401,7 @@ export function DimensionGroupPane() {
       const id = Number(idText);
       if (groupProps[id]?.measurement_type === "timber_framing") {
         const breakdown = groupFramingBreakdowns[id];
-        totals[id] = breakdown && breakdown.totalM > 0 ? { value: breakdown.totalM, uom: "m" } : null;
+        totals[id] = breakdown && breakdown.matchingTotalM > 0 ? { value: breakdown.matchingTotalM, uom: "m" } : null;
         continue;
       }
       const measurements = overlayMeasurements.filter((measurement) => measurement.dimension_group_id === id);
@@ -391,10 +449,10 @@ export function DimensionGroupPane() {
     setContextMenu({ x: event.clientX, y: event.clientY, node });
   }
 
-  async function confirmAddGroup(folderPath: string, name: string, colour: string) {
+  async function confirmAddGroup(folderPath: string, name: string, colour: string, measurementType: string) {
     setStatus("Adding dimension group...");
     try {
-      await createDimensionGroupInFolderPath(folderPath, name, colour);
+      await createDimensionGroupInFolderPath(folderPath, name, colour, measurementType);
       setPendingAddGroupPath(null);
       setStatus("");
     } catch (error) {
@@ -526,6 +584,7 @@ export function DimensionGroupPane() {
       uom: null,
       colour: null,
       framing_size: null,
+      measurement_type: null,
     };
 
     if (dgPaneCommand.action === "properties") {
@@ -580,7 +639,7 @@ export function DimensionGroupPane() {
       </div>
       <div style={{ display: "flex", gap: 6, padding: 6, borderBottom: `1px solid ${theme.border.subtle}` }}>
         <button
-          onClick={() => setPendingFolderParent({ id: 0, tree: "dimensions", node_type: "folder", parent_id: null, name: "root", sort_order: 0, has_children: false, file_path: null, page_count: null, uom: null, colour: null, framing_size: null })}
+          onClick={() => setPendingFolderParent({ id: 0, tree: "dimensions", node_type: "folder", parent_id: null, name: "root", sort_order: 0, has_children: false, file_path: null, page_count: null, uom: null, colour: null, framing_size: null, measurement_type: null })}
           style={{
             height: 24,
             padding: "0 8px",
@@ -614,6 +673,7 @@ export function DimensionGroupPane() {
             selectedGroupIds={selectedGroupIds}
             groupTotals={groupTotals}
             groupFramingBreakdowns={groupFramingBreakdowns}
+            groupProps={groupProps}
             onNodeClick={handleNodeClick}
             onContextMenu={handleContextMenu}
           />
@@ -726,8 +786,8 @@ export function DimensionGroupPane() {
           roots={dimensionRoots}
           childCache={childCache}
           onCancel={() => setPendingAddGroupPath(null)}
-          onConfirm={(folderPath, name, colour) => {
-            void confirmAddGroup(folderPath, name, colour);
+          onConfirm={(folderPath, name, colour, measurementType) => {
+            void confirmAddGroup(folderPath, name, colour, measurementType);
           }}
         />
       ) : null}

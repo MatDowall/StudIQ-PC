@@ -3,12 +3,19 @@ import { createPortal } from "react-dom";
 import { TreeNodeDto } from "../store/appStore";
 import { theme } from "../theme";
 
+const MEASUREMENT_TYPES = [
+  { value: "length", label: "Length" },
+  { value: "area", label: "Area" },
+  { value: "count", label: "Count" },
+  { value: "timber_framing", label: "Timber Framing" },
+] as const;
+
 interface DimensionGroupDialogProps {
   defaultPath: string;
   roots: TreeNodeDto[];
   childCache: Record<number, TreeNodeDto[]>;
   onCancel: () => void;
-  onConfirm: (folderPath: string, name: string, colour: string) => void;
+  onConfirm: (folderPath: string, name: string, colour: string, measurementType: string) => void;
 }
 
 function collectFolderPaths(nodes: TreeNodeDto[], childCache: Record<number, TreeNodeDto[]>, prefix: string[] = []): string[] {
@@ -27,12 +34,13 @@ export function DimensionGroupDialog({ defaultPath, roots, childCache, onCancel,
   const [folderPath, setFolderPath] = useState(defaultPath);
   const [name, setName] = useState("");
   const [colour, setColour] = useState("#4A9EFF");
+  const [measurementType, setMeasurementType] = useState("length");
   const canConfirm = folderPath.trim().length > 0 && name.trim().length > 0;
 
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
       if (event.key === "Escape") onCancel();
-      if (event.key === "Enter" && canConfirm) onConfirm(folderPath.trim(), name.trim(), colour);
+      if (event.key === "Enter" && canConfirm) onConfirm(folderPath.trim(), name.trim(), colour, measurementType);
     }
 
     window.addEventListener("keydown", handleKeyDown);
@@ -150,6 +158,27 @@ export function DimensionGroupDialog({ defaultPath, roots, childCache, onCancel,
               fontSize: 13,
             }}
           />
+          <label style={{ display: "block", color: theme.text.secondary, fontSize: 12, marginBottom: 4 }}>Measurement type</label>
+          <select
+            value={measurementType}
+            onChange={(event) => setMeasurementType(event.target.value)}
+            style={{
+              boxSizing: "border-box",
+              width: "100%",
+              height: 30,
+              padding: "0 8px",
+              marginBottom: 10,
+              background: theme.bg.input,
+              color: theme.text.primary,
+              border: `1px solid ${theme.border.divider}`,
+              outline: "none",
+              fontSize: 13,
+            }}
+          >
+            {MEASUREMENT_TYPES.map((t) => (
+              <option key={t.value} value={t.value}>{t.label}</option>
+            ))}
+          </select>
           <label style={{ display: "block", color: theme.text.secondary, fontSize: 12, marginBottom: 4 }}>Colour</label>
           <div style={{ display: "flex", gap: 8 }}>
             <input
@@ -199,7 +228,7 @@ export function DimensionGroupDialog({ defaultPath, roots, childCache, onCancel,
           </button>
           <button
             disabled={!canConfirm}
-            onClick={() => onConfirm(folderPath.trim(), name.trim(), colour)}
+            onClick={() => onConfirm(folderPath.trim(), name.trim(), colour, measurementType)}
             style={{
               height: 28,
               padding: "0 12px",
