@@ -1,36 +1,12 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
+import { useAppStore } from "../store/appStore";
 import { theme } from "../theme";
+import type { WorkbookDto, WorkbookRevisionDto } from "../store/appStore";
 
-interface WorkbookNode {
-  id: string;
-  kind: "estimate" | "revision" | "workbook";
-  label: string;
-  children?: WorkbookNode[];
-}
-
-const DUMMY_TREE: WorkbookNode[] = [
-  {
-    id: "estimate-1",
-    kind: "estimate",
-    label: "12 Magnolia Lane",
-    children: [
-      {
-        id: "rev-1",
-        kind: "revision",
-        label: "Revision 1",
-        children: [
-          { id: "wb-1", kind: "workbook", label: "Trade Estimate" },
-        ],
-      },
-    ],
-  },
-];
-
-const KIND_ICONS: Record<WorkbookNode["kind"], string> = {
-  estimate: "folder_open",
+const KIND_ICONS = {
+  workbook: "folder_open",
   revision: "history",
-  workbook: "table_view",
-};
+} as const;
 
 function Icon({ name, size = 14 }: { name: string; size?: number }) {
   return (
@@ -43,85 +19,217 @@ function Icon({ name, size = 14 }: { name: string; size?: number }) {
   );
 }
 
-function WorkbookTreeRow({
-  node,
-  depth,
-  selectedId,
+function RevisionRow({
+  revision,
+  isActive,
   onSelect,
+  onRename,
+  onDelete,
 }: {
-  node: WorkbookNode;
-  depth: number;
-  selectedId: string | null;
-  onSelect: (id: string) => void;
+  revision: WorkbookRevisionDto;
+  isActive: boolean;
+  onSelect: () => void;
+  onRename: (name: string) => void;
+  onDelete: () => void;
 }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(revision.name);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  function commitRename() {
+    const trimmed = draft.trim();
+    if (trimmed && trimmed !== revision.name) {
+      onRename(trimmed);
+    } else {
+      setDraft(revision.name);
+    }
+    setEditing(false);
+  }
+
+  return (
+    <div
+      onClick={() => { if (!editing) onSelect(); }}
+      onDoubleClick={() => { setDraft(revision.name); setEditing(true); setTimeout(() => inputRef.current?.select(), 0); }}
+      style={{
+        display: "flex",
+        alignItems: "center",
+        height: theme.rowHeight,
+        paddingLeft: theme.treeIndent * 2 + 4,
+        paddingRight: 4,
+        gap: 4,
+        cursor: "pointer",
+        background: isActive ? theme.bg.active : "transparent",
+        color: theme.text.primary,
+        userSelect: "none",
+        flexShrink: 0,
+      }}
+    >
+      {/* indent spacer */}
+      <span style={{ width: 14, flexShrink: 0 }} />
+
+      <Icon name={KIND_ICONS.revision} size={14} />
+
+      {editing ? (
+        <input
+          ref={inputRef}
+          value={draft}
+          autoFocus
+          onChange={(e) => setDraft(e.target.value)}
+          onBlur={commitRename}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") commitRename();
+            if (e.key === "Escape") { setDraft(revision.name); setEditing(false); }
+          }}
+          onClick={(e) => e.stopPropagation()}
+          style={{
+            flex: 1,
+            fontSize: 12,
+            background: theme.bg.input,
+            border: `1px solid ${theme.accent}`,
+            color: theme.text.primary,
+            padding: "0 2px",
+            outline: "none",
+          }}
+        />
+      ) : (
+        <span style={{ fontSize: 12, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {revision.name}
+        </span>
+      )}
+
+      {isActive && !editing && (
+        <button
+          title="Delete revision"
+          onClick={(e) => { e.stopPropagation(); onDelete(); }}
+          style={{
+            background: "none",
+            border: "none",
+            color: theme.text.secondary,
+            cursor: "pointer",
+            padding: 0,
+            display: "flex",
+            alignItems: "center",
+            flexShrink: 0,
+          }}
+        >
+          <Icon name="delete" size={14} />
+        </button>
+      )}
+    </div>
+  );
+}
+
+function WorkbookRow({ workbook }: { workbook: WorkbookDto }) {
   const [expanded, setExpanded] = useState(true);
-  const hasChildren = (node.children?.length ?? 0) > 0;
-  const isSelected = node.id === selectedId;
+  const activeRevisionId = useAppStore((s) => s.activeRevisionId);
+  const setActiveRevisionId = useAppStore((s) => s.setActiveRevisionId);
+  const createWorkbookRevision = useAppStore((s) => s.createWorkbookRevision);
+  const deleteWorkbookRevision = useAppStore((s) => s.deleteWorkbookRevision);
+  const renameWorkbookRevision = useAppStore((s) => s.renameWorkbookRevision);
+  const [adding, setAdding] = useState(false);
+  const [newName, setNewName] = useState("");
+
+  const hasRevisions = workbook.revisions.length > 0;
+
+  async function handleDelete(rev: WorkbookRevisionDto) {
+    if (workbook.revisions.length <= 1) {
+      return; // Don't allow deleting the last revision
+    }
+    await deleteWorkbookRevision(rev.id);
+  }
+
+  async function commitAdd() {
+    const trimmed = newName.trim();
+    if (trimmed) {
+      await createWorkbookRevision(workbook.id, trimmed);
+    }
+    setNewName("");
+    setAdding(false);
+  }
 
   return (
     <>
+      {/* Workbook header row */}
       <div
-        onClick={() => onSelect(node.id)}
+        onClick={() => setExpanded((v) => !v)}
         style={{
           display: "flex",
           alignItems: "center",
           height: theme.rowHeight,
-          paddingLeft: depth * theme.treeIndent + 4,
+          paddingLeft: theme.treeIndent + 4,
           paddingRight: 4,
           gap: 4,
           cursor: "pointer",
-          background: isSelected ? theme.bg.active : "transparent",
-          color: isSelected ? theme.text.primary : theme.text.primary,
+          color: theme.text.primary,
           userSelect: "none",
           flexShrink: 0,
         }}
       >
-        {/* expand/collapse arrow */}
-        <span
-          onClick={(e) => { e.stopPropagation(); if (hasChildren) setExpanded((v) => !v); }}
-          style={{
-            width: 14,
-            fontSize: 12,
-            lineHeight: 1,
-            color: hasChildren ? theme.text.secondary : "transparent",
-            cursor: hasChildren ? "pointer" : "default",
-            flexShrink: 0,
-            textAlign: "center",
-          }}
-        >
-          {hasChildren ? (expanded ? "▾" : "▸") : ""}
+        <span style={{ width: 14, fontSize: 12, lineHeight: 1, color: hasRevisions ? theme.text.secondary : "transparent", textAlign: "center", flexShrink: 0 }}>
+          {hasRevisions ? (expanded ? "▾" : "▸") : ""}
         </span>
-
-        <Icon name={KIND_ICONS[node.kind]} size={14} />
-
-        <span
-          style={{
-            fontSize: 12,
-            overflow: "hidden",
-            textOverflow: "ellipsis",
-            whiteSpace: "nowrap",
-            flex: 1,
-          }}
-        >
-          {node.label}
+        <Icon name={KIND_ICONS.workbook} size={14} />
+        <span style={{ fontSize: 12, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontWeight: 600 }}>
+          {workbook.name}
         </span>
       </div>
 
-      {expanded && hasChildren && node.children?.map((child) => (
-        <WorkbookTreeRow
-          key={child.id}
-          node={child}
-          depth={depth + 1}
-          selectedId={selectedId}
-          onSelect={onSelect}
+      {/* Revisions */}
+      {expanded && workbook.revisions.map((rev) => (
+        <RevisionRow
+          key={rev.id}
+          revision={rev}
+          isActive={rev.id === activeRevisionId}
+          onSelect={() => setActiveRevisionId(rev.id)}
+          onRename={(name) => renameWorkbookRevision(rev.id, name)}
+          onDelete={() => handleDelete(rev)}
         />
       ))}
+
+      {/* Inline new-revision input */}
+      {expanded && adding && (
+        <div style={{ display: "flex", alignItems: "center", height: theme.rowHeight, paddingLeft: theme.treeIndent * 2 + 4 + 14 + 4, paddingRight: 4, gap: 4, flexShrink: 0 }}>
+          <Icon name={KIND_ICONS.revision} size={14} />
+          <input
+            autoFocus
+            value={newName}
+            onChange={(e) => setNewName(e.target.value)}
+            onBlur={commitAdd}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") commitAdd();
+              if (e.key === "Escape") { setNewName(""); setAdding(false); }
+            }}
+            placeholder="Revision name…"
+            style={{
+              flex: 1,
+              fontSize: 12,
+              background: theme.bg.input,
+              border: `1px solid ${theme.accent}`,
+              color: theme.text.primary,
+              padding: "0 2px",
+              outline: "none",
+            }}
+          />
+        </div>
+      )}
     </>
   );
 }
 
 export function WorkbookSidebarPane() {
-  const [selectedId, setSelectedId] = useState<string | null>("wb-1");
+  const workbooks = useAppStore((s) => s.workbooks);
+  const createWorkbookRevision = useAppStore((s) => s.createWorkbookRevision);
+
+  function handleNewRevision() {
+    if (workbooks.length > 0) {
+      // Trigger inline add on the first (only) workbook via a synthetic approach:
+      // We rely on the WorkbookRow's own "adding" state — but since that's internal,
+      // the header button uses a store action directly with a generated name.
+      const wb = workbooks[0];
+      const nextNum = wb.revisions.length + 1;
+      createWorkbookRevision(wb.id, `Revision ${nextNum}`);
+    }
+  }
 
   return (
     <div
@@ -150,13 +258,14 @@ export function WorkbookSidebarPane() {
           WORKBOOKS
         </span>
         <button
-          disabled
-          title="New Revision (coming soon)"
+          title="New Revision"
+          onClick={handleNewRevision}
+          disabled={workbooks.length === 0}
           style={{
             background: "none",
             border: "none",
-            color: theme.text.disabled,
-            cursor: "not-allowed",
+            color: workbooks.length === 0 ? theme.text.disabled : theme.text.primary,
+            cursor: workbooks.length === 0 ? "not-allowed" : "pointer",
             padding: 0,
             display: "flex",
             alignItems: "center",
@@ -168,14 +277,8 @@ export function WorkbookSidebarPane() {
 
       {/* Tree */}
       <div style={{ flex: 1, overflow: "auto", padding: "4px 0" }}>
-        {DUMMY_TREE.map((node) => (
-          <WorkbookTreeRow
-            key={node.id}
-            node={node}
-            depth={0}
-            selectedId={selectedId}
-            onSelect={setSelectedId}
-          />
+        {workbooks.map((wb) => (
+          <WorkbookRow key={wb.id} workbook={wb} />
         ))}
       </div>
     </div>

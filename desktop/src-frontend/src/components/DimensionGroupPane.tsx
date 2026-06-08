@@ -194,6 +194,15 @@ function DimensionTreeRow({
       <div
         onClick={(event) => onNodeClick(node, event)}
         onContextMenu={(event) => onContextMenu(event, node)}
+        draggable={node.node_type === "dimension_group"}
+        onDragStart={(event) => {
+          if (node.node_type !== "dimension_group") return;
+          event.dataTransfer.setData(
+            "application/x-studiq-dimension-group",
+            JSON.stringify({ groupId: node.id, name: node.name }),
+          );
+          event.dataTransfer.effectAllowed = "copy";
+        }}
         style={{
           display: "grid",
           gridTemplateColumns: gridColumns,
