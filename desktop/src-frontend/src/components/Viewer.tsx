@@ -96,6 +96,7 @@ export function Viewer() {
       style={{
         display: "flex",
         flexDirection: "column",
+        height: "100%",
         minWidth: 0,
         minHeight: 0,
         background: theme.bg.shell,

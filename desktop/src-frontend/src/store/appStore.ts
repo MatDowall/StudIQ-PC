@@ -78,6 +78,70 @@ export interface RecentProject {
   file_exists: boolean;
 }
 
+export interface WorkbookRevisionDto {
+  id: number;
+  workbook_id: number;
+  name: string;
+  created_at: string;
+  sort_order: number;
+}
+
+export interface WorkbookDto {
+  id: number;
+  name: string;
+  revisions: WorkbookRevisionDto[];
+}
+
+// Snapshot of the active cell's text format — drives the Format toolbar's
+// font/size selects and the pressed state of its toggle buttons.
+export interface WorkbookFormatSnapshot {
+  enabled: boolean;
+  fontFamily: string;
+  fontSize: number;
+  bold: boolean;
+  italic: boolean;
+  underline: boolean;
+  align: "left" | "center" | "right";
+  decimals: number;
+}
+
+// Imperative bridge: WorkbookView registers these so the ribbon's Format
+// toolbar can apply formatting to the grid's current selection.
+export interface WorkbookFormatApi {
+  setFontFamily: (family: string) => void;
+  setFontSize: (size: number) => void;
+  toggleBold: () => void;
+  toggleItalic: () => void;
+  toggleUnderline: () => void;
+  setAlign: (align: "left" | "center" | "right") => void;
+  adjustDecimals: (delta: number) => void;
+}
+
+export const DEFAULT_WORKBOOK_FORMAT: WorkbookFormatSnapshot = {
+  enabled: false,
+  fontFamily: "Arial",
+  fontSize: 9,
+  bold: false,
+  italic: false,
+  underline: false,
+  align: "left",
+  decimals: 2,
+};
+
+export interface TemplateDto {
+  id: number;
+  name: string;
+  description: string | null;
+  created_at: string;
+  revision_id: number;
+}
+
+export interface TemplateEditMode {
+  templateId: number;
+  revisionId: number;
+  name: string;
+}
+
 export interface VectorPrimitive {
   type: "line" | "rect";
   x1?: number;
@@ -139,6 +203,10 @@ interface AppStore {
   activeProject: ProjectMeta | null;
   recentProjects: RecentProject[];
 
+  /** Which top-level workflow tab is active. */
+  activeTab: "dimensions" | "workbook";
+  setActiveTab: (tab: "dimensions" | "workbook") => void;
+
   drawingRoots: TreeNodeDto[];
   childCache: Record<number, TreeNodeDto[]>;
   treeRevision: number;
@@ -187,6 +255,21 @@ interface AppStore {
   // dialog for the active group (the pane owns the Add / Properties / Copy dialogs).
   dgPaneCommand: { action: DgPaneCommand; seq: number } | null;
 
+  workbooks: WorkbookDto[];
+  activeRevisionId: number | null;
+
+  // Format toolbar bridge: WorkbookView publishes the active selection's format
+  // here and registers an imperative API the ribbon's Format toolbar calls.
+  workbookFormat: WorkbookFormatSnapshot;
+  workbookFormatApi: WorkbookFormatApi | null;
+  setWorkbookFormat: (format: WorkbookFormatSnapshot) => void;
+  setWorkbookFormatApi: (api: WorkbookFormatApi | null) => void;
+
+  templates: TemplateDto[];
+  templateManagerOpen: boolean;
+  templateEditMode: TemplateEditMode | null;
+  preTemplateRevisionId: number | null;
+
   setActiveProject: (project: ProjectMeta | null) => void;
   setSnapEnabled: (on: boolean) => void;
   setViewerMode: (mode: ViewerMode) => void;
@@ -223,6 +306,10 @@ interface AppStore {
   renameNode: (node: TreeNodeDto, name: string) => Promise<void>;
   updateDimensionGroupColour: (nodeId: number, colour: string) => Promise<void>;
   selectDimensionGroup: (node: TreeNodeDto, additive?: boolean) => Promise<void>;
+  /** Switches to the Dimensions tab, selects the group, and navigates the viewer
+   *  to the drawing/page of its first measurement — used by the workbook's
+   *  "Show dimension group" context menu. */
+  goToDimensionGroup: (groupId: number) => Promise<void>;
   createMeasurement: (input: {
     measurementType?: string;
     geometryJson: string;
@@ -238,6 +325,22 @@ interface AppStore {
   resolveSnap: (cursorPageX: number, cursorPageY: number, pageIndex: number, radiusPts: number) => void;
   resolveLineSnap: (cursorPageX: number, cursorPageY: number, pageIndex: number, radiusPts: number) => void;
   clearSnap: () => void;
+  loadWorkbooks: () => Promise<void>;
+  setActiveRevisionId: (id: number | null) => void;
+  createWorkbookRevision: (workbookId: number, name: string) => Promise<void>;
+  createWorkbookRevisionFromTemplate: (workbookId: number, name: string, templateId: number) => Promise<void>;
+  deleteWorkbookRevision: (revisionId: number) => Promise<void>;
+  renameWorkbookRevision: (revisionId: number, name: string) => Promise<void>;
+
+  loadTemplates: () => Promise<void>;
+  openTemplateManager: () => void;
+  closeTemplateManager: () => void;
+  createTemplate: (name: string, description: string) => Promise<void>;
+  renameTemplate: (templateId: number, name: string) => Promise<void>;
+  updateTemplateDescription: (templateId: number, description: string) => Promise<void>;
+  deleteTemplate: (templateId: number) => Promise<void>;
+  enterTemplateEdit: (template: TemplateDto) => void;
+  exitTemplateEdit: () => void;
 }
 
 export function drawingPageNodeId(drawingId: number, pageIndex: number) {
@@ -472,6 +575,9 @@ export const useAppStore = create<AppStore>((set, get) => ({
   activeProject: null,
   recentProjects: [],
 
+  activeTab: "dimensions",
+  setActiveTab: (tab) => set({ activeTab: tab }),
+
   drawingRoots: [],
   childCache: {},
   treeRevision: 0,
@@ -505,6 +611,19 @@ export const useAppStore = create<AppStore>((set, get) => ({
   scaleCache: {},
   drawPolarity: 1,
   dgPaneCommand: null,
+
+  workbooks: [],
+  activeRevisionId: null,
+
+  workbookFormat: DEFAULT_WORKBOOK_FORMAT,
+  workbookFormatApi: null,
+  setWorkbookFormat: (format) => set({ workbookFormat: format }),
+  setWorkbookFormatApi: (api) => set({ workbookFormatApi: api }),
+
+  templates: [],
+  templateManagerOpen: false,
+  templateEditMode: null,
+  preTemplateRevisionId: null,
 
   setActiveProject: (project) => {
     set({ activeProject: project });
@@ -616,14 +735,16 @@ export const useAppStore = create<AppStore>((set, get) => ({
       contractNumber,
       filePath,
     });
-    set({ activeProject: project });
+    set({ activeProject: project, workbooks: [], activeRevisionId: null });
     await get().loadRecentProjects();
+    await get().loadWorkbooks();
   },
 
   openProject: async (filePath) => {
     const project = await invoke<ProjectMeta>("open_project", { filePath });
-    set({ activeProject: project });
+    set({ activeProject: project, workbooks: [], activeRevisionId: null });
     await get().loadRecentProjects();
+    await get().loadWorkbooks();
   },
 
   closeProject: async () => {
@@ -659,6 +780,8 @@ export const useAppStore = create<AppStore>((set, get) => ({
       activeBreadcrumb: "",
       overlayMeasurements: [],
       overlayColour: "#4A9EFF",
+      workbooks: [],
+      activeRevisionId: null,
     }));
     await get().loadRecentProjects();
   },
@@ -896,6 +1019,34 @@ export const useAppStore = create<AppStore>((set, get) => ({
       activePageNodeId: followsActiveDrawing
         ? drawingPageNodeId(firstMeasurement!.drawing_id, firstMeasurement!.page_index)
         : state.activePageNodeId,
+    });
+  },
+
+  goToDimensionGroup: async (groupId) => {
+    const state = get();
+    const groupNode = findNode(state.dimensionRoots, state.childCache, groupId);
+    if (groupNode) await get().selectDimensionGroup(groupNode);
+
+    const measurements = await invoke<MeasurementDto[]>("get_measurements_for_group", { groupId });
+    const first = measurements[0];
+    if (!first) {
+      set({ activeTab: "dimensions" });
+      return;
+    }
+
+    const after = get();
+    const drawingNode = findNode(after.drawingRoots, after.childCache, first.drawing_id);
+    if (drawingNode?.file_path && (after.activeDrawingId !== first.drawing_id || after.currentDocument?.path !== drawingNode.file_path)) {
+      const document = await invoke<DocumentMeta>("open_document", { path: drawingNode.file_path });
+      set({ currentDocument: document, vectorCache: {}, vectorIndex: {} });
+      await get().loadVectors(first.page_index);
+    }
+
+    set({
+      activeTab: "dimensions",
+      activeDrawingId: first.drawing_id,
+      activePageIndex: first.page_index,
+      activePageNodeId: drawingPageNodeId(first.drawing_id, first.page_index),
     });
   },
 
@@ -1191,4 +1342,102 @@ export const useAppStore = create<AppStore>((set, get) => ({
   },
 
   clearSnap: () => set({ snapPoint: null, snapType: null, lineSnapResult: null }),
+
+  loadWorkbooks: async () => {
+    const workbooks = await invoke<WorkbookDto[]>("list_workbooks");
+    set((state) => {
+      // Auto-select the first revision if none is active.
+      let activeRevisionId = state.activeRevisionId;
+      if (activeRevisionId === null && workbooks.length > 0 && workbooks[0].revisions.length > 0) {
+        activeRevisionId = workbooks[0].revisions[0].id;
+      }
+      return { workbooks, activeRevisionId };
+    });
+  },
+
+  setActiveRevisionId: (id) => set({ activeRevisionId: id }),
+
+  createWorkbookRevision: async (workbookId, name) => {
+    await invoke<WorkbookRevisionDto>("create_workbook_revision", { workbookId, name });
+    await get().loadWorkbooks();
+  },
+
+  createWorkbookRevisionFromTemplate: async (workbookId, name, templateId) => {
+    const revision = await invoke<WorkbookRevisionDto>("create_workbook_revision_from_template", { workbookId, name, templateId });
+    await get().loadWorkbooks();
+    set({ activeRevisionId: revision.id });
+  },
+
+  deleteWorkbookRevision: async (revisionId) => {
+    await invoke("delete_workbook_revision", { revisionId });
+    set((state) => ({
+      activeRevisionId: state.activeRevisionId === revisionId ? null : state.activeRevisionId,
+    }));
+    await get().loadWorkbooks();
+  },
+
+  renameWorkbookRevision: async (revisionId, name) => {
+    await invoke("rename_workbook_revision", { revisionId, name });
+    await get().loadWorkbooks();
+  },
+
+  loadTemplates: async () => {
+    const templates = await invoke<TemplateDto[]>("list_templates");
+    set({ templates });
+  },
+
+  openTemplateManager: () => {
+    set({ templateManagerOpen: true });
+    void get().loadTemplates();
+  },
+
+  closeTemplateManager: () => set({ templateManagerOpen: false }),
+
+  createTemplate: async (name, description) => {
+    const template = await invoke<TemplateDto>("create_template", { name, description });
+    set({ templates: [...get().templates, template].sort((a, b) => a.name.localeCompare(b.name)) });
+    get().enterTemplateEdit(template);
+  },
+
+  renameTemplate: async (templateId, name) => {
+    await invoke("rename_template", { templateId, name });
+    await get().loadTemplates();
+    set((state) =>
+      state.templateEditMode && state.templateEditMode.templateId === templateId
+        ? { templateEditMode: { ...state.templateEditMode, name } }
+        : {}
+    );
+  },
+
+  updateTemplateDescription: async (templateId, description) => {
+    await invoke("update_template_description", { templateId, description });
+    await get().loadTemplates();
+  },
+
+  deleteTemplate: async (templateId) => {
+    await invoke("delete_template", { templateId });
+    await get().loadTemplates();
+  },
+
+  enterTemplateEdit: (template) => {
+    const state = get();
+    set({
+      preTemplateRevisionId: state.templateEditMode ? state.preTemplateRevisionId : state.activeRevisionId,
+      templateEditMode: { templateId: template.id, revisionId: template.revision_id, name: template.name },
+      activeRevisionId: template.revision_id,
+      templateManagerOpen: false,
+      activeTab: "workbook",
+    });
+  },
+
+  exitTemplateEdit: () => {
+    const state = get();
+    set({
+      templateEditMode: null,
+      activeRevisionId: state.preTemplateRevisionId,
+      preTemplateRevisionId: null,
+      templateManagerOpen: true,
+    });
+    void get().loadTemplates();
+  },
 }));

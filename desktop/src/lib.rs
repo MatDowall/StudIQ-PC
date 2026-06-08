@@ -263,6 +263,31 @@ pub struct FolderOptionDto {
     pub path: String,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WorkbookRevisionDto {
+    pub id: i64,
+    pub workbook_id: i64,
+    pub name: String,
+    pub created_at: String,
+    pub sort_order: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WorkbookDto {
+    pub id: i64,
+    pub name: String,
+    pub revisions: Vec<WorkbookRevisionDto>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TemplateDto {
+    pub id: i64,
+    pub name: String,
+    pub description: Option<String>,
+    pub created_at: String,
+    pub revision_id: i64,
+}
+
 /// A single on-page vertex in PDF points, Y-up. Used to validate `geometry_json`.
 #[derive(serde::Deserialize)]
 struct GeometryPoint {
@@ -1650,6 +1675,672 @@ async fn set_dimension_group_props(
     })
 }
 
+/// Persist the full cell data for one sheet (identified by revision + path).
+/// `data_json` is the Handsontable 2-D array serialised as JSON.
+#[tauri::command]
+async fn save_workbook_sheet(
+    state: State<'_, AppState>,
+    revision_id: i64,
+    sheet_path: String,
+    data_json: String,
+) -> Result<(), String> {
+    let db = active_project_db(state.inner())?;
+    sqlx::query(
+        "INSERT INTO workbook_sheet_data (revision_id, sheet_path, data_json)
+         VALUES (?, ?, ?)
+         ON CONFLICT(revision_id, sheet_path) DO UPDATE SET data_json = excluded.data_json",
+    )
+    .bind(revision_id)
+    .bind(sheet_path)
+    .bind(data_json)
+    .execute(&db)
+    .await
+    .map_err(|e| format!("Failed to save sheet data: {e}"))?;
+    Ok(())
+}
+
+/// Load the cell data for one sheet. Returns an empty JSON array when no data
+/// has been saved yet.
+#[tauri::command]
+async fn load_workbook_sheet(
+    state: State<'_, AppState>,
+    revision_id: i64,
+    sheet_path: String,
+) -> Result<String, String> {
+    let db = active_project_db(state.inner())?;
+    let row: Option<String> = sqlx::query_scalar(
+        "SELECT data_json FROM workbook_sheet_data WHERE revision_id = ? AND sheet_path = ?",
+    )
+    .bind(revision_id)
+    .bind(sheet_path)
+    .fetch_optional(&db)
+    .await
+    .map_err(|e| format!("Failed to load sheet data: {e}"))?;
+    Ok(row.unwrap_or_else(|| "[]".to_string()))
+}
+
+/// Persist the dimension-group cell-link map for one sheet (identified by
+/// revision + path). `links_json` is a JSON object keyed by "row,col".
+#[tauri::command]
+async fn save_workbook_sheet_links(
+    state: State<'_, AppState>,
+    revision_id: i64,
+    sheet_path: String,
+    links_json: String,
+) -> Result<(), String> {
+    let db = active_project_db(state.inner())?;
+    sqlx::query(
+        "INSERT INTO workbook_sheet_links (revision_id, sheet_path, links_json)
+         VALUES (?, ?, ?)
+         ON CONFLICT(revision_id, sheet_path) DO UPDATE SET links_json = excluded.links_json",
+    )
+    .bind(revision_id)
+    .bind(sheet_path)
+    .bind(links_json)
+    .execute(&db)
+    .await
+    .map_err(|e| format!("Failed to save sheet links: {e}"))?;
+    Ok(())
+}
+
+/// Load the dimension-group cell-link map for one sheet. Returns an empty JSON
+/// object when no links have been saved yet.
+#[tauri::command]
+async fn load_workbook_sheet_links(
+    state: State<'_, AppState>,
+    revision_id: i64,
+    sheet_path: String,
+) -> Result<String, String> {
+    let db = active_project_db(state.inner())?;
+    let row: Option<String> = sqlx::query_scalar(
+        "SELECT links_json FROM workbook_sheet_links WHERE revision_id = ? AND sheet_path = ?",
+    )
+    .bind(revision_id)
+    .bind(sheet_path)
+    .fetch_optional(&db)
+    .await
+    .map_err(|e| format!("Failed to load sheet links: {e}"))?;
+    Ok(row.unwrap_or_else(|| "{}".to_string()))
+}
+
+/// Persist the per-cell text-formatting map for one sheet (identified by
+/// revision + path). `styles_json` is a JSON object keyed by "row,col".
+#[tauri::command]
+async fn save_workbook_sheet_styles(
+    state: State<'_, AppState>,
+    revision_id: i64,
+    sheet_path: String,
+    styles_json: String,
+) -> Result<(), String> {
+    let db = active_project_db(state.inner())?;
+    sqlx::query(
+        "INSERT INTO workbook_sheet_styles (revision_id, sheet_path, styles_json)
+         VALUES (?, ?, ?)
+         ON CONFLICT(revision_id, sheet_path) DO UPDATE SET styles_json = excluded.styles_json",
+    )
+    .bind(revision_id)
+    .bind(sheet_path)
+    .bind(styles_json)
+    .execute(&db)
+    .await
+    .map_err(|e| format!("Failed to save sheet styles: {e}"))?;
+    Ok(())
+}
+
+/// Load the per-cell text-formatting map for one sheet. Returns an empty JSON
+/// object when no styles have been saved yet.
+#[tauri::command]
+async fn load_workbook_sheet_styles(
+    state: State<'_, AppState>,
+    revision_id: i64,
+    sheet_path: String,
+) -> Result<String, String> {
+    let db = active_project_db(state.inner())?;
+    let row: Option<String> = sqlx::query_scalar(
+        "SELECT styles_json FROM workbook_sheet_styles WHERE revision_id = ? AND sheet_path = ?",
+    )
+    .bind(revision_id)
+    .bind(sheet_path)
+    .fetch_optional(&db)
+    .await
+    .map_err(|e| format!("Failed to load sheet styles: {e}"))?;
+    Ok(row.unwrap_or_else(|| "{}".to_string()))
+}
+
+/// Delete a single sheet's persisted data plus all of its descendant sheets
+/// (paths of the form `<sheet_path>/...`). Used to clean up "orphaned" build-up
+/// sheets left behind in the DB after the line item that owned them is cleared
+/// in its parent sheet. Returns the number of rows removed (0 if nothing existed
+/// at that path — safe to call speculatively).
+#[tauri::command]
+async fn delete_workbook_sheet_subtree(
+    state: State<'_, AppState>,
+    revision_id: i64,
+    sheet_path: String,
+) -> Result<i64, String> {
+    let db = active_project_db(state.inner())?;
+    let like_pattern = format!("{sheet_path}/%");
+    let rows_affected = sqlx::query(
+        "DELETE FROM workbook_sheet_data \
+         WHERE revision_id = ? AND (sheet_path = ? OR sheet_path LIKE ?)",
+    )
+    .bind(revision_id)
+    .bind(&sheet_path)
+    .bind(&like_pattern)
+    .execute(&db)
+    .await
+    .map_err(|e| format!("Failed to delete sheet subtree: {e}"))?
+    .rows_affected();
+    let _ = sqlx::query(
+        "DELETE FROM workbook_sheet_links \
+         WHERE revision_id = ? AND (sheet_path = ? OR sheet_path LIKE ?)",
+    )
+    .bind(revision_id)
+    .bind(&sheet_path)
+    .bind(&like_pattern)
+    .execute(&db)
+    .await;
+    let _ = sqlx::query(
+        "DELETE FROM workbook_sheet_styles \
+         WHERE revision_id = ? AND (sheet_path = ? OR sheet_path LIKE ?)",
+    )
+    .bind(revision_id)
+    .bind(&sheet_path)
+    .bind(&like_pattern)
+    .execute(&db)
+    .await;
+    Ok(rows_affected as i64)
+}
+
+/// Wipe all persisted sheet data for a workbook revision — i.e. "clear the whole
+/// workbook" back to a blank Level 1 sheet. Returns the number of rows removed.
+#[tauri::command]
+async fn clear_workbook_revision_data(
+    state: State<'_, AppState>,
+    revision_id: i64,
+) -> Result<i64, String> {
+    let db = active_project_db(state.inner())?;
+    let rows_affected = sqlx::query("DELETE FROM workbook_sheet_data WHERE revision_id = ?")
+        .bind(revision_id)
+        .execute(&db)
+        .await
+        .map_err(|e| format!("Failed to clear workbook revision data: {e}"))?
+        .rows_affected();
+    let _ = sqlx::query("DELETE FROM workbook_sheet_links WHERE revision_id = ?")
+        .bind(revision_id)
+        .execute(&db)
+        .await;
+    let _ = sqlx::query("DELETE FROM workbook_sheet_styles WHERE revision_id = ?")
+        .bind(revision_id)
+        .execute(&db)
+        .await;
+    Ok(rows_affected as i64)
+}
+
+#[tauri::command]
+async fn list_workbooks(state: State<'_, AppState>) -> Result<Vec<WorkbookDto>, String> {
+    let db = active_project_db(state.inner())?;
+
+    let wb_rows = sqlx::query("SELECT id, name FROM workbooks WHERE is_template = 0 ORDER BY id")
+        .fetch_all(&db)
+        .await
+        .map_err(|e| format!("Failed to list workbooks: {e}"))?;
+
+    let mut workbooks = Vec::new();
+    for wb_row in wb_rows {
+        let wb_id: i64 = wb_row.try_get("id").map_err(|e| e.to_string())?;
+        let wb_name: String = wb_row.try_get("name").map_err(|e| e.to_string())?;
+
+        let rev_rows = sqlx::query(
+            "SELECT id, workbook_id, name, created_at, sort_order \
+             FROM workbook_revisions WHERE workbook_id = ? ORDER BY sort_order, id",
+        )
+        .bind(wb_id)
+        .fetch_all(&db)
+        .await
+        .map_err(|e| format!("Failed to list workbook revisions: {e}"))?;
+
+        let revisions = rev_rows
+            .into_iter()
+            .map(|row| {
+                Ok(WorkbookRevisionDto {
+                    id: row.try_get("id").map_err(|e: sqlx::Error| e.to_string())?,
+                    workbook_id: row
+                        .try_get("workbook_id")
+                        .map_err(|e: sqlx::Error| e.to_string())?,
+                    name: row.try_get("name").map_err(|e: sqlx::Error| e.to_string())?,
+                    created_at: row
+                        .try_get("created_at")
+                        .map_err(|e: sqlx::Error| e.to_string())?,
+                    sort_order: row
+                        .try_get("sort_order")
+                        .map_err(|e: sqlx::Error| e.to_string())?,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+
+        workbooks.push(WorkbookDto {
+            id: wb_id,
+            name: wb_name,
+            revisions,
+        });
+    }
+
+    Ok(workbooks)
+}
+
+#[tauri::command]
+async fn create_workbook_revision(
+    workbook_id: i64,
+    name: String,
+    state: State<'_, AppState>,
+) -> Result<WorkbookRevisionDto, String> {
+    let db = active_project_db(state.inner())?;
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("Revision name cannot be empty".to_string());
+    }
+
+    let wb_exists: bool =
+        sqlx::query_scalar("SELECT COUNT(*) > 0 FROM workbooks WHERE id = ?")
+            .bind(workbook_id)
+            .fetch_one(&db)
+            .await
+            .map_err(|e| format!("Failed to verify workbook: {e}"))?;
+    if !wb_exists {
+        return Err(format!("Workbook {workbook_id} not found"));
+    }
+
+    let sort_order: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM workbook_revisions WHERE workbook_id = ?",
+    )
+    .bind(workbook_id)
+    .fetch_one(&db)
+    .await
+    .map_err(|e| format!("Failed to get next sort order: {e}"))?;
+
+    let result = sqlx::query(
+        "INSERT INTO workbook_revisions (workbook_id, name, sort_order) VALUES (?, ?, ?)",
+    )
+    .bind(workbook_id)
+    .bind(&name)
+    .bind(sort_order)
+    .execute(&db)
+    .await
+    .map_err(|e| format!("Failed to create workbook revision: {e}"))?;
+
+    let id = result.last_insert_rowid();
+
+    let created_at: String =
+        sqlx::query_scalar("SELECT created_at FROM workbook_revisions WHERE id = ?")
+            .bind(id)
+            .fetch_one(&db)
+            .await
+            .map_err(|e| format!("Failed to fetch created_at: {e}"))?;
+
+    Ok(WorkbookRevisionDto {
+        id,
+        workbook_id,
+        name,
+        created_at,
+        sort_order,
+    })
+}
+
+#[tauri::command]
+async fn create_workbook_revision_from_template(
+    workbook_id: i64,
+    name: String,
+    template_id: i64,
+    state: State<'_, AppState>,
+) -> Result<WorkbookRevisionDto, String> {
+    let db = active_project_db(state.inner())?;
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("Revision name cannot be empty".to_string());
+    }
+
+    let wb_exists: bool =
+        sqlx::query_scalar("SELECT COUNT(*) > 0 FROM workbooks WHERE id = ?")
+            .bind(workbook_id)
+            .fetch_one(&db)
+            .await
+            .map_err(|e| format!("Failed to verify workbook: {e}"))?;
+    if !wb_exists {
+        return Err(format!("Workbook {workbook_id} not found"));
+    }
+
+    let template_revision_id: Option<i64> =
+        sqlx::query_scalar("SELECT revision_id FROM templates WHERE id = ?")
+            .bind(template_id)
+            .fetch_optional(&db)
+            .await
+            .map_err(|e| format!("Failed to look up template: {e}"))?;
+    let Some(template_revision_id) = template_revision_id else {
+        return Err(format!("Template {template_id} not found"));
+    };
+
+    let sort_order: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM workbook_revisions WHERE workbook_id = ?",
+    )
+    .bind(workbook_id)
+    .fetch_one(&db)
+    .await
+    .map_err(|e| format!("Failed to get next sort order: {e}"))?;
+
+    let result = sqlx::query(
+        "INSERT INTO workbook_revisions (workbook_id, name, sort_order) VALUES (?, ?, ?)",
+    )
+    .bind(workbook_id)
+    .bind(&name)
+    .bind(sort_order)
+    .execute(&db)
+    .await
+    .map_err(|e| format!("Failed to create workbook revision: {e}"))?;
+    let revision_id = result.last_insert_rowid();
+
+    // Copy the template's master Level 1 (takeoff), Level 2 (takeoff), Level 3
+    // (rate build-up), and Quantity Build-up sheets into the new revision — "L1"
+    // seeds the takeoff sheet directly, while TEMPLATE_MASTER_L2 / TEMPLATE_MASTER_L3 /
+    // TEMPLATE_MASTER_LQ travel along as the seeds for any future Level 2 / Level 3 /
+    // Quantity Build-up sheet respectively (see WorkbookView's drillDown /
+    // TEMPLATE_MASTER_L2_PATH / TEMPLATE_MASTER_L3_PATH / TEMPLATE_MASTER_LQ_PATH constants).
+    for sheet_path in ["L1", "TEMPLATE_MASTER_L2", "TEMPLATE_MASTER_L3", "TEMPLATE_MASTER_LQ"] {
+        let data_json: Option<String> = sqlx::query_scalar(
+            "SELECT data_json FROM workbook_sheet_data WHERE revision_id = ? AND sheet_path = ?",
+        )
+        .bind(template_revision_id)
+        .bind(sheet_path)
+        .fetch_optional(&db)
+        .await
+        .map_err(|e| format!("Failed to read template sheet '{sheet_path}': {e}"))?;
+
+        if let Some(data_json) = data_json {
+            sqlx::query(
+                "INSERT INTO workbook_sheet_data (revision_id, sheet_path, data_json) VALUES (?, ?, ?)",
+            )
+            .bind(revision_id)
+            .bind(sheet_path)
+            .bind(&data_json)
+            .execute(&db)
+            .await
+            .map_err(|e| format!("Failed to seed sheet '{sheet_path}': {e}"))?;
+        }
+
+        // Carry the template's per-cell text formatting along with its data —
+        // otherwise bold/italic/underline applied in the template is lost on import.
+        let styles_json: Option<String> = sqlx::query_scalar(
+            "SELECT styles_json FROM workbook_sheet_styles WHERE revision_id = ? AND sheet_path = ?",
+        )
+        .bind(template_revision_id)
+        .bind(sheet_path)
+        .fetch_optional(&db)
+        .await
+        .map_err(|e| format!("Failed to read template sheet styles '{sheet_path}': {e}"))?;
+
+        if let Some(styles_json) = styles_json {
+            sqlx::query(
+                "INSERT INTO workbook_sheet_styles (revision_id, sheet_path, styles_json) VALUES (?, ?, ?)",
+            )
+            .bind(revision_id)
+            .bind(sheet_path)
+            .bind(&styles_json)
+            .execute(&db)
+            .await
+            .map_err(|e| format!("Failed to seed sheet styles '{sheet_path}': {e}"))?;
+        }
+    }
+
+    let created_at: String =
+        sqlx::query_scalar("SELECT created_at FROM workbook_revisions WHERE id = ?")
+            .bind(revision_id)
+            .fetch_one(&db)
+            .await
+            .map_err(|e| format!("Failed to fetch created_at: {e}"))?;
+
+    Ok(WorkbookRevisionDto {
+        id: revision_id,
+        workbook_id,
+        name,
+        created_at,
+        sort_order,
+    })
+}
+
+#[tauri::command]
+async fn delete_workbook_revision(
+    revision_id: i64,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let db = active_project_db(state.inner())?;
+
+    let rows_affected = sqlx::query("DELETE FROM workbook_revisions WHERE id = ?")
+        .bind(revision_id)
+        .execute(&db)
+        .await
+        .map_err(|e| format!("Failed to delete workbook revision: {e}"))?
+        .rows_affected();
+
+    if rows_affected == 0 {
+        return Err(format!("Workbook revision {revision_id} not found"));
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn rename_workbook_revision(
+    revision_id: i64,
+    name: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let db = active_project_db(state.inner())?;
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("Revision name cannot be empty".to_string());
+    }
+
+    let rows_affected = sqlx::query("UPDATE workbook_revisions SET name = ? WHERE id = ?")
+        .bind(&name)
+        .bind(revision_id)
+        .execute(&db)
+        .await
+        .map_err(|e| format!("Failed to rename workbook revision: {e}"))?
+        .rows_affected();
+
+    if rows_affected == 0 {
+        return Err(format!("Workbook revision {revision_id} not found"));
+    }
+
+    Ok(())
+}
+
+/// Returns the id of the hidden workbook that owns template revisions, creating it
+/// (with its blank seed revision excluded) if this is the first template in the project.
+async fn ensure_template_workbook(db: &SqlitePool) -> Result<i64, String> {
+    if let Some(id) = sqlx::query_scalar::<_, i64>("SELECT id FROM workbooks WHERE is_template = 1")
+        .fetch_optional(db)
+        .await
+        .map_err(|e| format!("Failed to look up template workbook: {e}"))?
+    {
+        return Ok(id);
+    }
+
+    let result = sqlx::query("INSERT INTO workbooks (project_id, name, is_template) VALUES (1, 'Templates', 1)")
+        .execute(db)
+        .await
+        .map_err(|e| format!("Failed to create template workbook: {e}"))?;
+
+    Ok(result.last_insert_rowid())
+}
+
+#[tauri::command]
+async fn list_templates(state: State<'_, AppState>) -> Result<Vec<TemplateDto>, String> {
+    let db = active_project_db(state.inner())?;
+
+    let rows = sqlx::query(
+        "SELECT id, name, description, created_at, revision_id FROM templates ORDER BY name",
+    )
+    .fetch_all(&db)
+    .await
+    .map_err(|e| format!("Failed to list templates: {e}"))?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(TemplateDto {
+                id: row.try_get("id").map_err(|e: sqlx::Error| e.to_string())?,
+                name: row.try_get("name").map_err(|e: sqlx::Error| e.to_string())?,
+                description: row.try_get("description").map_err(|e: sqlx::Error| e.to_string())?,
+                created_at: row.try_get("created_at").map_err(|e: sqlx::Error| e.to_string())?,
+                revision_id: row.try_get("revision_id").map_err(|e: sqlx::Error| e.to_string())?,
+            })
+        })
+        .collect()
+}
+
+#[tauri::command]
+async fn create_template(
+    name: String,
+    description: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<TemplateDto, String> {
+    let db = active_project_db(state.inner())?;
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("Template name cannot be empty".to_string());
+    }
+    let description = description.and_then(|d| {
+        let d = d.trim().to_string();
+        if d.is_empty() { None } else { Some(d) }
+    });
+
+    let workbook_id = ensure_template_workbook(&db).await?;
+
+    let sort_order: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM workbook_revisions WHERE workbook_id = ?",
+    )
+    .bind(workbook_id)
+    .fetch_one(&db)
+    .await
+    .map_err(|e| format!("Failed to get next sort order: {e}"))?;
+
+    let rev_result = sqlx::query(
+        "INSERT INTO workbook_revisions (workbook_id, name, sort_order) VALUES (?, ?, ?)",
+    )
+    .bind(workbook_id)
+    .bind(&name)
+    .bind(sort_order)
+    .execute(&db)
+    .await
+    .map_err(|e| format!("Failed to create template revision: {e}"))?;
+    let revision_id = rev_result.last_insert_rowid();
+
+    let result = sqlx::query(
+        "INSERT INTO templates (name, description, revision_id) VALUES (?, ?, ?)",
+    )
+    .bind(&name)
+    .bind(&description)
+    .bind(revision_id)
+    .execute(&db)
+    .await
+    .map_err(|e| format!("Failed to create template: {e}"))?;
+    let id = result.last_insert_rowid();
+
+    let created_at: String = sqlx::query_scalar("SELECT created_at FROM templates WHERE id = ?")
+        .bind(id)
+        .fetch_one(&db)
+        .await
+        .map_err(|e| format!("Failed to fetch created_at: {e}"))?;
+
+    Ok(TemplateDto {
+        id,
+        name,
+        description,
+        created_at,
+        revision_id,
+    })
+}
+
+#[tauri::command]
+async fn rename_template(
+    template_id: i64,
+    name: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let db = active_project_db(state.inner())?;
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("Template name cannot be empty".to_string());
+    }
+
+    let rows_affected = sqlx::query("UPDATE templates SET name = ? WHERE id = ?")
+        .bind(&name)
+        .bind(template_id)
+        .execute(&db)
+        .await
+        .map_err(|e| format!("Failed to rename template: {e}"))?
+        .rows_affected();
+
+    if rows_affected == 0 {
+        return Err(format!("Template {template_id} not found"));
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn update_template_description(
+    template_id: i64,
+    description: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let db = active_project_db(state.inner())?;
+    let description = description.and_then(|d| {
+        let d = d.trim().to_string();
+        if d.is_empty() { None } else { Some(d) }
+    });
+
+    let rows_affected = sqlx::query("UPDATE templates SET description = ? WHERE id = ?")
+        .bind(&description)
+        .bind(template_id)
+        .execute(&db)
+        .await
+        .map_err(|e| format!("Failed to update template description: {e}"))?
+        .rows_affected();
+
+    if rows_affected == 0 {
+        return Err(format!("Template {template_id} not found"));
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn delete_template(template_id: i64, state: State<'_, AppState>) -> Result<(), String> {
+    let db = active_project_db(state.inner())?;
+
+    let revision_id: Option<i64> =
+        sqlx::query_scalar("SELECT revision_id FROM templates WHERE id = ?")
+            .bind(template_id)
+            .fetch_optional(&db)
+            .await
+            .map_err(|e| format!("Failed to look up template: {e}"))?;
+
+    let Some(revision_id) = revision_id else {
+        return Err(format!("Template {template_id} not found"));
+    };
+
+    // Deletes the templates row (and cascades workbook_items / workbook_sheet_data
+    // for the backing revision) when its revision is removed.
+    sqlx::query("DELETE FROM workbook_revisions WHERE id = ?")
+        .bind(revision_id)
+        .execute(&db)
+        .await
+        .map_err(|e| format!("Failed to delete template revision: {e}"))?;
+
+    Ok(())
+}
+
 async fn init_database(db_path: &Path) -> Result<SqlitePool, String> {
     let options = SqliteConnectOptions::new()
         .filename(db_path)
@@ -1989,6 +2680,144 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), String> {
     .execute(pool)
     .await
     .map_err(|e| format!("Failed to create page_scales: {e}"))?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS workbooks (
+            id          INTEGER PRIMARY KEY,
+            project_id  INTEGER NOT NULL DEFAULT 1,
+            name        TEXT    NOT NULL DEFAULT 'Estimate'
+        );
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| format!("Failed to create workbooks: {e}"))?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS workbook_revisions (
+            id          INTEGER PRIMARY KEY,
+            workbook_id INTEGER NOT NULL REFERENCES workbooks(id) ON DELETE CASCADE,
+            name        TEXT    NOT NULL,
+            created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+            sort_order  INTEGER NOT NULL DEFAULT 0
+        );
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| format!("Failed to create workbook_revisions: {e}"))?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS workbook_items (
+            id                 INTEGER PRIMARY KEY,
+            revision_id        INTEGER NOT NULL REFERENCES workbook_revisions(id) ON DELETE CASCADE,
+            parent_id          INTEGER REFERENCES workbook_items(id) ON DELETE CASCADE,
+            sort_order         INTEGER NOT NULL DEFAULT 0,
+            item_type          TEXT    NOT NULL CHECK(item_type IN ('folder', 'line')),
+            name               TEXT    NOT NULL,
+            dimension_group_id INTEGER REFERENCES tree_nodes(id) ON DELETE SET NULL,
+            framing_size       TEXT,
+            unit               TEXT,
+            quantity           REAL,
+            rate               REAL,
+            notes              TEXT
+        );
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| format!("Failed to create workbook_items: {e}"))?;
+
+    // Additive: sheet data blob store (one row per revision × sheet path).
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS workbook_sheet_data (
+            id          INTEGER PRIMARY KEY,
+            revision_id INTEGER NOT NULL REFERENCES workbook_revisions(id) ON DELETE CASCADE,
+            sheet_path  TEXT NOT NULL,
+            data_json   TEXT NOT NULL DEFAULT '[]',
+            UNIQUE(revision_id, sheet_path)
+        );
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| format!("Failed to create workbook_sheet_data: {e}"))?;
+
+    // Additive: per-sheet map of cells that carry a live dimension-group import
+    // (CostX-style drag-and-drop from the Dimensions sidebar into C:Quantity).
+    // `links_json` is a JSON object keyed by "row,col" → { groupId, display, sizeOverride? }.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS workbook_sheet_links (
+            id          INTEGER PRIMARY KEY,
+            revision_id INTEGER NOT NULL REFERENCES workbook_revisions(id) ON DELETE CASCADE,
+            sheet_path  TEXT NOT NULL,
+            links_json  TEXT NOT NULL DEFAULT '{}',
+            UNIQUE(revision_id, sheet_path)
+        );
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| format!("Failed to create workbook_sheet_links: {e}"))?;
+
+    // Additive: per-sheet map of cells that carry user-applied text formatting
+    // (bold/italic/underline/font/size/align/decimals from the Format toolbar).
+    // `styles_json` is a JSON object keyed by "row,col" → CellStyle.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS workbook_sheet_styles (
+            id          INTEGER PRIMARY KEY,
+            revision_id INTEGER NOT NULL REFERENCES workbook_revisions(id) ON DELETE CASCADE,
+            sheet_path  TEXT NOT NULL,
+            styles_json TEXT NOT NULL DEFAULT '{}',
+            UNIQUE(revision_id, sheet_path)
+        );
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| format!("Failed to create workbook_sheet_styles: {e}"))?;
+
+    // Additive: marks a workbook as the hidden container for template revisions
+    // (excluded from list_workbooks / the sidebar tree).
+    let _ = sqlx::query("ALTER TABLE workbooks ADD COLUMN is_template INTEGER NOT NULL DEFAULT 0")
+        .execute(pool)
+        .await;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS templates (
+            id          INTEGER PRIMARY KEY,
+            name        TEXT    NOT NULL,
+            description TEXT,
+            created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+            revision_id INTEGER NOT NULL REFERENCES workbook_revisions(id) ON DELETE CASCADE
+        );
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| format!("Failed to create templates: {e}"))?;
+
+    // Seed a default workbook + revision for projects that have none yet.
+    sqlx::query(
+        "INSERT INTO workbooks (id, project_id, name) SELECT 1, 1, 'Estimate' WHERE NOT EXISTS (SELECT 1 FROM workbooks WHERE id = 1)",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| format!("Failed to seed default workbook: {e}"))?;
+
+    sqlx::query(
+        "INSERT INTO workbook_revisions (workbook_id, name, sort_order) SELECT 1, 'Revision 1', 0 WHERE NOT EXISTS (SELECT 1 FROM workbook_revisions WHERE workbook_id = 1)",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| format!("Failed to seed default workbook revision: {e}"))?;
 
     Ok(())
 }
@@ -2453,7 +3282,25 @@ pub fn run() {
             set_page_scale,
             get_page_scale,
             get_dimension_group_props,
-            set_dimension_group_props
+            set_dimension_group_props,
+            save_workbook_sheet,
+            load_workbook_sheet,
+            save_workbook_sheet_links,
+            load_workbook_sheet_links,
+            save_workbook_sheet_styles,
+            load_workbook_sheet_styles,
+            delete_workbook_sheet_subtree,
+            clear_workbook_revision_data,
+            list_workbooks,
+            create_workbook_revision,
+            create_workbook_revision_from_template,
+            delete_workbook_revision,
+            rename_workbook_revision,
+            list_templates,
+            create_template,
+            rename_template,
+            update_template_description,
+            delete_template
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
