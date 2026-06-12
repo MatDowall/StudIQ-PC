@@ -12,11 +12,25 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "StudIQ",
         "width": 1400,
         "height": 900,
+        "maximized": true,
         "resizable": true,
-        "dragDropEnabled": false
+        "dragDropEnabled": false,
+        "visible": false
+      },
+      {
+        "label": "splashscreen",
+        "url": "splashscreen.html",
+        "width": 360,
+        "height": 280,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "center": true,
+        "alwaysOnTop": true
       }
     ],
     "security": {

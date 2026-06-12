@@ -1,5 +1,6 @@
 import React, { useRef, useState, useCallback, useMemo, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { HotTable } from "@handsontable/react-wrapper";
 import type { HotTableRef } from "@handsontable/react-wrapper";
 import { registerAllModules } from "handsontable/registry";
@@ -9,10 +10,12 @@ import "handsontable/styles/ht-theme-classic.css";
 import type Handsontable from "handsontable";
 import { HyperFormula } from "hyperformula";
 import { useAppStore, DEFAULT_WORKBOOK_FORMAT } from "../store/appStore";
-import type { WorkbookFormatApi, MeasurementDto, DimensionGroupPropsDto, PageScaleDto } from "../store/appStore";
+import type { WorkbookFormatApi, WorkbookGridApi, MeasurementDto, DimensionGroupPropsDto, PageScaleDto } from "../store/appStore";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { TemplateManagerDialog } from "./TemplateManagerDialog";
 import { ContextMenu } from "./ContextMenu";
+import { TextInputDialog } from "./TextInputDialog";
+import { NamedCellsManagerDialog, type NamedCellEntry } from "./NamedCellsManagerDialog";
 import { ImportDimensionDialog, type ImportDisplayOption } from "./ImportDimensionDialog";
 import { groupNetQuantity, quantityValueText, type GroupProps, type PagePoint, type Quantity } from "../lib/quantity";
 import {
@@ -114,6 +117,11 @@ const NUMERIC_COLS = new Set<number>(
 // respectively). Level 3 sheets (Rate Build-up or Quantity Build-up) are leaves — no
 // drill columns there.
 const DRILL_FONT_COLOUR = "#0400ff";
+
+// Faint dashed top border marking a cell that's excluded from auto-calculation
+// (see cellExclusionMap) — a visual cue that its content is hand-built and won't
+// be overwritten by the drill-down rollup, factor default, or total formula.
+const EXCLUDED_BORDER_COLOUR = "#c08a00";
 function isDrillColumn(level: Level, col: number): boolean {
   return (level === 1 && col === COL_SUBTOTAL)
       || (level === 2 && (col === COL_RATE || col === COL_QTY));
@@ -145,6 +153,45 @@ interface CellLink {
   display: string;
 }
 
+// ─── Named cells (Excel-style "New Named Cell") ───────────────────────────────
+
+/** A workbook-wide name bound to one cell (sheet path + row/col). Unique per
+ *  revision — defined once, then usable in formulas at any level. Persisted
+ *  alongside the revision and gone when it (or the workbook) is deleted. */
+interface NamedCell {
+  name: string;
+  path: string;
+  row: number;
+  col: number;
+}
+
+/** Excel-style identifier rules: starts with a letter/underscore, then
+ *  letters/digits/underscores/periods — and must not look like a cell reference
+ *  (HyperFormula rejects those as named-expression names anyway). */
+const NAMED_CELL_PATTERN = /^[A-Za-z_][A-Za-z0-9_.]*$/;
+const CELL_REF_PATTERN = /^[A-Za-z]{1,3}[0-9]+$/;
+
+function isValidNamedCellName(name: string): boolean {
+  return NAMED_CELL_PATTERN.test(name) && !CELL_REF_PATTERN.test(name);
+}
+
+/** "A1"-style label for a grid cell — used in the New Named Cell dialog prompt. */
+function cellRefLabel(row: number, col: number): string {
+  return `${COLUMNS[col]?.letter ?? "A"}${row + 1}`;
+}
+
+/** Renders a cell value as a HyperFormula named-expression formula — numbers and
+ *  text are embedded as literals (quoting text) so the name keeps working from
+ *  any sheet, since HyperFormula reuses a single "Sheet1" across drill levels. */
+function namedExprFromValue(value: unknown): string {
+  if (value == null || value === "") return "=0";
+  if (typeof value === "number") return Number.isFinite(value) ? `=${value}` : "=0";
+  const text = String(value);
+  const num = Number(text);
+  if (text.trim() !== "" && !Number.isNaN(num)) return `=${num}`;
+  return `="${text.replace(/"/g, '""')}"`;
+}
+
 const LINK_FONT_COLOUR = "#489c35";
 const DIMENSION_DRAG_MIME = "application/x-studiq-dimension-group";
 
@@ -152,6 +199,7 @@ const IMPORT_DISPLAY_LABELS: Record<string, string> = {
   count: "Count",
   length: "Length",
   area: "Area",
+  perimeter: "Perimeter",
   wall_area: "Wall surface area",
   volume: "Volume",
 };
@@ -175,7 +223,7 @@ function possibleImportDisplays(props: GroupProps): string[] {
       return out;
     }
     case "area": {
-      const out = ["area"];
+      const out = ["area", "perimeter"];
       if (props.default_height > 0) out.push("wall_area", "volume");
       return out;
     }
@@ -315,6 +363,14 @@ function isQtyBuildupPath(path: string): boolean {
   return /\/Q\d+$/.test(path) || path === TEMPLATE_MASTER_LQ_PATH;
 }
 
+/** Derives a sheet's drill level purely from its path depth — "L1" is level 1,
+ *  "L1/R3" is level 2, "L1/R3/R2" or "L1/R3/Q5" is level 3. Used by the Named
+ *  Cells manager's "Go to" action, which only has the bound cell's path to work from. */
+function levelForPath(path: string): Level {
+  const depth = path.split("/").length;
+  return Math.min(3, Math.max(1, depth)) as Level;
+}
+
 interface BreadcrumbCtx {
   code:        string;
   description: string;
@@ -412,10 +468,13 @@ function deriveLevelFormulas(
   level: Level,
   guardRef: React.MutableRefObject<boolean>,
   kind: SheetKind = "standard",
+  excluded?: Set<string>,
 ): void {
   if (guardRef.current) return;
   guardRef.current = true;
   try {
+    const isExcluded = (r: number, c: number) => excluded != null && excluded.has(styleKey(r, c));
+
     if (kind === "qty") {
       // Quantity Build-up sheets: H = C×D×E×F×G (Count×Length×Width×Height×Factor).
       // G auto-populates to 1 the first time a row has a computable product and Factor
@@ -427,12 +486,14 @@ function deriveLevelFormulas(
         const hasInput = vals.some(v => v != null && v !== "");
         if (!hasInput) continue;
 
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const gSrc = (hot as any).getSourceDataAtCell(r, COL_FACTOR);
-        if (gSrc == null || String(gSrc) === "") {
-          pass.push([r, COL_FACTOR, "1"]);
+        if (!isExcluded(r, COL_FACTOR)) {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const gSrc = (hot as any).getSourceDataAtCell(r, COL_FACTOR);
+          if (gSrc == null || String(gSrc) === "") {
+            pass.push([r, COL_FACTOR, "1"]);
+          }
         }
-        pass.push([r, COL_TOTAL, qtyTotalFormula(r)]);
+        if (!isExcluded(r, COL_TOTAL)) pass.push([r, COL_TOTAL, qtyTotalFormula(r)]);
       }
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       if (pass.length) hot.setDataAtCell(pass as any);
@@ -444,6 +505,7 @@ function deriveLevelFormulas(
     const pass1: Array<[number, number, string]> = [];
     if (level >= 2) {
       for (let r = 0; r < NUM_ROWS; r++) {
+        if (isExcluded(r, COL_SUBTOTAL)) continue;
         const cVal = hot.getDataAtCell(r, COL_QTY);
         const eVal = hot.getDataAtCell(r, COL_RATE);
         if ((cVal != null && cVal !== "") || (eVal != null && eVal !== "")) {
@@ -461,12 +523,14 @@ function deriveLevelFormulas(
       if (fRaw == null || fRaw === "") continue;
       const f = typeof fRaw === "number" ? fRaw : parseFloat(String(fRaw)) || 0;
 
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const gSrc = (hot as any).getSourceDataAtCell(r, COL_FACTOR);
-      if (f > 0 && (gSrc == null || String(gSrc) === "")) {
-        pass2.push([r, COL_FACTOR, "1"]);
+      if (!isExcluded(r, COL_FACTOR)) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const gSrc = (hot as any).getSourceDataAtCell(r, COL_FACTOR);
+        if (f > 0 && (gSrc == null || String(gSrc) === "")) {
+          pass2.push([r, COL_FACTOR, "1"]);
+        }
       }
-      pass2.push([r, COL_TOTAL, `=F${r + 1}*G${r + 1}`]);
+      if (!isExcluded(r, COL_TOTAL)) pass2.push([r, COL_TOTAL, `=F${r + 1}*G${r + 1}`]);
     }
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     if (pass2.length) hot.setDataAtCell(pass2 as any);
@@ -484,6 +548,7 @@ function deriveLevelFormulas(
       for (let r = 0; r < NUM_ROWS; r++) {
         const cVal = hot.getDataAtCell(r, COL_QTY);
         for (const [src, total] of pullThroughCols) {
+          if (isExcluded(r, total)) continue;
           const srcVal = hot.getDataAtCell(r, src);
           if ((srcVal != null && srcVal !== "") || (cVal != null && cVal !== "")) {
             const colLetter = COLUMNS[src].letter;
@@ -521,6 +586,8 @@ function loadLevelData(
   level: Level,
   guardRef: React.MutableRefObject<boolean>,
   path: string,
+  excluded?: Set<string>,
+  reRegisterNamed?: () => void,
 ): void {
   const kind = sheetKindForPath(path);
   hot.updateSettings({
@@ -535,8 +602,15 @@ function loadLevelData(
       if (sheetId !== undefined) hf.clearSheet(sheetId);
     }
   } catch { /* ignore if HyperFormula API differs across versions */ }
+  // Re-point named expressions to the *new* active sheet BEFORE loadData evaluates
+  // its formulas. Otherwise a cross-sheet `=margin*2` would first be evaluated while
+  // `margin` still points at the just-cleared cell (→ #VALUE!), and the plugin would
+  // paint that error; fixing the name afterwards recomputes the engine but doesn't
+  // reliably repaint. Doing it here means the first evaluation already sees the
+  // correct literal/live reference. See refreshNamedCellsForPath / namedExprFormula.
+  reRegisterNamed?.();
   hot.loadData(dataForHot(data));
-  deriveLevelFormulas(hot, level, guardRef, kind);
+  deriveLevelFormulas(hot, level, guardRef, kind, excluded);
 }
 
 /**
@@ -761,6 +835,7 @@ export function WorkbookView() {
   // Format toolbar bridge (ribbon ⇄ grid) — see appStore.ts
   const setWorkbookFormat    = useAppStore(s => s.setWorkbookFormat);
   const setWorkbookFormatApi = useAppStore(s => s.setWorkbookFormatApi);
+  const setWorkbookGridApi   = useAppStore(s => s.setWorkbookGridApi);
 
   // Template manager / template-edit-mode (Settings → Template Manager in the ribbon)
   const templateManagerOpen = useAppStore(s => s.templateManagerOpen);
@@ -795,13 +870,17 @@ export function WorkbookView() {
   // back to the cell even after focus moves to the input element.
   const lastSelectedCellRef = useRef<{ row: number; col: number } | null>(null);
 
+  // Excel-style status bar stats for the current selection
+  const [selectionStats, setSelectionStats] = useState<{ count: number; sum: number; average: number } | null>(null);
+
   // Workbook maintenance: "clean orphaned sheets" / "clear whole workbook".
   // `cleanupBusy` disables the toolbar buttons while a maintenance op runs;
   // `cleanupMessage` is a short transient status shown beside them; `confirmAction`
   // drives the shared ConfirmDialog (clearing the workbook is destructive).
   const [cleanupBusy,    setCleanupBusy]    = useState(false);
   const [cleanupMessage, setCleanupMessage] = useState<string | null>(null);
-  const [confirmAction,  setConfirmAction]  = useState<"clean" | "clear" | null>(null);
+  const confirmAction      = useAppStore(s => s.workbookConfirmAction);
+  const setConfirmAction   = useAppStore(s => s.setWorkbookConfirmAction);
   const cleanupMessageTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const showCleanupMessage = useCallback((msg: string) => {
@@ -839,12 +918,58 @@ export function WorkbookView() {
   const loadedLinkPathsRef = useRef<Set<string>>(new Set());
   const loadedStylePathsRef = useRef<Set<string>>(new Set());
 
+  // Per-sheet set of cells excluded from auto-derivation — i.e. the F:Subtotal
+  // drill-up rollup, the G:Factor default-to-1, and the H:Total = F×G formula
+  // injection all skip any cell whose "row,col" key is present here. Lets a
+  // template author "switch off" auto-calc for a hand-built summary block that
+  // overwrites those columns with its own formulas. Persisted to SQLite alongside
+  // sheet data — see persistSheet / ensureSheetExclusionsLoaded — and keyed the
+  // same way as cellStyleMap so it follows drill navigation.
+  const cellExclusionMap = useRef<Map<string, Set<string>>>(new Map());
+  const loadedExclusionPathsRef = useRef<Set<string>>(new Set());
+
+  // Named cells: workbook-wide name → bound cell (sheet path + row/col). Loaded
+  // once per active revision and registered with HyperFormula as named expressions
+  // (see registerNamedExpression) so they resolve in formulas at any drill level.
+  // `registeredNamedExprRef` tracks which names already exist in the engine, since
+  // HyperFormula needs `addNamedExpression` the first time and `changeNamedExpression`
+  // thereafter.
+  const namedCellMap = useRef<Map<string, NamedCell>>(new Map());
+  const registeredNamedExprRef = useRef<Set<string>>(new Set());
+  const [namedCellDialog, setNamedCellDialog] = useState<{ row: number; col: number } | null>(null);
+
+  // TEMP DEBUG: window.__ncDump() dumps every named cell's bound path + engine
+  // formula + resolved value, plus the current sheet path. Remove once the
+  // cross-sheet named-cell bug is resolved.
+  useEffect(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (window as any).__ncDump = () => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const hf = (hotRef.current?.hotInstance?.getPlugin('formulas') as any)?.engine;
+      const out: Record<string, unknown> = { curSheetPath: pathStack.current[pathStack.current.length - 1] };
+      for (const n of namedCellMap.current.values()) {
+        out[n.name] = {
+          boundPath: n.path, row: n.row, col: n.col,
+          formula: (() => { try { return hf?.getNamedExpression(n.name)?.expression; } catch { return "ERR"; } })(),
+          value: (() => { try { return hf?.getNamedExpressionValue(n.name); } catch { return "ERR"; } })(),
+        };
+      }
+      // eslint-disable-next-line no-console
+      console.log("[NC] dump", JSON.parse(JSON.stringify(out)));
+      return out;
+    };
+  }, []);
+  const namedCellsManagerOpen    = useAppStore(s => s.namedCellsManagerOpen);
+  const closeNamedCellsManager   = useAppStore(s => s.closeNamedCellsManager);
+
   // Drag-and-drop import dialog (shown when more than one derived display is possible)
   // and the "Show dimension group" context menu for already-linked cells.
   const [importPrompt, setImportPrompt] = useState<{
     row: number; groupId: number; groupName: string; options: ImportDisplayOption[]; defaultKey: string;
   } | null>(null);
-  const [linkContextMenu, setLinkContextMenu] = useState<{ x: number; y: number; link: CellLink } | null>(null);
+  const [gridContextMenu, setGridContextMenu] = useState<{
+    x: number; y: number; items: { label: string; action: () => void; danger?: boolean }[];
+  } | null>(null);
   const goToDimensionGroup = useAppStore(s => s.goToDimensionGroup);
 
   function curSheetPath(): string {
@@ -863,6 +988,174 @@ export function WorkbookView() {
     let map = cellLinkMap.current.get(path);
     if (!map) { map = new Map(); cellLinkMap.current.set(path, map); }
     map.set(styleKey(row, col), link);
+  }
+
+  /** True when (row,col) on `path` is excluded from auto-derivation — the
+   *  drill-up rollup, factor default-to-1, and total formula injection all skip it. */
+  function isCellExcluded(path: string, row: number, col: number): boolean {
+    return cellExclusionMap.current.get(path)?.has(styleKey(row, col)) ?? false;
+  }
+
+  /** Adds or removes (row,col) on `path` from the exclusion set and persists it. */
+  function setCellExcluded(path: string, row: number, col: number, excluded: boolean) {
+    let set = cellExclusionMap.current.get(path);
+    if (excluded) {
+      if (!set) { set = new Set(); cellExclusionMap.current.set(path, set); }
+      set.add(styleKey(row, col));
+    } else if (set) {
+      set.delete(styleKey(row, col));
+      if (set.size === 0) cellExclusionMap.current.delete(path);
+    }
+    const revId = revIdRef.current;
+    if (revId != null) persistSheetExclusions(revId, path);
+  }
+
+  /** Toggles auto-calc exclusion for every cell in the current selection on the
+   *  active sheet, then re-derives so the change takes effect immediately. */
+  function toggleExclusionForSelection(exclude: boolean) {
+    const hot = hotRef.current?.hotInstance;
+    if (!hot) return;
+    const path = curSheetPath();
+    for (const { row, col } of getSelectedCells()) {
+      setCellExcluded(path, row, col, exclude);
+    }
+    hot.render();
+    deriveLevelFormulas(hot, levelRef.current, isAutoUpdatingRef, sheetKindForPath(path), cellExclusionMap.current.get(path));
+  }
+
+  // ── Named cells ─────────────────────────────────────────────────────────
+
+  /** Reads a cell's *evaluated* value regardless of which sheet it lives on:
+   *  the active sheet via Handsontable, an ancestor via its rollup snapshot, or
+   *  (last resort) its raw stored source string. Used to seed/refresh the named
+   *  expression's cached value, since HyperFormula only ever has one sheet loaded. */
+  function readCellValue(path: string, row: number, col: number): unknown {
+    const hot = hotRef.current?.hotInstance;
+    if (path === curSheetPath() && hot) return hot.getDataAtCell(row, col);
+    const computed = sheetComputedMap.current.get(path);
+    if (computed) return computed[row]?.[col] ?? null;
+    return sheetDataMap.current.get(path)?.[row]?.[col] ?? null;
+  }
+
+  /** Builds the HyperFormula named-expression formula for `nc` given the *currently
+   *  active* sheet:
+   *
+   *  - Bound cell is on the active sheet → a **live reference** (`=Sheet1!$C$5`).
+   *    HyperFormula then tracks the dependency natively, so editing the bound cell
+   *    instantly recomputes *and repaints* every formula referencing the name —
+   *    exactly Excel's named-range behaviour. (Only one sheet is ever loaded into
+   *    HyperFormula's "Sheet1", so the reference is unambiguous while we're on it.)
+   *  - Bound cell is on a *different* sheet → a **literal snapshot** of its
+   *    last-known evaluated value. A live `Sheet1!` reference would resolve against
+   *    whichever sheet currently occupies "Sheet1" (the wrong cell); and since the
+   *    bound cell isn't even visible, there's nothing to update live anyway. The
+   *    literal is refreshed by `syncNamedExpressions` whenever sheets change. */
+  function namedExprFormula(nc: NamedCell): string {
+    if (nc.path === curSheetPath()) {
+      const letter = COLUMNS[nc.col]?.letter ?? "A";
+      return `=Sheet1!$${letter}$${nc.row + 1}`;
+    }
+    return namedExprFromValue(readCellValue(nc.path, nc.row, nc.col));
+  }
+
+  /** Registers (or updates) `nc` as a global HyperFormula named expression, choosing
+   *  live-reference vs literal-snapshot form via `namedExprFormula`. */
+  function registerNamedExpression(nc: NamedCell) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const hf = (hotRef.current?.hotInstance?.getPlugin('formulas') as any)?.engine;
+    if (!hf) return;
+    const formula = namedExprFormula(nc);
+    // Use the engine itself as the source of truth for whether the name already
+    // exists — a separate JS Set can desync (e.g. if the engine drops the name) and
+    // then `changeNamedExpression` throws, silently leaving a stale (live-ref) formula.
+    const exists = (() => {
+      try { return hf.getNamedExpression?.(nc.name) != null; }
+      catch { return registeredNamedExprRef.current.has(nc.name); }
+    })();
+    try {
+      if (exists) hf.changeNamedExpression(nc.name, formula);
+      else hf.addNamedExpression(nc.name, formula);
+      registeredNamedExprRef.current.add(nc.name);
+    } catch {
+      // Last resort: tear down and re-add so the name never gets stuck on an old formula.
+      try { hf.removeNamedExpression(nc.name); } catch { /* wasn't there */ }
+      try { hf.addNamedExpression(nc.name, formula); registeredNamedExprRef.current.add(nc.name); }
+      catch { /* invalid expression text — leave the name unregistered */ }
+    }
+    // eslint-disable-next-line no-console
+    console.log("[NC] reg", nc.name, "bound=", nc.path, "cur=", curSheetPath(),
+      "formula=", formula, "->",
+      (() => { try { return hf.getNamedExpressionValue(nc.name); } catch { return "ERR"; } })());
+  }
+
+  /** Re-registers *every* named cell against the now-active sheet — called after any
+   *  sheet load/navigation. Names bound to the new active sheet flip to live
+   *  references (auto-updating); names bound elsewhere flip to a fresh literal
+   *  snapshot. The `path` arg is the just-loaded sheet (kept for call-site clarity;
+   *  all names are re-evaluated regardless since leaving a sheet must demote its
+   *  live references back to literals). */
+  function refreshNamedCellsForPath(_path: string) {
+    if (namedCellMap.current.size === 0) return;
+    for (const nc of namedCellMap.current.values()) registerNamedExpression(nc);
+  }
+
+  /** Binds `name` to (path,row,col): persists it, replaces any prior binding for
+   *  the same name, and (re)registers it with HyperFormula. */
+  async function defineNamedCell(name: string, path: string, row: number, col: number) {
+    const revId = revIdRef.current;
+    if (revId == null) return;
+    const nc: NamedCell = { name, path, row, col };
+    namedCellMap.current.set(name, nc);
+    registerNamedExpression(nc);
+    try {
+      await invoke("save_workbook_named_cell", {
+        revisionId: revId, name, sheetPath: path, row, col,
+      });
+    } catch { /* non-fatal — local binding still works for this session */ }
+  }
+
+  /** Removes `name`'s binding entirely: persisted row, HyperFormula named expression,
+   *  and local bookkeeping. Used by the Named Cells manager's Delete action. */
+  async function removeNamedCell(name: string) {
+    const revId = revIdRef.current;
+    namedCellMap.current.delete(name);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const hf = (hotRef.current?.hotInstance?.getPlugin('formulas') as any)?.engine;
+    if (hf && registeredNamedExprRef.current.has(name)) {
+      try { hf.removeNamedExpression(name); } catch { /* already gone */ }
+    }
+    registeredNamedExprRef.current.delete(name);
+    if (revId == null) return;
+    try {
+      await invoke("delete_workbook_named_cell", { revisionId: revId, name });
+    } catch { /* non-fatal — local removal still took effect for this session */ }
+  }
+
+  /** Renames `oldName` to `newName`, keeping its cell binding: implemented as
+   *  delete-then-redefine since the persisted table is unique on name. Used by
+   *  the Named Cells manager's Rename action. */
+  async function renameNamedCell(oldName: string, newName: string) {
+    const nc = namedCellMap.current.get(oldName);
+    if (!nc) return;
+    await removeNamedCell(oldName);
+    await defineNamedCell(newName, nc.path, nc.row, nc.col);
+  }
+
+  /** Switches to the sheet a named cell is bound to and selects/scrolls to it.
+   *  Used by the Named Cells manager's "Go to" action. */
+  function goToNamedCell(name: string) {
+    const nc = namedCellMap.current.get(name);
+    if (!nc) return;
+    closeNamedCellsManager();
+    if (nc.path === curSheetPath()) {
+      const hot = hotRef.current?.hotInstance;
+      if (hot) {
+        hot.selectCell(nc.row, nc.col);
+        hot.scrollViewportTo(nc.row, nc.col, true, true);
+      }
+      return;
+    }
+    jumpToSheet(nc.path, levelForPath(nc.path), { row: nc.row, col: nc.col });
   }
 
   /** Loads a sheet's persisted cell-link map once (cached thereafter; lost links are
@@ -889,6 +1182,68 @@ export function WorkbookView() {
       const entries = Object.entries(obj);
       if (entries.length > 0) cellStyleMap.current.set(path, new Map(entries));
     } catch { /* non-fatal — sheet simply has no styles yet */ }
+  }
+
+  /** Loads `path`'s persisted auto-calc exclusion set into cellExclusionMap, once
+   *  per path — mirrors ensureSheetStylesLoaded. Awaited *before* the sheet's first
+   *  `loadLevelData`/`deriveLevelFormulas` pass (see loadLevelDataExcl) so a freshly
+   *  opened excluded cell never gets clobbered by an auto-derived value first. */
+  async function ensureSheetExclusionsLoaded(revisionId: number, path: string): Promise<void> {
+    if (loadedExclusionPathsRef.current.has(path)) return;
+    loadedExclusionPathsRef.current.add(path);
+    try {
+      const json = await invoke<string>("load_workbook_sheet_exclusions", { revisionId, sheetPath: path });
+      const obj = JSON.parse(json) as Record<string, true>;
+      const keys = Object.keys(obj);
+      if (keys.length > 0) cellExclusionMap.current.set(path, new Set(keys));
+    } catch { /* non-fatal — sheet simply has no exclusions yet */ }
+  }
+
+  /** Persists `path`'s current auto-calc exclusion set (or clears it if empty). */
+  function persistSheetExclusions(revisionId: number, path: string) {
+    const set = cellExclusionMap.current.get(path);
+    const obj: Record<string, true> = {};
+    if (set) for (const key of set) obj[key] = true;
+    invoke("save_workbook_sheet_exclusions", {
+      revisionId,
+      sheetPath: path,
+      exclusionsJson: JSON.stringify(obj),
+    }).catch(() => {/* non-fatal */});
+  }
+
+  /** Wraps loadLevelData so that `path`'s persisted exclusion set is loaded and in
+   *  cellExclusionMap *before* the first auto-derivation pass runs — guarantees an
+   *  excluded cell's hand-built content is never overwritten on a cold sheet load. */
+  function loadLevelDataExcl(
+    hot: Handsontable,
+    data: (string | null)[][],
+    level: Level,
+    guardRef: React.MutableRefObject<boolean>,
+    path: string,
+  ): void {
+    const revId = revIdRef.current;
+    // Re-point named expressions to the new active sheet *inside* loadLevelData, after
+    // its clearSheet but before its loadData — so cross-sheet references already hold
+    // their correct literal when the new sheet's formulas are first evaluated.
+    const reRegister = () => refreshNamedCellsForPath(path);
+    // Re-register named expressions both *before* loadData (so the new sheet's formulas
+    // evaluate against correct values on first pass — no transient #VALUE!) and *after*
+    // (idempotent safety net in case the plugin's loadData re-evaluation reset anything),
+    // then render so dependent cells repaint.
+    const settle = () => {
+      reRegister();
+      if (namedCellMap.current.size > 0) hot.render();
+    };
+    if (revId == null) {
+      loadLevelData(hot, data, level, guardRef, path, undefined, reRegister);
+      settle();
+      return;
+    }
+    ensureSheetExclusionsLoaded(revId, path).then(() => {
+      if (curSheetPath() !== path) return;
+      loadLevelData(hot, data, level, guardRef, path, cellExclusionMap.current.get(path), reRegister);
+      settle();
+    });
   }
 
   /**
@@ -981,6 +1336,26 @@ export function WorkbookView() {
     }
   }
 
+  /** Same row-shift as shiftRowKeyedEntries, for the Set-based exclusion map
+   *  (cellExclusionMap stores membership only, not a value per key). */
+  function shiftRowKeyedSet(
+    set: Set<string> | undefined,
+    fromRow: number,
+    toRowExclusive: number,
+    by: number,
+  ): void {
+    if (!set || set.size === 0) return;
+    for (let r = toRowExclusive - 1; r >= fromRow; r--) {
+      for (let c = 0; c < NUM_COLS; c++) {
+        const key = styleKey(r, c);
+        if (!set.has(key)) continue;
+        set.delete(key);
+        const dest = r + by;
+        if (dest <= NUM_ROWS - 1) set.add(styleKey(dest, c));
+      }
+    }
+  }
+
   /** Moves the standard-layout line items occupying rows `[fromRow..lastRow]` down by
    *  `by` rows, freeing `[fromRow, fromRow+by)` for new line items without overwriting
    *  what's there — used when auto-placing "<size> Lintel to last" rows directly below a
@@ -1020,10 +1395,11 @@ export function WorkbookView() {
 
     shiftRowKeyedEntries(cellLinkMap.current.get(path), fromRow, lastRow + 1, by);
     shiftRowKeyedEntries(cellStyleMap.current.get(path), fromRow, lastRow + 1, by);
+    shiftRowKeyedSet(cellExclusionMap.current.get(path), fromRow, lastRow + 1, by);
 
     // Regenerate F/H/J/L/N/P for every row (cheap, idempotent) now that the moved
     // rows' inputs sit at their new positions.
-    deriveLevelFormulas(hot, levelRef.current, isAutoUpdatingRef, "standard");
+    deriveLevelFormulas(hot, levelRef.current, isAutoUpdatingRef, "standard", cellExclusionMap.current.get(path));
   }
 
   /** Inserts plain `Description`/`Quantity`/`Unit` line items directly below `afterRow` on
@@ -1058,6 +1434,10 @@ export function WorkbookView() {
       hot.setDataAtCell(r, COL_DESC, items[i].desc);
       hot.setDataAtCell(r, COL_QTY, items[i].qty);
       hot.setDataAtCell(r, COL_UNIT, "m");
+      // Prevent accidental drill-down into C:Quantity for auto-generated lintel rows —
+      // the quantity is a flat total (nothing to build up), and drilling would create a
+      // sub-sheet whose rollup would overwrite the placed value on drill-up.
+      setCellExcluded(path, r, COL_QTY, true);
     }
     hot.render();
     scheduleSaveRef.current();
@@ -1158,17 +1538,46 @@ export function WorkbookView() {
   }
 
   /** Right-click on a linked C:Quantity / D:Unit cell offers "Show dimension group". */
+  /** Right-click on any cell offers "New Named Cell"; a linked C:Quantity / D:Unit
+   *  cell additionally offers "Show dimension group". */
   function handleGridContextMenu(event: React.MouseEvent<HTMLDivElement>) {
     const hot = hotRef.current?.hotInstance;
     if (!hot) return;
     const td = (event.target as HTMLElement | null)?.closest("td");
     if (!td) return;
     const coords = hot.getCoords(td);
-    if (!coords || coords.row < 0 || (coords.col !== COL_QTY && coords.col !== COL_UNIT)) return;
-    const link = getCellLink(curSheetPath(), coords.row, COL_QTY);
-    if (!link) return;
+    if (!coords || coords.row < 0 || coords.col < 0) return;
     event.preventDefault();
-    setLinkContextMenu({ x: event.clientX, y: event.clientY, link });
+
+    const items: { label: string; action: () => void; danger?: boolean }[] = [];
+    if (coords.col === COL_QTY || coords.col === COL_UNIT) {
+      const link = getCellLink(curSheetPath(), coords.row, COL_QTY);
+      if (link) {
+        items.push({
+          label: "Show dimension group",
+          action: () => { void goToDimensionGroup(link.groupId); },
+        });
+      }
+    }
+    items.push({
+      label: "New Named Cell…",
+      action: () => setNamedCellDialog({ row: coords.row, col: coords.col }),
+    });
+
+    // "Exclude/re-enable auto-calculation" — operates on the live selection (falls
+    // back to the right-clicked cell when nothing is selected). Lets a template
+    // author switch off the F:Subtotal/G:Factor/H:Total auto-derivation for a
+    // hand-built summary block that overwrites those columns with its own formulas.
+    const selection = getSelectedCells();
+    const targetCells = selection.length > 0 ? selection : [{ row: coords.row, col: coords.col }];
+    const path = curSheetPath();
+    const allExcluded = targetCells.every(({ row, col }) => isCellExcluded(path, row, col));
+    items.push({
+      label: allExcluded ? "Re-enable auto-calculation" : "Exclude from auto-calculation",
+      action: () => toggleExclusionForSelection(!allExcluded),
+    });
+
+    setGridContextMenu({ x: event.clientX, y: event.clientY, items });
   }
 
   /** Cells covered by the live selection, falling back to the last-known cell. */
@@ -1255,6 +1664,32 @@ export function WorkbookView() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Stable grid API exposed to the ribbon for row operations and output actions.
+  // Implementation is kept in gridApiImplRef (updated each render) so closures
+  // always see the latest captureSourceData / shiftStandardRowsDown / etc. The
+  // stable ref itself just delegates, matching the scheduleSaveRef pattern.
+  const gridApiImplRef = useRef({
+    addRow: () => {},
+    insertAbove: () => {},
+    insertBelow: () => {},
+    exportCsv: async () => {},
+    print: () => {},
+  });
+
+  const gridApiRef = useRef<WorkbookGridApi>({
+    addRow:       () => gridApiImplRef.current.addRow(),
+    insertAbove:  () => gridApiImplRef.current.insertAbove(),
+    insertBelow:  () => gridApiImplRef.current.insertBelow(),
+    exportCsv:    () => gridApiImplRef.current.exportCsv(),
+    print:        () => gridApiImplRef.current.print(),
+  });
+
+  useEffect(() => {
+    setWorkbookGridApi(gridApiRef.current);
+    return () => setWorkbookGridApi(null);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // Stable refs so Handsontable hooks don't capture stale values
   const levelRef      = useRef<Level>(1);
   levelRef.current    = level;
@@ -1291,6 +1726,8 @@ export function WorkbookView() {
       sheetPath: path,
       stylesJson: JSON.stringify(styles ? Object.fromEntries(styles) : {}),
     }).catch(() => {/* non-fatal */});
+
+    persistSheetExclusions(revisionId, path);
   }
 
   /**
@@ -1329,6 +1766,232 @@ export function WorkbookView() {
   const scheduleSaveRef = useRef(scheduleSave);
   scheduleSaveRef.current = scheduleSave;
 
+  // ── Grid API implementations (updated each render so closures stay fresh) ─
+
+  /**
+   * Insert a blank row at `insertAt`, shifting all occupied rows from that
+   * position downward by one.  ALL columns are copied verbatim (including
+   * F:Subtotal and the …-Total columns which at Level 1 hold plain rollup
+   * numbers, not row-relative formulas).  `deriveLevelFormulas` is called
+   * afterwards to regenerate the formula columns (F=E×C at L2+, H=F×G at
+   * all levels, J/L/N/P×C at L2) for their new row positions — it overwrites
+   * only the cells it handles, leaving plain-number cells untouched.
+   *
+   * This is intentionally NOT `shiftStandardRowsDown`, which clears the
+   * …-Total columns and is only correct at Level 2/3 (never at Level 1).
+   */
+  function insertBlankRowAt(hot: Handsontable, path: string, insertAt: number): void {
+    const data = captureSourceData(hot);
+    let lastOccupied = -1;
+    for (let r = NUM_ROWS - 1; r >= insertAt; r--) {
+      if (isLineItemRow(data[r])) { lastOccupied = r; break; }
+    }
+
+    isAutoUpdatingRef.current = true;
+    try {
+      const batch: Array<[number, number, string]> = [];
+      if (lastOccupied >= insertAt) {
+        for (let r = lastOccupied; r >= insertAt; r--) {
+          const dest = r + 1;
+          if (dest > NUM_ROWS - 1) continue;
+          for (let c = 0; c < NUM_COLS; c++) batch.push([dest, c, data[r][c] ?? ""]);
+        }
+      }
+      for (let c = 0; c < NUM_COLS; c++) batch.push([insertAt, c, ""]);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      if (batch.length) hot.setDataAtCell(batch as any);
+    } finally {
+      isAutoUpdatingRef.current = false;
+    }
+
+    // Shift any named cells bound to this sheet at or below the insertion point,
+    // so they keep pointing at the same logical row of content (Excel-style).
+    for (const nc of namedCellMap.current.values()) {
+      if (nc.path !== path || nc.row < insertAt) continue;
+      if (nc.row + 1 > NUM_ROWS - 1) continue;
+      nc.row += 1;
+      registerNamedExpression(nc);
+      const revId = revIdRef.current;
+      if (revId != null) {
+        invoke("save_workbook_named_cell", {
+          revisionId: revId, name: nc.name, sheetPath: nc.path, row: nc.row, col: nc.col,
+        }).catch(() => {/* non-fatal */});
+      }
+    }
+
+    if (lastOccupied >= insertAt) {
+      shiftRowKeyedEntries(cellLinkMap.current.get(path), insertAt, lastOccupied + 1, 1);
+      shiftRowKeyedEntries(cellStyleMap.current.get(path), insertAt, lastOccupied + 1, 1);
+      shiftRowKeyedSet(cellExclusionMap.current.get(path), insertAt, lastOccupied + 1, 1);
+
+      // Remap in-memory sub-sheet caches (bottom-up to avoid collisions).
+      // At Level 1 sub-sheets are "<path>/R{r}"; at Level 2 also "<path>/Q{r}".
+      const lv = levelRef.current;
+      const subPrefixes = lv === 1 ? ["R"] : lv === 2 ? ["R", "Q"] : [];
+      if (subPrefixes.length > 0) {
+        for (let r = lastOccupied; r >= insertAt; r--) {
+          for (const prefix of subPrefixes) {
+            const oldSub = `${path}/${prefix}${r}`;
+            const newSub = `${path}/${prefix}${r + 1}`;
+            // Rename the exact path in every Map cache.
+            function remapMapKey<V>(map: Map<string, V>) {
+              if (map.has(oldSub)) { map.set(newSub, map.get(oldSub)!); map.delete(oldSub); }
+              const subPrefix = `${oldSub}/`;
+              for (const key of Array.from(map.keys())) {
+                if (key.startsWith(subPrefix)) { map.set(newSub + key.slice(oldSub.length), map.get(key)!); map.delete(key); }
+              }
+            }
+            remapMapKey(sheetDataMap.current as Map<string, unknown>);
+            remapMapKey(sheetComputedMap.current as Map<string, unknown>);
+            remapMapKey(cellLinkMap.current);
+            remapMapKey(cellStyleMap.current);
+            remapMapKey(cellExclusionMap.current);
+            // Rename in the "loaded" Set caches.
+            function remapSetKey(set: Set<string>) {
+              if (set.has(oldSub)) { set.add(newSub); set.delete(oldSub); }
+              const subPrefix = `${oldSub}/`;
+              for (const key of Array.from(set)) {
+                if (key.startsWith(subPrefix)) { set.add(newSub + key.slice(oldSub.length)); set.delete(key); }
+              }
+            }
+            remapSetKey(loadedLinkPathsRef.current);
+            remapSetKey(loadedStylePathsRef.current);
+            remapSetKey(loadedExclusionPathsRef.current);
+          }
+        }
+
+        // Persist the path renames to SQLite (bottom-up; fire-and-forget).
+        const revId = revIdRef.current;
+        if (revId != null) {
+          for (let r = lastOccupied; r >= insertAt; r--) {
+            for (const prefix of subPrefixes) {
+              const oldSub = `${path}/${prefix}${r}`;
+              const newSub = `${path}/${prefix}${r + 1}`;
+              invoke("rename_workbook_sheet_subtree", {
+                revisionId: revId, oldPath: oldSub, newPath: newSub,
+              }).catch(() => {/* non-fatal */});
+            }
+          }
+        }
+      }
+    }
+
+    // Regenerate row-relative formula cells at their new positions.
+    deriveLevelFormulas(hot, levelRef.current, isAutoUpdatingRef, sheetKindForPath(path), cellExclusionMap.current.get(path));
+  }
+
+  gridApiImplRef.current = {
+    addRow() {
+      const hot = hotRef.current?.hotInstance;
+      if (!hot) return;
+      const data = captureSourceData(hot);
+      let lastOccupied = -1;
+      for (let r = NUM_ROWS - 1; r >= 0; r--) {
+        if (isLineItemRow(data[r])) { lastOccupied = r; break; }
+      }
+      const targetRow = Math.min(lastOccupied + 1, NUM_ROWS - 1);
+      hot.selectCell(targetRow, COL_DESC);
+      hot.scrollViewportTo(targetRow, COL_DESC, true, true);
+    },
+
+    insertAbove() {
+      const hot = hotRef.current?.hotInstance;
+      if (!hot) return;
+      const selected = getSelectedCells();
+      if (selected.length === 0) return;
+      insertBlankRowAt(hot, curSheetPath(), Math.min(...selected.map(c => c.row)));
+      hot.selectCell(Math.min(...selected.map(c => c.row)), COL_DESC);
+      scheduleSaveRef.current();
+    },
+
+    insertBelow() {
+      const hot = hotRef.current?.hotInstance;
+      if (!hot) return;
+      const selected = getSelectedCells();
+      if (selected.length === 0) return;
+      const insertAt = Math.max(...selected.map(c => c.row)) + 1;
+      if (insertAt >= NUM_ROWS) return;
+      insertBlankRowAt(hot, curSheetPath(), insertAt);
+      hot.selectCell(insertAt, COL_DESC);
+      scheduleSaveRef.current();
+    },
+
+    async exportCsv() {
+      const hot = hotRef.current?.hotInstance;
+      if (!hot) return;
+      const kind = sheetKindForPath(curSheetPath());
+      const cols = kind === "qty" ? QTY_COLUMNS : COLUMNS;
+      const header = cols.map(c => c.label).join(",");
+      const rawData: unknown[][] = hot.getData() as unknown[][];
+      const lines: string[] = rawData
+        .filter(row => row.some(cell => cell != null && cell !== ""))
+        .map(row =>
+          cols.map((_c, i) => {
+            const val = row[i];
+            if (val == null || val === "") return "";
+            const s = String(val);
+            return s.includes(",") || s.includes('"') || s.includes("\n")
+              ? `"${s.replace(/"/g, '""')}"` : s;
+          }).join(",")
+        );
+      const csv = [header, ...lines].join("\r\n");
+      const filePath = await saveDialog({
+        defaultPath: "workbook.csv",
+        filters: [{ name: "CSV", extensions: ["csv"] }],
+      });
+      if (!filePath) return;
+      try {
+        await invoke("write_text_file", { path: filePath, content: csv });
+      } catch (err) {
+        console.error("Export failed:", err);
+      }
+    },
+
+    print() {
+      const hot = hotRef.current?.hotInstance;
+      if (!hot) return;
+      const kind = sheetKindForPath(curSheetPath());
+      const cols = kind === "qty" ? QTY_COLUMNS : COLUMNS;
+      const rawData: unknown[][] = hot.getData() as unknown[][];
+
+      const headerCells = cols.map(c => `<th>${c.letter}:${c.label}</th>`).join("");
+      const dataRows = rawData
+        .filter(row => row.some(cell => cell != null && cell !== ""))
+        .map(row => {
+          const cells = cols.map((_c, i) => {
+            const val = row[i];
+            const s = (val != null && val !== "") ? String(val) : "";
+            return `<td>${s.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</td>`;
+          }).join("");
+          return `<tr>${cells}</tr>`;
+        })
+        .join("");
+
+      const html = `<!DOCTYPE html><html><head><title>Workbook</title><style>
+        body { font-family: Arial, sans-serif; font-size: 11px; margin: 12px; }
+        table { border-collapse: collapse; width: 100%; }
+        th, td { border: 1px solid #bbb; padding: 2px 5px; white-space: nowrap; }
+        th { background: #e8e8e8; font-weight: 600; }
+        td { text-align: right; }
+        td:first-child, td:nth-child(2), td:nth-child(4) { text-align: left; }
+      </style></head><body>
+        <table><thead><tr>${headerCells}</tr></thead><tbody>${dataRows}</tbody></table>
+      </body></html>`;
+
+      const iframe = document.createElement("iframe");
+      iframe.style.cssText = "position:fixed;right:0;bottom:0;width:0;height:0;border:none;";
+      document.body.appendChild(iframe);
+      const doc = iframe.contentDocument ?? iframe.contentWindow?.document;
+      if (!doc) { document.body.removeChild(iframe); return; }
+      doc.open();
+      doc.write(html);
+      doc.close();
+      iframe.contentWindow?.focus();
+      iframe.contentWindow?.print();
+      setTimeout(() => { try { document.body.removeChild(iframe); } catch { /* already gone */ } }, 1000);
+    },
+  };
+
   // ── Load root sheet when active revision changes ───────────────────────
 
   useEffect(() => {
@@ -1346,6 +2009,10 @@ export function WorkbookView() {
     loadedLinkPathsRef.current = new Set();
     cellStyleMap.current = new Map();
     loadedStylePathsRef.current = new Set();
+    cellExclusionMap.current = new Map();
+    loadedExclusionPathsRef.current = new Set();
+    namedCellMap.current = new Map();
+    registeredNamedExprRef.current = new Set();
 
     invoke<string>("load_workbook_sheet", { revisionId: revId, sheetPath: "L1" })
       .then(json => {
@@ -1354,16 +2021,31 @@ export function WorkbookView() {
         catch { data = createEmptyData(); }
         sheetDataMap.current = new Map([["L1", data]]);
         const hot = hotRef.current?.hotInstance;
-        if (hot) loadLevelData(hot, data, 1, isAutoUpdatingRef, "L1");
+        if (hot) loadLevelDataExcl(hot, data, 1, isAutoUpdatingRef, "L1");
         syncSheetLinks("L1");
       })
       .catch(() => {
         const empty = createEmptyData();
         sheetDataMap.current = new Map([["L1", empty]]);
         const hot = hotRef.current?.hotInstance;
-        if (hot) loadLevelData(hot, empty, 1, isAutoUpdatingRef, "L1");
+        if (hot) loadLevelDataExcl(hot, empty, 1, isAutoUpdatingRef, "L1");
         syncSheetLinks("L1");
       });
+
+    // Named cells are workbook-wide (not per-sheet) — load the whole set once per
+    // revision and register each with HyperFormula so they resolve from any level.
+    invoke<string>("load_workbook_named_cells", { revisionId: revId })
+      .then(json => {
+        let entries: NamedCell[];
+        try { entries = JSON.parse(json) as NamedCell[]; } catch { entries = []; }
+        namedCellMap.current = new Map(entries.map(nc => [nc.name, nc]));
+        for (const nc of entries) registerNamedExpression(nc);
+        // If the sheet finished loading before this callback fired, formula cells that
+        // reference these named expressions already rendered with stale/=0 values.
+        // Force a re-render so they pick up the now-correct named expressions.
+        if (entries.length > 0) hotRef.current?.hotInstance?.render();
+      })
+      .catch(() => { /* non-fatal — workbook simply has no named cells yet */ });
   }, [activeRevisionId]);
 
   // Track grid-container resize to drive Handsontable height
@@ -1425,7 +2107,7 @@ export function WorkbookView() {
     const display = (data: (string | null)[][]) => {
       sheetDataMap.current.set(newPath, data);
       const hot2 = hotRef.current?.hotInstance;
-      if (hot2) loadLevelData(hot2, data, newLevel, isAutoUpdatingRef, newPath);
+      if (hot2) loadLevelDataExcl(hot2, data, newLevel, isAutoUpdatingRef, newPath);
       syncSheetLinks(newPath);
     };
 
@@ -1515,14 +2197,19 @@ export function WorkbookView() {
     if (rowInParent !== null) {
       const parentData = sheetDataMap.current.get(parentPath) ?? createEmptyData();
       const lv = levelRef.current;
+      // Skip writing any column the user has excluded from auto-calc on the parent
+      // sheet — e.g. a summary row whose F/G/H carry hand-built formulas must not be
+      // clobbered by the drill-up rollup.
+      const excluded = (col: number) => isCellExcluded(parentPath, rowInParent, col);
 
       if (lv === 2) {
         // Leaving Level 2 → Level 1:
         //   F:Subtotal              = SUM of Level-2 H:Total
         //   J/L/N/P (…-Total)       = SUM of their matching Level-2 columns (pulled through)
         const sumH = sumComputedCol(computed, COL_TOTAL);
-        parentData[rowInParent][COL_SUBTOTAL] = sumH !== null ? String(sumH) : null;
+        if (!excluded(COL_SUBTOTAL)) parentData[rowInParent][COL_SUBTOTAL] = sumH !== null ? String(sumH) : null;
         for (const total of [COL_LAB_TOTAL, COL_MAT_TOTAL, COL_SUB_TOTAL, COL_SUM_TOTAL]) {
+          if (excluded(total)) continue;
           const s = sumComputedCol(computed, total);
           parentData[rowInParent][total] = s !== null ? String(s) : null;
         }
@@ -1534,7 +2221,7 @@ export function WorkbookView() {
         // reference C, so they're recomputed for free by deriveLevelFormulas when
         // the parent (standard Level 2) sheet is redisplayed — nothing else to write.
         const sumH = sumComputedCol(computed, COL_TOTAL);
-        parentData[rowInParent][COL_QTY] = sumH !== null ? String(sumH) : null;
+        if (!excluded(COL_QTY)) parentData[rowInParent][COL_QTY] = sumH !== null ? String(sumH) : null;
         sheetDataMap.current.set(parentPath, parentData);
       } else if (lv === 3) {
         // Leaving Level 3 → Level 2:
@@ -1542,7 +2229,7 @@ export function WorkbookView() {
         //   I/K/M/O (Lab/Mat/Sub/Sum) = SUM of their matching Level-3 columns (pulled through)
         //   J/L/N/P (…-Total)         = formula: pulled-through rate × this row's Quantity (C)
         const sumH = sumComputedCol(computed, COL_TOTAL);
-        parentData[rowInParent][COL_RATE] = sumH !== null ? String(sumH) : null;
+        if (!excluded(COL_RATE)) parentData[rowInParent][COL_RATE] = sumH !== null ? String(sumH) : null;
         const pullThroughCols: Array<[number, number]> = [
           [COL_LAB, COL_LAB_TOTAL],
           [COL_MAT, COL_MAT_TOTAL],
@@ -1551,9 +2238,11 @@ export function WorkbookView() {
         ];
         for (const [src, total] of pullThroughCols) {
           const s = sumComputedCol(computed, src);
-          parentData[rowInParent][src] = s !== null ? String(s) : null;
-          parentData[rowInParent][total] =
-            (s !== null) ? `=${COLUMNS[src].letter}${rowInParent + 1}*C${rowInParent + 1}` : null;
+          if (!excluded(src)) parentData[rowInParent][src] = s !== null ? String(s) : null;
+          if (!excluded(total)) {
+            parentData[rowInParent][total] =
+              (s !== null) ? `=${COLUMNS[src].letter}${rowInParent + 1}*C${rowInParent + 1}` : null;
+          }
         }
         sheetDataMap.current.set(parentPath, parentData);
       }
@@ -1584,7 +2273,7 @@ export function WorkbookView() {
     requestAnimationFrame(() => {
       const parentData = sheetDataMap.current.get(parentPath) ?? createEmptyData();
       const hot2 = hotRef.current?.hotInstance;
-      if (hot2) loadLevelData(hot2, parentData, newLevel, isAutoUpdatingRef, parentPath);
+      if (hot2) loadLevelDataExcl(hot2, parentData, newLevel, isAutoUpdatingRef, parentPath);
       syncSheetLinks(parentPath);
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1637,24 +2326,31 @@ export function WorkbookView() {
 
         // Clone the row so we can override its derived columns without mutating the cache.
         const liveRow = [...(parentSource[rowInParent] ?? [])] as (string | null)[];
+        // Skip live-deriving any column the user has excluded from auto-calc on the
+        // parent sheet — e.g. a summary row whose F/G/H carry hand-built formulas
+        // must keep showing those, not a rolled-up child total, in the breadcrumb.
+        const excluded = (col: number) => isCellExcluded(parentPath, rowInParent, col);
 
         if (curLevel === 2) {
           // Leaving L2 → L1 rollup: F = SUM(child H); J/L/N/P = SUM(child J/L/N/P)
           // (pulled through); G auto-populate; H = F×G
           const sumH = sumComputedCol(childComputed, COL_TOTAL);
           const f = sumH ?? 0;
-          liveRow[COL_SUBTOTAL] = f !== 0 ? String(f) : null;
+          if (!excluded(COL_SUBTOTAL)) liveRow[COL_SUBTOTAL] = f !== 0 ? String(f) : null;
 
           for (const total of [COL_LAB_TOTAL, COL_MAT_TOTAL, COL_SUB_TOTAL, COL_SUM_TOTAL]) {
+            if (excluded(total)) continue;
             const s = sumComputedCol(childComputed, total);
             liveRow[total] = s !== null ? String(s) : null;
           }
 
-          let gRaw: string | null = liveRow[COL_FACTOR];
-          if (f > 0 && (gRaw == null || gRaw === "")) gRaw = "1";
-          liveRow[COL_FACTOR] = gRaw;
-          const g = toNum(gRaw);
-          liveRow[COL_TOTAL] = (f !== 0 || g !== 0) ? String(f * g) : null;
+          if (!excluded(COL_FACTOR) || !excluded(COL_TOTAL)) {
+            let gRaw: string | null = liveRow[COL_FACTOR];
+            if (f > 0 && (gRaw == null || gRaw === "")) gRaw = "1";
+            if (!excluded(COL_FACTOR)) liveRow[COL_FACTOR] = gRaw;
+            const g = toNum(gRaw);
+            if (!excluded(COL_TOTAL)) liveRow[COL_TOTAL] = (f !== 0 || g !== 0) ? String(f * g) : null;
+          }
         } else if (curLevel === 3 && isQtyBuildupPath(childPath)) {
           // Leaving a Quantity Build-up sheet → L2 rollup: C:Quantity = SUM(child
           // H:Quantity); I/K/M/O are untouched (they belong to the rate-buildup
@@ -1662,7 +2358,7 @@ export function WorkbookView() {
           // be re-derived; then F = E×C, G auto-populate, H = F×G for that L2 row.
           const sumH = sumComputedCol(childComputed, COL_TOTAL);
           const cVal = sumH ?? 0;
-          liveRow[COL_QTY] = sumH !== null ? String(sumH) : null;
+          if (!excluded(COL_QTY)) liveRow[COL_QTY] = sumH !== null ? String(sumH) : null;
 
           for (const [src, total] of [
             [COL_LAB, COL_LAB_TOTAL],
@@ -1670,26 +2366,29 @@ export function WorkbookView() {
             [COL_SUB, COL_SUB_TOTAL],
             [COL_SUM, COL_SUM_TOTAL],
           ] as Array<[number, number]>) {
+            if (excluded(total)) continue;
             const srcRaw = liveRow[src];
             liveRow[total] = (srcRaw != null && srcRaw !== "") ? String(toNum(srcRaw) * cVal) : null;
           }
 
           const e = toNum(liveRow[COL_RATE]);
           const f = e * cVal;
-          liveRow[COL_SUBTOTAL] = (e !== 0 || cVal !== 0) ? String(f) : null;
+          if (!excluded(COL_SUBTOTAL)) liveRow[COL_SUBTOTAL] = (e !== 0 || cVal !== 0) ? String(f) : null;
 
-          let gRaw: string | null = liveRow[COL_FACTOR];
-          if (f > 0 && (gRaw == null || gRaw === "")) gRaw = "1";
-          liveRow[COL_FACTOR] = gRaw;
-          const g = toNum(gRaw);
-          liveRow[COL_TOTAL] = (f !== 0 || g !== 0) ? String(f * g) : null;
+          if (!excluded(COL_FACTOR) || !excluded(COL_TOTAL)) {
+            let gRaw: string | null = liveRow[COL_FACTOR];
+            if (f > 0 && (gRaw == null || gRaw === "")) gRaw = "1";
+            if (!excluded(COL_FACTOR)) liveRow[COL_FACTOR] = gRaw;
+            const g = toNum(gRaw);
+            if (!excluded(COL_TOTAL)) liveRow[COL_TOTAL] = (f !== 0 || g !== 0) ? String(f * g) : null;
+          }
         } else if (curLevel === 3) {
           // Leaving L3 → L2 rollup: E = SUM(child H); I/K/M/O = SUM(child I/K/M/O) (pulled
           // through); J/L/N/P = pulled-through value × C; then F = E×C, G auto-populate,
           // H = F×G for that L2 row
           const sumH = sumComputedCol(childComputed, COL_TOTAL);
           const e = sumH ?? 0;
-          liveRow[COL_RATE] = sumH !== null ? String(sumH) : null;
+          if (!excluded(COL_RATE)) liveRow[COL_RATE] = sumH !== null ? String(sumH) : null;
 
           const cValForTotals = toNum(liveRow[COL_QTY]);
           for (const [src, total] of [
@@ -1699,19 +2398,21 @@ export function WorkbookView() {
             [COL_SUM, COL_SUM_TOTAL],
           ] as Array<[number, number]>) {
             const s = sumComputedCol(childComputed, src);
-            liveRow[src] = s !== null ? String(s) : null;
-            liveRow[total] = s !== null ? String(s * cValForTotals) : null;
+            if (!excluded(src)) liveRow[src] = s !== null ? String(s) : null;
+            if (!excluded(total)) liveRow[total] = s !== null ? String(s * cValForTotals) : null;
           }
 
           const cVal = toNum(liveRow[COL_QTY]);
           const f = e * cVal;
-          liveRow[COL_SUBTOTAL] = (e !== 0 || cVal !== 0) ? String(f) : null;
+          if (!excluded(COL_SUBTOTAL)) liveRow[COL_SUBTOTAL] = (e !== 0 || cVal !== 0) ? String(f) : null;
 
-          let gRaw: string | null = liveRow[COL_FACTOR];
-          if (f > 0 && (gRaw == null || gRaw === "")) gRaw = "1";
-          liveRow[COL_FACTOR] = gRaw;
-          const g = toNum(gRaw);
-          liveRow[COL_TOTAL] = (f !== 0 || g !== 0) ? String(f * g) : null;
+          if (!excluded(COL_FACTOR) || !excluded(COL_TOTAL)) {
+            let gRaw: string | null = liveRow[COL_FACTOR];
+            if (f > 0 && (gRaw == null || gRaw === "")) gRaw = "1";
+            if (!excluded(COL_FACTOR)) liveRow[COL_FACTOR] = gRaw;
+            const g = toNum(gRaw);
+            if (!excluded(COL_TOTAL)) liveRow[COL_TOTAL] = (f !== 0 || g !== 0) ? String(f * g) : null;
+          }
         }
 
         // Refresh this row's breadcrumb entry from the live-derived row
@@ -1822,6 +2523,12 @@ export function WorkbookView() {
     for (const key of Array.from(loadedStylePathsRef.current)) {
       if (key === path || key.startsWith(prefix)) loadedStylePathsRef.current.delete(key);
     }
+    for (const key of Array.from(cellExclusionMap.current.keys())) {
+      if (key === path || key.startsWith(prefix)) cellExclusionMap.current.delete(key);
+    }
+    for (const key of Array.from(loadedExclusionPathsRef.current)) {
+      if (key === path || key.startsWith(prefix)) loadedExclusionPathsRef.current.delete(key);
+    }
   }
 
   /** Reset the whole view back to a blank Level 1 sheet (in-memory only). */
@@ -1830,8 +2537,12 @@ export function WorkbookView() {
    * breadcrumb ancestry. Used by template-edit mode to jump between the master
    * Level 1 (takeoff) and master Level 2 (rate build-up) sheets — these are
    * standalone "roots" with no real parent rows, unlike normal drill-down targets.
+   *
+   * `selectAfter` (optional) selects and scrolls to a cell once the target sheet's
+   * data has loaded and rendered — used by the Named Cells manager's "Go to" action,
+   * which needs the destination cell highlighted, not just the sheet displayed.
    */
-  function jumpToSheet(path: string, level: Level): void {
+  function jumpToSheet(path: string, level: Level, selectAfter?: { row: number; col: number }): void {
     const hot = hotRef.current?.hotInstance;
     if (saveTimerRef.current) { clearTimeout(saveTimerRef.current); saveTimerRef.current = null; }
 
@@ -1857,7 +2568,13 @@ export function WorkbookView() {
       sheetDataMap.current.set(path, data);
       requestAnimationFrame(() => {
         const hot2 = hotRef.current?.hotInstance;
-        if (hot2) loadLevelData(hot2, data, level, isAutoUpdatingRef, path);
+        if (hot2) {
+          loadLevelDataExcl(hot2, data, level, isAutoUpdatingRef, path);
+          if (selectAfter) {
+            hot2.selectCell(selectAfter.row, selectAfter.col);
+            hot2.scrollViewportTo(selectAfter.row, selectAfter.col, true, true);
+          }
+        }
         syncSheetLinks(path);
       });
     };
@@ -1892,7 +2609,7 @@ export function WorkbookView() {
     setActiveCellValue("");
     requestAnimationFrame(() => {
       const hot = hotRef.current?.hotInstance;
-      if (hot) loadLevelData(hot, sheetDataMap.current.get("L1") ?? createEmptyData(), 1, isAutoUpdatingRef, "L1");
+      if (hot) loadLevelDataExcl(hot, sheetDataMap.current.get("L1") ?? createEmptyData(), 1, isAutoUpdatingRef, "L1");
       syncSheetLinks("L1");
     });
   }
@@ -1945,6 +2662,8 @@ export function WorkbookView() {
       loadedLinkPathsRef.current = new Set();
       cellStyleMap.current = new Map();
       loadedStylePathsRef.current = new Set();
+      cellExclusionMap.current = new Map();
+      loadedExclusionPathsRef.current = new Set();
       resetToRootSheet();
       showCleanupMessage("Workbook cleared — all sheets reset to blank.");
     } catch (e) {
@@ -1994,7 +2713,16 @@ export function WorkbookView() {
     // Quantity cells imported from a dimension group (and their Unit cell) are shown
     // in green so the user can see at a glance which figures are live CostX imports.
     const isLinked = (col === COL_QTY || col === COL_UNIT) && !!getCellLink(curSheetPath(), row, COL_QTY);
-    td.style.color = isLinked ? LINK_FONT_COLOUR : (isDrillColumn(levelRef.current, col) ? DRILL_FONT_COLOUR : "");
+    const excluded = isCellExcluded(curSheetPath(), row, col);
+    // An excluded drill column reverts from drill-blue to plain black — the visual
+    // cue that exclusion has also switched off its drill-down behaviour (see
+    // beforeOnCellMouseDown).
+    const isDrill = isDrillColumn(levelRef.current, col) && !excluded;
+    td.style.color = isLinked ? LINK_FONT_COLOUR : (isDrill ? DRILL_FONT_COLOUR : "");
+
+    // Cells excluded from auto-calc carry a faint dashed top border so the user can
+    // see at a glance which F/G/H cells are hand-built and won't be auto-derived.
+    td.style.borderTop = excluded ? `1px dashed ${EXCLUDED_BORDER_COLOUR}` : "";
   }
 
   // ── Handsontable settings (created once; hooks read from refs) ─────────
@@ -2022,7 +2750,7 @@ export function WorkbookView() {
       sheetName: "Sheet1",
     },
 
-    afterSelection(row: number, col: number) {
+    afterSelection(row: number, col: number, row2: number, col2: number) {
       if (row < 0 || col < 0) return;
       lastSelectedCellRef.current = { row, col };
       const letter = COLUMNS[col]?.letter ?? "A";
@@ -2034,6 +2762,29 @@ export function WorkbookView() {
       setActiveCellValue(val != null ? String(val) : "");
       setCompletions([]);
       syncFormatSnapshot();
+
+      // Compute Excel-style status bar stats over the selected range
+      if (hot) {
+        const fromRow = Math.min(row, row2);
+        const toRow   = Math.max(row, row2);
+        const fromCol = Math.min(col, col2);
+        const toCol   = Math.max(col, col2);
+        let numCount = 0;
+        let sum = 0;
+        for (let r = fromRow; r <= toRow; r++) {
+          for (let c = fromCol; c <= toCol; c++) {
+            const v = hot.getDataAtCell(r, c);
+            const n = typeof v === "number" ? v : (v != null && v !== "" ? Number(v) : NaN);
+            if (isFinite(n)) { sum += n; numCount++; }
+          }
+        }
+        const cellCount = (toRow - fromRow + 1) * (toCol - fromCol + 1);
+        if (numCount > 0 && cellCount > 1) {
+          setSelectionStats({ count: numCount, sum, average: sum / numCount });
+        } else {
+          setSelectionStats(null);
+        }
+      }
     },
 
     afterChange(changes: Handsontable.CellChange[] | null) {
@@ -2049,11 +2800,17 @@ export function WorkbookView() {
       // Debounced auto-save to SQLite
       scheduleSaveRef.current();
 
+      // Named cells bound to a cell on the active sheet are registered as *live*
+      // HyperFormula references (see namedExprFormula), so edits to a bound cell
+      // recompute and repaint their dependents natively — no manual sync needed here.
+
       // ── Level 2/3 auto-derivation: F=E×C, G auto-populate=1, H=F×G ─────
       // Skipped when isAutoUpdatingRef is true — i.e. for the nested afterChange
       // calls fired by our own setDataAtCell writes below (prevents recursion).
       if (!isAutoUpdatingRef.current) {
         const kind = sheetKindForPath(curSheetPath());
+        const excludedSet = cellExclusionMap.current.get(curSheetPath());
+        const isExcluded = (r: number, c: number) => excludedSet != null && excludedSet.has(styleKey(r, c));
 
         if (kind === "qty") {
           // ── Quantity Build-up auto-derivation: H = C×D×E×F×G, G auto-populate=1 ──
@@ -2073,12 +2830,14 @@ export function WorkbookView() {
                 const vals = [COL_COUNT, COL_LENGTH, COL_WIDTH, COL_HEIGHT].map(c => hot.getDataAtCell(r, c));
                 if (!vals.some(v => v != null && v !== "")) continue;
 
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                const gSrc = (hot as any).getSourceDataAtCell(r, COL_FACTOR);
-                if (gSrc == null || String(gSrc) === "") {
-                  pass.push([r, COL_FACTOR, "1"]);
+                if (!isExcluded(r, COL_FACTOR)) {
+                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                  const gSrc = (hot as any).getSourceDataAtCell(r, COL_FACTOR);
+                  if (gSrc == null || String(gSrc) === "") {
+                    pass.push([r, COL_FACTOR, "1"]);
+                  }
                 }
-                pass.push([r, COL_TOTAL, qtyTotalFormula(r)]);
+                if (!isExcluded(r, COL_TOTAL)) pass.push([r, COL_TOTAL, qtyTotalFormula(r)]);
               }
               // eslint-disable-next-line @typescript-eslint/no-explicit-any
               if (pass.length) hot.setDataAtCell(pass as any);
@@ -2108,6 +2867,7 @@ export function WorkbookView() {
               const pass1: Array<[number, number, string]> = [];
               if (levelRef.current >= 2) {
                 for (const r of cOrERows) {
+                  if (isExcluded(r, COL_SUBTOTAL)) continue;
                   pass1.push([r, COL_SUBTOTAL, `=E${r + 1}*C${r + 1}`]);
                 }
               }
@@ -2120,13 +2880,15 @@ export function WorkbookView() {
                 const fRaw = hot.getDataAtCell(r, COL_SUBTOTAL);
                 const f = typeof fRaw === "number" ? fRaw : parseFloat(String(fRaw ?? "")) || 0;
 
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                const gSrc = (hot as any).getSourceDataAtCell(r, COL_FACTOR);
-                if (f > 0 && (gSrc == null || String(gSrc) === "")) {
-                  pass2.push([r, COL_FACTOR, "1"]);
+                if (!isExcluded(r, COL_FACTOR)) {
+                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                  const gSrc = (hot as any).getSourceDataAtCell(r, COL_FACTOR);
+                  if (f > 0 && (gSrc == null || String(gSrc) === "")) {
+                    pass2.push([r, COL_FACTOR, "1"]);
+                  }
                 }
 
-                pass2.push([r, COL_TOTAL, `=F${r + 1}*G${r + 1}`]);
+                if (!isExcluded(r, COL_TOTAL)) pass2.push([r, COL_TOTAL, `=F${r + 1}*G${r + 1}`]);
               }
               // eslint-disable-next-line @typescript-eslint/no-explicit-any
               if (pass2.length) hot.setDataAtCell(pass2 as any);
@@ -2147,13 +2909,14 @@ export function WorkbookView() {
                   if (row < 0 || col < 0) continue;
                   if (col === COL_QTY) {
                     for (const [src, total] of pullThroughCols) {
+                      if (isExcluded(row, total)) continue;
                       pass3.push([row, total, `=${COLUMNS[src].letter}${row + 1}*C${row + 1}`]);
                     }
                   } else {
                     const match = pullThroughCols.find(([src]) => src === col);
                     if (match) {
                       const [src, total] = match;
-                      pass3.push([row, total, `=${COLUMNS[src].letter}${row + 1}*C${row + 1}`]);
+                      if (!isExcluded(row, total)) pass3.push([row, total, `=${COLUMNS[src].letter}${row + 1}*C${row + 1}`]);
                     }
                   }
                 }
@@ -2186,6 +2949,11 @@ export function WorkbookView() {
       const isDrill =
         (lv === 1 && coords.col === COL_SUBTOTAL) ||
         (lv === 2 && (coords.col === COL_RATE || coords.col === COL_QTY));
+      // A cell excluded from auto-calc has been "switched off" — including its
+      // drill-down behaviour, since drilling into it would create/seed a sub-sheet
+      // whose rollup the exclusion is specifically meant to suppress. The renderer
+      // shows it in black (not drill-blue) as the visual cue that it no longer drills.
+      if (isDrill && isCellExcluded(curSheetPath(), coords.row, coords.col)) return;
       if (isDrill) {
         event.stopImmediatePropagation();
         // The first click of the double-click already selected (and may have begun
@@ -2505,46 +3273,6 @@ export function WorkbookView() {
           />
         </div>
 
-        {/* Separator dots */}
-        <div style={tbCell({ color: "#aaa", letterSpacing: 2, borderLeft: TB_BORDER })}>···</div>
-
-        {/* "Total =" label */}
-        <div style={tbCell({ color: "#555", borderLeft: TB_BORDER })}>Total =</div>
-
-        {/* Total value — placeholder (future milestone: named cell) */}
-        <div style={tbCell({ width: 110, color: "#333", fontWeight: 500, justifyContent: "flex-end" })}>
-          0
-        </div>
-
-        {/* Workbook maintenance: clean orphaned build-up sheets / clear whole workbook */}
-        <button
-          type="button"
-          title="Remove orphaned build-up sheets left behind by deleted line items"
-          onClick={() => setConfirmAction("clean")}
-          disabled={cleanupBusy}
-          style={{
-            display: "flex", alignItems: "center", gap: 4, height: "100%", padding: "0 10px",
-            border: "none", borderLeft: TB_BORDER, background: "transparent",
-            color: cleanupBusy ? "#aaa" : "#555", cursor: cleanupBusy ? "default" : "pointer", fontSize: 11,
-          }}
-        >
-          <span className="material-symbols-outlined" style={{ fontSize: 16 }}>cleaning_services</span>
-          Clean orphaned sheets
-        </button>
-        <button
-          type="button"
-          title="Delete all sheet data in this workbook revision and start over"
-          onClick={() => setConfirmAction("clear")}
-          disabled={cleanupBusy}
-          style={{
-            display: "flex", alignItems: "center", gap: 4, height: "100%", padding: "0 10px",
-            border: "none", borderLeft: TB_BORDER, borderRight: "none", background: "transparent",
-            color: cleanupBusy ? "#aaa" : "#555", cursor: cleanupBusy ? "default" : "pointer", fontSize: 11,
-          }}
-        >
-          <span className="material-symbols-outlined" style={{ fontSize: 16 }}>delete_sweep</span>
-          Clear workbook
-        </button>
       </div>
 
       {/* Transient status message from a maintenance operation */}
@@ -2595,6 +3323,34 @@ export function WorkbookView() {
         <GridCore hotRef={hotRef} settings={hotSettings} />
       </div>
 
+      {/* ── Excel-style status bar ── */}
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          height: 22,
+          borderTop: "1px solid #d0d0d0",
+          background: "#f0f0f0",
+          flexShrink: 0,
+          paddingRight: 12,
+          justifyContent: "flex-end",
+          gap: 20,
+          fontSize: 11,
+          color: "#333",
+          userSelect: "none",
+        }}
+      >
+        {selectionStats ? (
+          <>
+            <span>Average: {selectionStats.average.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+            <span>Count: {selectionStats.count}</span>
+            <span>Sum: {selectionStats.sum.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+          </>
+        ) : (
+          <span style={{ color: "#aaa" }}></span>
+        )}
+      </div>
+
       {templateManagerOpen && <TemplateManagerDialog />}
 
       {importPrompt && (
@@ -2610,17 +3366,49 @@ export function WorkbookView() {
         />
       )}
 
-      {linkContextMenu && (
+      {gridContextMenu && (
         <ContextMenu
-          x={linkContextMenu.x}
-          y={linkContextMenu.y}
-          items={[
-            {
-              label: "Show dimension group",
-              action: () => { void goToDimensionGroup(linkContextMenu.link.groupId); },
-            },
-          ]}
-          onClose={() => setLinkContextMenu(null)}
+          x={gridContextMenu.x}
+          y={gridContextMenu.y}
+          items={gridContextMenu.items}
+          onClose={() => setGridContextMenu(null)}
+        />
+      )}
+
+      {namedCellDialog && (
+        <TextInputDialog
+          title="New Named Cell"
+          label={`Name for ${cellRefLabel(namedCellDialog.row, namedCellDialog.col)} — usable in formulas at any level of this workbook`}
+          initialValue=""
+          confirmLabel="Create"
+          onCancel={() => setNamedCellDialog(null)}
+          onConfirm={(value) => {
+            const name = value.trim();
+            const dialog = namedCellDialog;
+            setNamedCellDialog(null);
+            if (!dialog) return;
+            if (!isValidNamedCellName(name)) {
+              window.alert(
+                `"${name}" isn't a valid name. Names must start with a letter or underscore, ` +
+                `contain only letters, digits, underscores or periods, and must not look like a cell reference (e.g. A1).`,
+              );
+              return;
+            }
+            void defineNamedCell(name, curSheetPath(), dialog.row, dialog.col);
+          }}
+        />
+      )}
+
+      {namedCellsManagerOpen && (
+        <NamedCellsManagerDialog
+          entries={Array.from(namedCellMap.current.values())
+            .map((nc): NamedCellEntry => ({ name: nc.name, path: nc.path, ref: cellRefLabel(nc.row, nc.col) }))
+            .sort((a, b) => a.name.localeCompare(b.name))}
+          isValidName={isValidNamedCellName}
+          onClose={closeNamedCellsManager}
+          onGoTo={goToNamedCell}
+          onRename={(oldName, newName) => void renameNamedCell(oldName, newName)}
+          onDelete={(name) => void removeNamedCell(name)}
         />
       )}
     </div>

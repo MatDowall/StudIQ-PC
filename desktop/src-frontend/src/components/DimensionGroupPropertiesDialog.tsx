@@ -21,6 +21,7 @@ const MEASUREMENT_TYPES = [
   { value: "length", label: "Length" },
   { value: "area", label: "Area" },
   { value: "timber_framing", label: "Timber Framing" },
+  { value: "array", label: "Array" },
 ] as const;
 const LINE_STYLES = [
   { value: "solid", label: "Solid" },
@@ -42,11 +43,13 @@ const DISPLAYS_BY_TYPE: Record<string, { value: string; label: string }[]> = {
   ],
   area: [
     { value: "area", label: "Area" },
+    { value: "perimeter", label: "Perimeter" },
     { value: "wall_area", label: "Wall Area" },
     { value: "volume", label: "Volume" },
     { value: "weight", label: "Weight" },
   ],
   timber_framing: [{ value: "length", label: "Timber (lineal m)" }],
+  array: [{ value: "length", label: "Length" }],
 };
 
 function Field({ label, children }: { label: string; children: ReactNode }) {
@@ -109,6 +112,7 @@ export function DimensionGroupPropertiesDialog({
   const [dwangsOn, setDwangsOn] = useState(initialFraming.dwangsOn);
 
   const isFraming = measurementType === "timber_framing";
+  const isArray = measurementType === "array";
   const displayOptions = DISPLAYS_BY_TYPE[measurementType] ?? DISPLAYS_BY_TYPE.length;
 
   function changeMeasurementType(next: string) {
@@ -145,8 +149,8 @@ export function DimensionGroupPropertiesDialog({
     onConfirm({
       node_id: initial.node_id,
       measurement_type: measurementType,
-      // Framing always derives lineal metres → display as length.
-      default_display: isFraming ? "length" : defaultDisplay,
+      // Framing and array always display as length.
+      default_display: (isFraming || isArray) ? "length" : defaultDisplay,
       default_multiplier: parseNumber(multiplier, 1),
       default_width: parseNumber(width, 0),
       default_height: parseNumber(height, 0),
@@ -194,26 +198,30 @@ export function DimensionGroupPropertiesDialog({
           </Field>
           {!isFraming ? (
             <>
-              <Field label="Default Display">
-                <select value={defaultDisplay} onChange={(e) => setDefaultDisplay(e.target.value)} style={{ ...inputStyle, flex: 1 }}>
-                  {displayOptions.map((option) => (
-                    <option key={option.value} value={option.value}>
-                      {option.label}
-                    </option>
-                  ))}
-                </select>
-              </Field>
+              {!isArray ? (
+                <Field label="Default Display">
+                  <select value={defaultDisplay} onChange={(e) => setDefaultDisplay(e.target.value)} style={{ ...inputStyle, flex: 1 }}>
+                    {displayOptions.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+              ) : null}
               <Field label="Default Multiplier">
                 <input type="number" value={multiplier} onChange={(e) => setMultiplier(e.target.value)} style={{ ...inputStyle, flex: 1 }} />
               </Field>
-              <Field label="Default Width">
-                <input type="number" value={width} onChange={(e) => setWidth(e.target.value)} style={{ ...inputStyle, flex: 1 }} />
+              <Field label={isArray ? "Default Spacing" : "Default Width"}>
+                <input type="number" value={width} onChange={(e) => setWidth(e.target.value)} style={{ ...inputStyle, flex: 1 }} title={isArray ? "Centre-to-centre spacing between array members (metres)" : undefined} />
                 <span style={{ color: theme.text.secondary, fontSize: 12 }}>m</span>
               </Field>
-              <Field label="Default Height">
-                <input type="number" value={height} onChange={(e) => setHeight(e.target.value)} style={{ ...inputStyle, flex: 1 }} />
-                <span style={{ color: theme.text.secondary, fontSize: 12 }}>m</span>
-              </Field>
+              {!isArray ? (
+                <Field label="Default Height">
+                  <input type="number" value={height} onChange={(e) => setHeight(e.target.value)} style={{ ...inputStyle, flex: 1 }} />
+                  <span style={{ color: theme.text.secondary, fontSize: 12 }}>m</span>
+                </Field>
+              ) : null}
             </>
           ) : (
             <>

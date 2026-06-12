@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import { useAppStore } from "../store/appStore";
 import { theme } from "../theme";
 import { ConfirmDialog } from "./ConfirmDialog";
@@ -13,6 +14,8 @@ export function TemplateManagerDialog() {
   const renameTemplate = useAppStore((s) => s.renameTemplate);
   const updateTemplateDescription = useAppStore((s) => s.updateTemplateDescription);
   const deleteTemplate = useAppStore((s) => s.deleteTemplate);
+  const exportTemplate = useAppStore((s) => s.exportTemplate);
+  const importTemplate = useAppStore((s) => s.importTemplate);
   const enterTemplateEdit = useAppStore((s) => s.enterTemplateEdit);
 
   const [selectedId, setSelectedId] = useState<number | null>(null);
@@ -20,6 +23,7 @@ export function TemplateManagerDialog() {
   const [creating, setCreating] = useState(false);
   const [renaming, setRenaming] = useState(false);
   const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   const selected = templates.find((t) => t.id === selectedId) ?? null;
 
@@ -38,6 +42,35 @@ export function TemplateManagerDialog() {
   function handleSaveDescription() {
     if (selected && description.trim() !== (selected.description ?? "")) {
       void updateTemplateDescription(selected.id, description);
+    }
+  }
+
+  async function handleExport() {
+    if (!selected) return;
+    setError(null);
+    const destPath = await save({
+      defaultPath: `${selected.name}.sqtemplate`,
+      filters: [{ name: "StudIQ Workbook Template", extensions: ["sqtemplate"] }],
+    });
+    if (!destPath) return;
+    try {
+      await exportTemplate(selected.id, destPath);
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
+  async function handleImport() {
+    setError(null);
+    const srcPath = await open({
+      filters: [{ name: "StudIQ Workbook Template", extensions: ["sqtemplate"] }],
+      multiple: false,
+    });
+    if (!srcPath || typeof srcPath !== "string") return;
+    try {
+      await importTemplate(srcPath);
+    } catch (err) {
+      setError(String(err));
     }
   }
 
@@ -136,10 +169,31 @@ export function TemplateManagerDialog() {
                   border: `1px solid ${theme.border.divider}`,
                   cursor: "pointer",
                   fontSize: 12,
+                  marginBottom: 6,
                 }}
               >
                 <span className="material-symbols-outlined" style={{ fontSize: 16 }}>add</span>
                 New Template
+              </button>
+              <button
+                onClick={() => void handleImport()}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  gap: 4,
+                  width: "100%",
+                  height: 28,
+                  padding: "0 12px",
+                  background: theme.bg.input,
+                  color: theme.text.primary,
+                  border: `1px solid ${theme.border.divider}`,
+                  cursor: "pointer",
+                  fontSize: 12,
+                }}
+              >
+                <span className="material-symbols-outlined" style={{ fontSize: 16 }}>upload</span>
+                Import...
               </button>
             </div>
 
@@ -151,6 +205,18 @@ export function TemplateManagerDialog() {
                     <div style={{ flex: 1, fontSize: 14, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                       {selected.name}
                     </div>
+                    <button
+                      title="Export"
+                      onClick={() => void handleExport()}
+                      style={{
+                        display: "flex", alignItems: "center", justifyContent: "center",
+                        width: 28, height: 28, padding: 0,
+                        background: theme.bg.input, color: theme.text.primary,
+                        border: `1px solid ${theme.border.divider}`, cursor: "pointer",
+                      }}
+                    >
+                      <span className="material-symbols-outlined" style={{ fontSize: 16 }}>download</span>
+                    </button>
                     <button
                       title="Rename"
                       onClick={() => setRenaming(true)}
@@ -222,6 +288,12 @@ export function TemplateManagerDialog() {
               )}
             </div>
           </div>
+
+          {error && (
+            <div style={{ padding: "0 12px 8px", color: theme.danger, fontSize: 12 }}>
+              {error}
+            </div>
+          )}
 
           <div
             style={{

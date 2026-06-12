@@ -57,15 +57,222 @@ export function polygonAreaPts(points: PagePoint[]): number {
   return Math.abs(sum) / 2;
 }
 
+/** Parsed array metadata from framing_json for an array-type measurement. */
+export interface ArrayMeta {
+  extraMembers: number;
+  spacingPts: number;
+  direction: number;
+  trims: ArrayTrim[];
+}
+
+/** A straight cut line: members are clipped to the half-plane containing (keepX, keepY). */
+export interface LineTrim {
+  kind?: "line"; // absent = "line", for backward compatibility with trims saved before box trim existed
+  x1: number; y1: number;
+  x2: number; y2: number;
+  keepX: number; keepY: number;
+}
+
+/** A closed polygon: members are clipped to whichever side (inside/outside) contains (keepX, keepY). */
+export interface BoxTrim {
+  kind: "box";
+  points: PagePoint[];
+  keepX: number; keepY: number;
+}
+
+export type ArrayTrim = LineTrim | BoxTrim;
+
+export function parseArrayMeta(json: string | null): ArrayMeta {
+  const defaults: ArrayMeta = { extraMembers: 0, spacingPts: 0, direction: 1, trims: [] };
+  if (!json) return defaults;
+  try {
+    const parsed = JSON.parse(json);
+    if (parsed?.type !== "array") return defaults;
+    return {
+      extraMembers: typeof parsed.extraMembers === "number" ? parsed.extraMembers : 0,
+      spacingPts: typeof parsed.spacingPts === "number" ? parsed.spacingPts : 0,
+      direction: parsed.direction === -1 ? -1 : 1,
+      trims: Array.isArray(parsed.trims) ? parsed.trims : [],
+    };
+  } catch {
+    return defaults;
+  }
+}
+
+export function serializeArrayMeta(meta: ArrayMeta): string {
+  return JSON.stringify({ type: "array", ...meta });
+}
+
+// --- Array trim geometry helpers (mirrors ViewerCanvas but needed for quantity derivation) ---
+
+function _sideOfLine(px: number, py: number, lx1: number, ly1: number, lx2: number, ly2: number): number {
+  return (lx2 - lx1) * (py - ly1) - (ly2 - ly1) * (px - lx1);
+}
+
+/** Even-odd point-in-polygon test. */
+function _pointInPolygon(pt: PagePoint, poly: PagePoint[]): boolean {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const xi = poly[i].x, yi = poly[i].y;
+    const xj = poly[j].x, yj = poly[j].y;
+    const intersect = yi > pt.y !== yj > pt.y && pt.x < ((xj - xi) * (pt.y - yi)) / (yj - yi) + xi;
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
+/** Parameter values t in (0,1) where segment AB crosses an edge of poly. */
+function _segmentPolygonCrossings(seg: [PagePoint, PagePoint], poly: PagePoint[]): number[] {
+  const [a, b] = seg;
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const ts: number[] = [];
+  for (let i = 0; i < poly.length; i += 1) {
+    const c = poly[i];
+    const d = poly[(i + 1) % poly.length];
+    const ex = d.x - c.x;
+    const ey = d.y - c.y;
+    const denom = dx * ey - dy * ex;
+    if (Math.abs(denom) < 1e-12) continue;
+    const t = ((c.x - a.x) * ey - (c.y - a.y) * ex) / denom;
+    const u = ((c.x - a.x) * dy - (c.y - a.y) * dx) / denom;
+    if (t > 1e-9 && t < 1 - 1e-9 && u >= 0 && u <= 1) ts.push(t);
+  }
+  return ts;
+}
+
+/** Clip a segment to the inside or outside of a polygon, per trim.keepX/keepY. May yield 0..n pieces. */
+function _clipSegmentToBox(seg: [PagePoint, PagePoint], trim: BoxTrim): [PagePoint, PagePoint][] {
+  const poly = trim.points;
+  if (poly.length < 3) return [seg];
+  const keepInside = _pointInPolygon({ x: trim.keepX, y: trim.keepY }, poly);
+  const [a, b] = seg;
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  if (dx * dx + dy * dy < 1e-12) {
+    return _pointInPolygon(a, poly) === keepInside ? [seg] : [];
+  }
+  const ts = _segmentPolygonCrossings(seg, poly).sort((x, y) => x - y);
+  const breakpoints = [0, ...ts, 1];
+  const result: [PagePoint, PagePoint][] = [];
+  for (let i = 0; i < breakpoints.length - 1; i += 1) {
+    const t0 = breakpoints[i];
+    const t1 = breakpoints[i + 1];
+    if (t1 - t0 < 1e-9) continue;
+    const tm = (t0 + t1) / 2;
+    const inside = _pointInPolygon({ x: a.x + dx * tm, y: a.y + dy * tm }, poly);
+    if (inside === keepInside) {
+      result.push([
+        { x: a.x + dx * t0, y: a.y + dy * t0 },
+        { x: a.x + dx * t1, y: a.y + dy * t1 },
+      ]);
+    }
+  }
+  return result;
+}
+
+/** Clip a segment to the half-plane (line trim) or inside/outside (box trim). May yield 0..n pieces. */
+function _clipSegmentToTrim(seg: [PagePoint, PagePoint], trim: ArrayTrim): [PagePoint, PagePoint][] {
+  if (trim.kind === "box") return _clipSegmentToBox(seg, trim);
+  const { x1, y1, x2, y2, keepX, keepY } = trim;
+  // Negate to match the sign convention in clipSegmentToSide (ViewerCanvas).
+  const keepSign = -Math.sign(_sideOfLine(keepX, keepY, x1, y1, x2, y2));
+  if (keepSign === 0) return [seg];
+  const dA = _sideOfLine(seg[0].x, seg[0].y, x1, y1, x2, y2);
+  const dB = _sideOfLine(seg[1].x, seg[1].y, x1, y1, x2, y2);
+  const aKept = Math.sign(dA) === 0 || Math.sign(dA) === keepSign;
+  const bKept = Math.sign(dB) === 0 || Math.sign(dB) === keepSign;
+  if (aKept && bKept) return [seg];
+  if (!aKept && !bKept) return [];
+  const denom = dA - dB;
+  if (Math.abs(denom) < 1e-12) return aKept ? [seg] : [];
+  const t = Math.max(0, Math.min(1, dA / denom));
+  const ix = seg[0].x + t * (seg[1].x - seg[0].x);
+  const iy = seg[0].y + t * (seg[1].y - seg[0].y);
+
+  // Only clip if the crossing point falls within the drawn trim segment's extent.
+  const trimDx = x2 - x1;
+  const trimDy = y2 - y1;
+  const trimLenSq = trimDx * trimDx + trimDy * trimDy;
+  if (trimLenSq > 1e-12) {
+    const tTrim = ((ix - x1) * trimDx + (iy - y1) * trimDy) / trimLenSq;
+    if (tTrim < 0 || tTrim > 1) return [seg];
+  }
+
+  return aKept ? [[seg[0], { x: ix, y: iy }]] : [[{ x: ix, y: iy }, seg[1]]];
+}
+
+/** Apply all trims sequentially. Each trim may split a segment into multiple pieces. */
+function _applyTrims(seg: [PagePoint, PagePoint], trims: ArrayTrim[]): [PagePoint, PagePoint][] {
+  let segments: [PagePoint, PagePoint][] = [seg];
+  for (const trim of trims) {
+    const next: [PagePoint, PagePoint][] = [];
+    for (const s of segments) next.push(..._clipSegmentToTrim(s, trim));
+    segments = next;
+    if (segments.length === 0) return [];
+  }
+  return segments;
+}
+
+/** Convert relative-stored trims to absolute page coords by adding the baseline origin. */
+function _absTrims(trims: ArrayTrim[], origin: PagePoint): ArrayTrim[] {
+  if (trims.length === 0) return trims;
+  return trims.map((t): ArrayTrim => {
+    if (t.kind === "box") {
+      return {
+        kind: "box",
+        points: t.points.map((p) => ({ x: p.x + origin.x, y: p.y + origin.y })),
+        keepX: t.keepX + origin.x, keepY: t.keepY + origin.y,
+      };
+    }
+    return {
+      x1: t.x1 + origin.x, y1: t.y1 + origin.y,
+      x2: t.x2 + origin.x, y2: t.y2 + origin.y,
+      keepX: t.keepX + origin.x, keepY: t.keepY + origin.y,
+    };
+  });
+}
+
+/** Total post-trim length of all array members in PDF points. */
+function arrayTrimmedLengthPts(p1: PagePoint, p2: PagePoint, meta: ArrayMeta): number {
+  const dx = p2.x - p1.x;
+  const dy = p2.y - p1.y;
+  const len = Math.hypot(dx, dy);
+  if (len < 1e-9) return 0;
+  const perpX = -dy / len;
+  const perpY = dx / len;
+  // Convert relative trims to absolute using p1 as origin.
+  const absTrimsList = _absTrims(meta.trims, p1);
+  let total = 0;
+  for (let i = 0; i <= meta.extraMembers; i++) {
+    const off = i * meta.spacingPts * meta.direction;
+    const seg: [PagePoint, PagePoint] = [
+      { x: p1.x + perpX * off, y: p1.y + perpY * off },
+      { x: p2.x + perpX * off, y: p2.y + perpY * off },
+    ];
+    const clipped = _applyTrims(seg, absTrimsList);
+    for (const c of clipped) total += Math.hypot(c[1].x - c[0].x, c[1].y - c[0].y);
+  }
+  return total;
+}
+
 /**
  * Derives the display quantity (magnitude, unsigned) for one dimension's geometry.
  * Returns null when it can't be computed (no scale, or the deferred weight display).
+ * For array-type measurements, pass `framingJson` containing the array metadata.
  */
-export function deriveQuantity(points: PagePoint[], mmPerPoint: number | null, props: GroupProps): Quantity | null {
+export function deriveQuantity(points: PagePoint[], mmPerPoint: number | null, props: GroupProps, framingJson?: string | null): Quantity | null {
   if (points.length < 1) return null;
   // Count needs no scale or geometry beyond a single point — each marker counts as the multiplier.
   if (props.default_display === "count") return { value: props.default_multiplier, uom: "no" };
   if (points.length < 2 || mmPerPoint == null || !(mmPerPoint > 0)) return null;
+
+  // Array: sum post-trim length of all members.
+  if (props.measurement_type === "array") {
+    const meta = parseArrayMeta(framingJson ?? null);
+    const totalPts = arrayTrimmedLengthPts(points[0], points[1], meta);
+    return { value: totalPts * (mmPerPoint / 1000) * props.default_multiplier, uom: "m" };
+  }
 
   const mPerPt = mmPerPoint / 1000;
   const m = props.default_multiplier;
@@ -84,6 +291,8 @@ export function deriveQuantity(points: PagePoint[], mmPerPoint: number | null, p
       return { value: m, uom: "" };
     case "length":
       return { value: boundaryM * m, uom: "m" };
+    case "perimeter":
+      return { value: perimeterM * m, uom: "m" };
     case "area":
       return { value: (isAreaMeasure ? areaM2 : lengthM * w) * m, uom: "m²" };
     case "wall_area":
@@ -115,6 +324,7 @@ interface MeasurementLike {
   polarity: number;
   drawing_id: number;
   page_index: number;
+  framing_json?: string | null;
 }
 
 /** Net quantity for a group: Σ(positive) − Σ(negative), via polarity-signed sum. */
@@ -134,7 +344,7 @@ export function groupNetQuantity(
       continue;
     }
     if (!Array.isArray(points)) continue;
-    const quantity = deriveQuantity(points, scaleFor(measurement.drawing_id, measurement.page_index), props);
+    const quantity = deriveQuantity(points, scaleFor(measurement.drawing_id, measurement.page_index), props, measurement.framing_json);
     if (!quantity) continue;
     total += (measurement.polarity ?? 1) * quantity.value;
     uom = quantity.uom;

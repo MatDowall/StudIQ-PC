@@ -340,6 +340,18 @@ fn load_document_meta_via_renderer(
 }
 
 #[tauri::command]
+async fn close_splashscreen(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(splash) = app.get_webview_window("splashscreen") {
+        let _ = splash.close();
+    }
+    if let Some(main) = app.get_webview_window("main") {
+        let _ = main.show();
+        let _ = main.set_focus();
+    }
+    Ok(())
+}
+
+#[tauri::command]
 async fn get_active_project(state: State<'_, AppState>) -> Result<Option<ProjectMeta>, String> {
     Ok(state
         .active_project
@@ -1331,7 +1343,7 @@ async fn create_measurement(
     verify_node_type(&db, dimension_group_id, "dimension_group").await?;
     verify_node_type(&db, drawing_id, "drawing").await?;
 
-    if !matches!(measurement_type.as_str(), "count" | "length" | "area" | "timber_framing") {
+    if !matches!(measurement_type.as_str(), "count" | "length" | "area" | "timber_framing" | "array") {
         return Err(format!(
             "Unsupported measurement_type: {measurement_type}"
         ));
@@ -1520,8 +1532,8 @@ async fn get_page_scale(
     .transpose()
 }
 
-const MEASUREMENT_TYPES: [&str; 4] = ["count", "length", "area", "timber_framing"];
-const DISPLAY_TYPES: [&str; 6] = ["count", "length", "area", "wall_area", "volume", "weight"];
+const MEASUREMENT_TYPES: [&str; 5] = ["count", "length", "area", "timber_framing", "array"];
+const DISPLAY_TYPES: [&str; 7] = ["count", "length", "area", "perimeter", "wall_area", "volume", "weight"];
 const LINE_STYLES: [&str; 4] = ["solid", "dashed", "dotted", "dash_dot"];
 
 /// Returns a dimension group's properties, or sensible defaults if none are stored yet
@@ -1807,6 +1819,124 @@ async fn load_workbook_sheet_styles(
     Ok(row.unwrap_or_else(|| "{}".to_string()))
 }
 
+/// Persist the set of cells excluded from auto-derivation for one sheet
+/// (identified by revision + path). `exclusions_json` is a JSON object keyed by
+/// "row,col" → true.
+#[tauri::command]
+async fn save_workbook_sheet_exclusions(
+    state: State<'_, AppState>,
+    revision_id: i64,
+    sheet_path: String,
+    exclusions_json: String,
+) -> Result<(), String> {
+    let db = active_project_db(state.inner())?;
+    sqlx::query(
+        "INSERT INTO workbook_sheet_exclusions (revision_id, sheet_path, exclusions_json)
+         VALUES (?, ?, ?)
+         ON CONFLICT(revision_id, sheet_path) DO UPDATE SET exclusions_json = excluded.exclusions_json",
+    )
+    .bind(revision_id)
+    .bind(sheet_path)
+    .bind(exclusions_json)
+    .execute(&db)
+    .await
+    .map_err(|e| format!("Failed to save sheet exclusions: {e}"))?;
+    Ok(())
+}
+
+/// Load the set of cells excluded from auto-derivation for one sheet. Returns an
+/// empty JSON object when no exclusions have been saved yet.
+#[tauri::command]
+async fn load_workbook_sheet_exclusions(
+    state: State<'_, AppState>,
+    revision_id: i64,
+    sheet_path: String,
+) -> Result<String, String> {
+    let db = active_project_db(state.inner())?;
+    let row: Option<String> = sqlx::query_scalar(
+        "SELECT exclusions_json FROM workbook_sheet_exclusions WHERE revision_id = ? AND sheet_path = ?",
+    )
+    .bind(revision_id)
+    .bind(sheet_path)
+    .fetch_optional(&db)
+    .await
+    .map_err(|e| format!("Failed to load sheet exclusions: {e}"))?;
+    Ok(row.unwrap_or_else(|| "{}".to_string()))
+}
+
+/// Create or update a named cell — a workbook-wide name bound to a single cell
+/// (identified by sheet path + row/col) that can be referenced from formulas at
+/// any level. Names are unique per revision; saving an existing name moves it.
+#[tauri::command]
+async fn save_workbook_named_cell(
+    state: State<'_, AppState>,
+    revision_id: i64,
+    name: String,
+    sheet_path: String,
+    row: i64,
+    col: i64,
+) -> Result<(), String> {
+    let db = active_project_db(state.inner())?;
+    sqlx::query(
+        "INSERT INTO workbook_named_cells (revision_id, name, sheet_path, row, col)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(revision_id, name) DO UPDATE SET
+            sheet_path = excluded.sheet_path, row = excluded.row, col = excluded.col",
+    )
+    .bind(revision_id)
+    .bind(name)
+    .bind(sheet_path)
+    .bind(row)
+    .bind(col)
+    .execute(&db)
+    .await
+    .map_err(|e| format!("Failed to save named cell: {e}"))?;
+    Ok(())
+}
+
+/// Remove a named cell — e.g. when the user deletes it or overwrites the name
+/// with a new binding elsewhere (handled as delete + re-save by the frontend).
+#[tauri::command]
+async fn delete_workbook_named_cell(
+    state: State<'_, AppState>,
+    revision_id: i64,
+    name: String,
+) -> Result<(), String> {
+    let db = active_project_db(state.inner())?;
+    sqlx::query("DELETE FROM workbook_named_cells WHERE revision_id = ? AND name = ?")
+        .bind(revision_id)
+        .bind(name)
+        .execute(&db)
+        .await
+        .map_err(|e| format!("Failed to delete named cell: {e}"))?;
+    Ok(())
+}
+
+/// Load every named cell defined in a workbook revision. Returns a JSON array of
+/// `{ name, path, row, col }` — empty array when none have been defined yet.
+#[tauri::command]
+async fn load_workbook_named_cells(
+    state: State<'_, AppState>,
+    revision_id: i64,
+) -> Result<String, String> {
+    let db = active_project_db(state.inner())?;
+    let rows = sqlx::query_as::<_, (String, String, i64, i64)>(
+        "SELECT name, sheet_path, row, col FROM workbook_named_cells WHERE revision_id = ?",
+    )
+    .bind(revision_id)
+    .fetch_all(&db)
+    .await
+    .map_err(|e| format!("Failed to load named cells: {e}"))?;
+
+    let entries: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(name, sheet_path, row, col)| {
+            serde_json::json!({ "name": name, "path": sheet_path, "row": row, "col": col })
+        })
+        .collect();
+    serde_json::to_string(&entries).map_err(|e| format!("Failed to serialise named cells: {e}"))
+}
+
 /// Delete a single sheet's persisted data plus all of its descendant sheets
 /// (paths of the form `<sheet_path>/...`). Used to clean up "orphaned" build-up
 /// sheets left behind in the DB after the line item that owned them is cleared
@@ -1849,6 +1979,15 @@ async fn delete_workbook_sheet_subtree(
     .bind(&like_pattern)
     .execute(&db)
     .await;
+    let _ = sqlx::query(
+        "DELETE FROM workbook_sheet_exclusions \
+         WHERE revision_id = ? AND (sheet_path = ? OR sheet_path LIKE ?)",
+    )
+    .bind(revision_id)
+    .bind(&sheet_path)
+    .bind(&like_pattern)
+    .execute(&db)
+    .await;
     Ok(rows_affected as i64)
 }
 
@@ -1871,6 +2010,10 @@ async fn clear_workbook_revision_data(
         .execute(&db)
         .await;
     let _ = sqlx::query("DELETE FROM workbook_sheet_styles WHERE revision_id = ?")
+        .bind(revision_id)
+        .execute(&db)
+        .await;
+    let _ = sqlx::query("DELETE FROM workbook_sheet_exclusions WHERE revision_id = ?")
         .bind(revision_id)
         .execute(&db)
         .await;
@@ -2089,6 +2232,59 @@ async fn create_workbook_revision_from_template(
             .await
             .map_err(|e| format!("Failed to seed sheet styles '{sheet_path}': {e}"))?;
         }
+
+        // Carry the template's auto-calc exclusions along too — e.g. a summary
+        // block whose F/G/H cells are hand-built must stay excluded in every
+        // project created from this template.
+        let exclusions_json: Option<String> = sqlx::query_scalar(
+            "SELECT exclusions_json FROM workbook_sheet_exclusions WHERE revision_id = ? AND sheet_path = ?",
+        )
+        .bind(template_revision_id)
+        .bind(sheet_path)
+        .fetch_optional(&db)
+        .await
+        .map_err(|e| format!("Failed to read template sheet exclusions '{sheet_path}': {e}"))?;
+
+        if let Some(exclusions_json) = exclusions_json {
+            sqlx::query(
+                "INSERT INTO workbook_sheet_exclusions (revision_id, sheet_path, exclusions_json) VALUES (?, ?, ?)",
+            )
+            .bind(revision_id)
+            .bind(sheet_path)
+            .bind(&exclusions_json)
+            .execute(&db)
+            .await
+            .map_err(|e| format!("Failed to seed sheet exclusions '{sheet_path}': {e}"))?;
+        }
+    }
+
+    // Carry the template's named cells along too — they're revision-scoped (not
+    // per-sheet, so outside the loop above), and formulas in the copied sheets may
+    // reference them by name. Without this, the new revision starts with an empty
+    // `workbook_named_cells` set: the names resolve to nothing (#NAME? in the grid,
+    // empty Name Manager) until the template happens to be reloaded in the same
+    // session and re-registers them in HyperFormula's *shared* named-expression
+    // registry — which only masks the missing copy until the app restarts.
+    let named_cells: Vec<(String, String, i64, i64)> = sqlx::query_as(
+        "SELECT name, sheet_path, row, col FROM workbook_named_cells WHERE revision_id = ?",
+    )
+    .bind(template_revision_id)
+    .fetch_all(&db)
+    .await
+    .map_err(|e| format!("Failed to read template named cells: {e}"))?;
+
+    for (nc_name, nc_path, nc_row, nc_col) in named_cells {
+        sqlx::query(
+            "INSERT INTO workbook_named_cells (revision_id, name, sheet_path, row, col) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(revision_id)
+        .bind(&nc_name)
+        .bind(&nc_path)
+        .bind(nc_row)
+        .bind(nc_col)
+        .execute(&db)
+        .await
+        .map_err(|e| format!("Failed to seed named cell '{nc_name}': {e}"))?;
     }
 
     let created_at: String =
@@ -2338,6 +2534,307 @@ async fn delete_template(template_id: i64, state: State<'_, AppState>) -> Result
         .await
         .map_err(|e| format!("Failed to delete template revision: {e}"))?;
 
+    Ok(())
+}
+
+#[tauri::command]
+async fn write_text_file(path: String, content: String) -> Result<(), String> {
+    std::fs::write(&path, content).map_err(|e| format!("Failed to write file: {e}"))
+}
+
+#[tauri::command]
+async fn read_text_file(path: String) -> Result<String, String> {
+    std::fs::read_to_string(&path).map_err(|e| format!("Failed to read file: {e}"))
+}
+
+/// The sheet paths that make up a template's master sheets — see
+/// `create_workbook_revision_from_template` for why these four are special.
+const TEMPLATE_SHEET_PATHS: [&str; 4] =
+    ["L1", "TEMPLATE_MASTER_L2", "TEMPLATE_MASTER_L3", "TEMPLATE_MASTER_LQ"];
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct TemplateSheetExport {
+    data_json: Option<String>,
+    styles_json: Option<String>,
+    exclusions_json: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct TemplateNamedCellExport {
+    name: String,
+    sheet_path: String,
+    row: i64,
+    col: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct TemplateExportFile {
+    format: String,
+    version: u32,
+    name: String,
+    description: Option<String>,
+    sheets: std::collections::HashMap<String, TemplateSheetExport>,
+    named_cells: Vec<TemplateNamedCellExport>,
+}
+
+const TEMPLATE_EXPORT_FORMAT: &str = "studiq-workbook-template";
+const TEMPLATE_EXPORT_VERSION: u32 = 1;
+
+#[tauri::command]
+async fn export_template(
+    template_id: i64,
+    dest_path: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let db = active_project_db(state.inner())?;
+
+    let row = sqlx::query("SELECT name, description, revision_id FROM templates WHERE id = ?")
+        .bind(template_id)
+        .fetch_optional(&db)
+        .await
+        .map_err(|e| format!("Failed to look up template: {e}"))?;
+    let Some(row) = row else {
+        return Err(format!("Template {template_id} not found"));
+    };
+    let name: String = row.try_get("name").map_err(|e: sqlx::Error| e.to_string())?;
+    let description: Option<String> = row.try_get("description").map_err(|e: sqlx::Error| e.to_string())?;
+    let revision_id: i64 = row.try_get("revision_id").map_err(|e: sqlx::Error| e.to_string())?;
+
+    let mut sheets = std::collections::HashMap::new();
+    for sheet_path in TEMPLATE_SHEET_PATHS {
+        let data_json: Option<String> = sqlx::query_scalar(
+            "SELECT data_json FROM workbook_sheet_data WHERE revision_id = ? AND sheet_path = ?",
+        )
+        .bind(revision_id)
+        .bind(sheet_path)
+        .fetch_optional(&db)
+        .await
+        .map_err(|e| format!("Failed to read sheet '{sheet_path}': {e}"))?;
+
+        let styles_json: Option<String> = sqlx::query_scalar(
+            "SELECT styles_json FROM workbook_sheet_styles WHERE revision_id = ? AND sheet_path = ?",
+        )
+        .bind(revision_id)
+        .bind(sheet_path)
+        .fetch_optional(&db)
+        .await
+        .map_err(|e| format!("Failed to read sheet styles '{sheet_path}': {e}"))?;
+
+        let exclusions_json: Option<String> = sqlx::query_scalar(
+            "SELECT exclusions_json FROM workbook_sheet_exclusions WHERE revision_id = ? AND sheet_path = ?",
+        )
+        .bind(revision_id)
+        .bind(sheet_path)
+        .fetch_optional(&db)
+        .await
+        .map_err(|e| format!("Failed to read sheet exclusions '{sheet_path}': {e}"))?;
+
+        if data_json.is_some() || styles_json.is_some() || exclusions_json.is_some() {
+            sheets.insert(
+                sheet_path.to_string(),
+                TemplateSheetExport { data_json, styles_json, exclusions_json },
+            );
+        }
+    }
+
+    let named_cells_rows: Vec<(String, String, i64, i64)> = sqlx::query_as(
+        "SELECT name, sheet_path, row, col FROM workbook_named_cells WHERE revision_id = ?",
+    )
+    .bind(revision_id)
+    .fetch_all(&db)
+    .await
+    .map_err(|e| format!("Failed to read named cells: {e}"))?;
+
+    let named_cells = named_cells_rows
+        .into_iter()
+        .map(|(name, sheet_path, row, col)| TemplateNamedCellExport { name, sheet_path, row, col })
+        .collect();
+
+    let export = TemplateExportFile {
+        format: TEMPLATE_EXPORT_FORMAT.to_string(),
+        version: TEMPLATE_EXPORT_VERSION,
+        name,
+        description,
+        sheets,
+        named_cells,
+    };
+
+    let json = serde_json::to_string_pretty(&export)
+        .map_err(|e| format!("Failed to serialize template: {e}"))?;
+    std::fs::write(&dest_path, json).map_err(|e| format!("Failed to write file: {e}"))?;
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn import_template(src_path: String, state: State<'_, AppState>) -> Result<TemplateDto, String> {
+    let db = active_project_db(state.inner())?;
+
+    let json = std::fs::read_to_string(&src_path).map_err(|e| format!("Failed to read file: {e}"))?;
+    let import: TemplateExportFile = serde_json::from_str(&json)
+        .map_err(|e| format!("Failed to parse template file: {e}"))?;
+
+    if import.format != TEMPLATE_EXPORT_FORMAT {
+        return Err("This file is not a StudIQ workbook template".to_string());
+    }
+
+    let name = import.name.trim().to_string();
+    if name.is_empty() {
+        return Err("Template name cannot be empty".to_string());
+    }
+
+    // Avoid colliding with an existing template name in this project.
+    let mut final_name = name.clone();
+    let mut suffix = 2;
+    loop {
+        let exists: bool = sqlx::query_scalar("SELECT COUNT(*) > 0 FROM templates WHERE name = ?")
+            .bind(&final_name)
+            .fetch_one(&db)
+            .await
+            .map_err(|e| format!("Failed to check template name: {e}"))?;
+        if !exists {
+            break;
+        }
+        final_name = format!("{name} ({suffix})");
+        suffix += 1;
+    }
+
+    let workbook_id = ensure_template_workbook(&db).await?;
+
+    let sort_order: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM workbook_revisions WHERE workbook_id = ?",
+    )
+    .bind(workbook_id)
+    .fetch_one(&db)
+    .await
+    .map_err(|e| format!("Failed to get next sort order: {e}"))?;
+
+    let rev_result = sqlx::query(
+        "INSERT INTO workbook_revisions (workbook_id, name, sort_order) VALUES (?, ?, ?)",
+    )
+    .bind(workbook_id)
+    .bind(&final_name)
+    .bind(sort_order)
+    .execute(&db)
+    .await
+    .map_err(|e| format!("Failed to create template revision: {e}"))?;
+    let revision_id = rev_result.last_insert_rowid();
+
+    for sheet_path in TEMPLATE_SHEET_PATHS {
+        let Some(sheet) = import.sheets.get(sheet_path) else { continue };
+
+        if let Some(data_json) = &sheet.data_json {
+            sqlx::query(
+                "INSERT INTO workbook_sheet_data (revision_id, sheet_path, data_json) VALUES (?, ?, ?)",
+            )
+            .bind(revision_id)
+            .bind(sheet_path)
+            .bind(data_json)
+            .execute(&db)
+            .await
+            .map_err(|e| format!("Failed to import sheet '{sheet_path}': {e}"))?;
+        }
+
+        if let Some(styles_json) = &sheet.styles_json {
+            sqlx::query(
+                "INSERT INTO workbook_sheet_styles (revision_id, sheet_path, styles_json) VALUES (?, ?, ?)",
+            )
+            .bind(revision_id)
+            .bind(sheet_path)
+            .bind(styles_json)
+            .execute(&db)
+            .await
+            .map_err(|e| format!("Failed to import sheet styles '{sheet_path}': {e}"))?;
+        }
+
+        if let Some(exclusions_json) = &sheet.exclusions_json {
+            sqlx::query(
+                "INSERT INTO workbook_sheet_exclusions (revision_id, sheet_path, exclusions_json) VALUES (?, ?, ?)",
+            )
+            .bind(revision_id)
+            .bind(sheet_path)
+            .bind(exclusions_json)
+            .execute(&db)
+            .await
+            .map_err(|e| format!("Failed to import sheet exclusions '{sheet_path}': {e}"))?;
+        }
+    }
+
+    for nc in &import.named_cells {
+        sqlx::query(
+            "INSERT INTO workbook_named_cells (revision_id, name, sheet_path, row, col) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(revision_id)
+        .bind(&nc.name)
+        .bind(&nc.sheet_path)
+        .bind(nc.row)
+        .bind(nc.col)
+        .execute(&db)
+        .await
+        .map_err(|e| format!("Failed to import named cell '{}': {e}", nc.name))?;
+    }
+
+    let result = sqlx::query(
+        "INSERT INTO templates (name, description, revision_id) VALUES (?, ?, ?)",
+    )
+    .bind(&final_name)
+    .bind(&import.description)
+    .bind(revision_id)
+    .execute(&db)
+    .await
+    .map_err(|e| format!("Failed to create template: {e}"))?;
+    let id = result.last_insert_rowid();
+
+    let created_at: String = sqlx::query_scalar("SELECT created_at FROM templates WHERE id = ?")
+        .bind(id)
+        .fetch_one(&db)
+        .await
+        .map_err(|e| format!("Failed to fetch created_at: {e}"))?;
+
+    Ok(TemplateDto {
+        id,
+        name: final_name,
+        description: import.description,
+        created_at,
+        revision_id,
+    })
+}
+
+/// Rename a sheet path prefix across all workbook tables — used when inserting a
+/// blank row shifts existing sub-sheet paths (e.g. "L1/R3" → "L1/R4" and all
+/// descendants like "L1/R3/R1" → "L1/R4/R1"). Must be called bottom-up (highest
+/// row first) so a rename cannot clobber a path that hasn't been renamed yet.
+#[tauri::command]
+async fn rename_workbook_sheet_subtree(
+    state: State<'_, AppState>,
+    revision_id: i64,
+    old_path: String,
+    new_path: String,
+) -> Result<(), String> {
+    let db = active_project_db(state.inner())?;
+    let like_pattern = format!("{old_path}/%");
+    let prefix_len = (old_path.len() as i64) + 1; // +1 to skip the trailing char before substr
+    for table in &[
+        "workbook_sheet_data",
+        "workbook_sheet_links",
+        "workbook_sheet_styles",
+        "workbook_sheet_exclusions",
+    ] {
+        let sql = format!(
+            "UPDATE {table} \
+             SET sheet_path = ? || substr(sheet_path, ?) \
+             WHERE revision_id = ? AND (sheet_path = ? OR sheet_path LIKE ?)"
+        );
+        let _ = sqlx::query(&sql)
+            .bind(&new_path)
+            .bind(prefix_len)
+            .bind(revision_id)
+            .bind(&old_path)
+            .bind(&like_pattern)
+            .execute(&db)
+            .await
+            .map_err(|e| format!("Failed to rename {table}: {e}"))?;
+    }
     Ok(())
 }
 
@@ -2782,6 +3279,46 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), String> {
     .execute(pool)
     .await
     .map_err(|e| format!("Failed to create workbook_sheet_styles: {e}"))?;
+
+    // Additive: per-sheet set of cells excluded from auto-derivation (drill-down
+    // subtotal rollup, factor default-to-1, total = subtotal × factor formulas).
+    // `exclusions_json` is a JSON object keyed by "row,col" → true. Lets a template
+    // author "switch off" the F/G/H auto-calc for a summary block that overwrites
+    // those cells with its own hand-built formulas.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS workbook_sheet_exclusions (
+            id              INTEGER PRIMARY KEY,
+            revision_id     INTEGER NOT NULL REFERENCES workbook_revisions(id) ON DELETE CASCADE,
+            sheet_path      TEXT NOT NULL,
+            exclusions_json TEXT NOT NULL DEFAULT '{}',
+            UNIQUE(revision_id, sheet_path)
+        );
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| format!("Failed to create workbook_sheet_exclusions: {e}"))?;
+
+    // Additive: workbook-wide named cells (Excel-style "New Named Cell" — a name
+    // bound to one sheet+row+col, usable in formulas at any level). Scoped to the
+    // revision so it lives and dies with that workbook revision (cascade delete).
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS workbook_named_cells (
+            id          INTEGER PRIMARY KEY,
+            revision_id INTEGER NOT NULL REFERENCES workbook_revisions(id) ON DELETE CASCADE,
+            name        TEXT NOT NULL,
+            sheet_path  TEXT NOT NULL,
+            row         INTEGER NOT NULL,
+            col         INTEGER NOT NULL,
+            UNIQUE(revision_id, name)
+        );
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| format!("Failed to create workbook_named_cells: {e}"))?;
 
     // Additive: marks a workbook as the hidden container for template revisions
     // (excluded from list_workbooks / the sidebar tree).
@@ -3249,6 +3786,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            close_splashscreen,
             get_active_project,
             get_recent_projects,
             remove_recent_project,
@@ -3289,6 +3827,11 @@ pub fn run() {
             load_workbook_sheet_links,
             save_workbook_sheet_styles,
             load_workbook_sheet_styles,
+            save_workbook_sheet_exclusions,
+            load_workbook_sheet_exclusions,
+            save_workbook_named_cell,
+            delete_workbook_named_cell,
+            load_workbook_named_cells,
             delete_workbook_sheet_subtree,
             clear_workbook_revision_data,
             list_workbooks,
@@ -3300,7 +3843,12 @@ pub fn run() {
             create_template,
             rename_template,
             update_template_description,
-            delete_template
+            delete_template,
+            export_template,
+            import_template,
+            write_text_file,
+            read_text_file,
+            rename_workbook_sheet_subtree
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
