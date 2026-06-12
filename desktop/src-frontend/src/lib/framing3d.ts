@@ -11,6 +11,7 @@ export interface Member3D {
   size: [number, number, number];
   yaw: number;
   pitch: number;
+  wedge?: { quad: [number, number][]; depthM: number };
 }
 
 /** Member colours, loosely matching docs/window makeup.png + the 3D references. */
@@ -38,5 +39,6 @@ export function computeWall3D(
     size: m.size,
     yaw: m.yaw,
     pitch: m.pitch,
+    wedge: m.wedge,
   }));
 }

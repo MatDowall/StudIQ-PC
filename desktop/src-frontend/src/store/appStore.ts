@@ -1,7 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import { create } from "zustand";
 import type { GroupProps } from "../lib/quantity";
-import type { OpeningTemplate } from "../lib/framing";
+import { parseFramingSettings, parseWallFraming, wallMembers, type OpeningTemplate } from "../lib/framing";
+import { computeWallElevations } from "../lib/elevation2d";
+import { exportElevationPdf, type WallElevationExport } from "../lib/elevationPdf";
 
 export type DimensionGroupPropsDto = GroupProps;
 
@@ -50,6 +52,35 @@ export interface PageMeta {
   index: number;
   width_pts: number;
   height_pts: number;
+}
+
+/** A single timber-framing dimension group's contribution to a page in the multi-page 3D setup. */
+export interface MultiPage3DGroupEntry {
+  groupId: number;
+  name: string;
+  included: boolean;
+  framingPropsJson: string | null;
+  measurements: MeasurementDto[];
+}
+
+/** One page included in the multi-page 3D view, with its own Z-offset and group selection. */
+export interface MultiPage3DPageEntry {
+  pageIndex: number;
+  label: string;
+  included: boolean;
+  // Vertical (world Y) offset from Z-0, in metres.
+  offsetM: number;
+  mmPerPoint: number | null;
+  pageWidthPts: number;
+  pageHeightPts: number;
+  groups: MultiPage3DGroupEntry[];
+}
+
+/** Persisted multi-page 3D setup, confirmed via the "View Multiple Pages..." dialog. Page order
+ *  in `pages` dictates draw/stacking order (drag-and-drop in the dialog). */
+export interface MultiPage3DConfig {
+  drawingId: number;
+  pages: MultiPage3DPageEntry[];
 }
 
 export interface DocumentMeta {
@@ -103,6 +134,16 @@ export interface WorkbookFormatSnapshot {
   underline: boolean;
   align: "left" | "center" | "right";
   decimals: number;
+}
+
+// Imperative bridge: WorkbookView registers these so the ribbon's row/output
+// buttons can operate on the live grid.
+export interface WorkbookGridApi {
+  addRow: () => void;
+  insertAbove: () => void;
+  insertBelow: () => void;
+  exportCsv: () => Promise<void>;
+  print: () => void;
 }
 
 // Imperative bridge: WorkbookView registers these so the ribbon's Format
@@ -239,8 +280,19 @@ interface AppStore {
   // When set, the viewer is placing a door/window opening: hovering a framing wall shows a ghost
   // that commits onto the wall on click. Overrides add/select while active.
   openingPlacement: OpeningTemplate | null;
+  // When true, the array trim tool is active: the user draws a cut shape to clip array members.
+  arrayTrimMode: boolean;
+  // "line" = single cut line (half-plane trim); "box" = closed polygon (inside/outside trim).
+  arrayTrimType: "line" | "box";
   // Drawing ribbon: false = 2D plan view (default), true = 3D framing view.
   view3d: boolean;
+  // When true (and view3d is set), render the multi-page scene from `multiPage3DConfig`
+  // instead of the current page's framing.
+  view3dMulti: boolean;
+  // Confirmed multi-page 3D setup (page selection, group selection, Z-offsets, order).
+  multiPage3DConfig: MultiPage3DConfig | null;
+  // Whether the "View Multiple Pages..." setup dialog is open.
+  multiPage3DDialogOpen: boolean;
   // 0..1: opacity of PDF linework (1 = full, no dimming). Lets measurements stand out.
   drawingDimmer: number;
   // Scale of the active drawing page, and whether the calibration capture is in progress.
@@ -262,19 +314,32 @@ interface AppStore {
   // here and registers an imperative API the ribbon's Format toolbar calls.
   workbookFormat: WorkbookFormatSnapshot;
   workbookFormatApi: WorkbookFormatApi | null;
+  workbookGridApi: WorkbookGridApi | null;
   setWorkbookFormat: (format: WorkbookFormatSnapshot) => void;
   setWorkbookFormatApi: (api: WorkbookFormatApi | null) => void;
+  setWorkbookGridApi: (api: WorkbookGridApi | null) => void;
 
   templates: TemplateDto[];
   templateManagerOpen: boolean;
   templateEditMode: TemplateEditMode | null;
+  namedCellsManagerOpen: boolean;
+  workbookConfirmAction: "clean" | "clear" | null;
   preTemplateRevisionId: number | null;
 
   setActiveProject: (project: ProjectMeta | null) => void;
   setSnapEnabled: (on: boolean) => void;
   setViewerMode: (mode: ViewerMode) => void;
   setOpeningPlacement: (template: OpeningTemplate | null) => void;
+  setArrayTrimMode: (on: boolean) => void;
+  setArrayTrimType: (trimType: "line" | "box") => void;
   setView3d: (on: boolean) => void;
+  setView3dMulti: (on: boolean) => void;
+  setMultiPage3DConfig: (config: MultiPage3DConfig | null) => void;
+  setMultiPage3DDialogOpen: (open: boolean) => void;
+  /** Builds the initial page list for the multi-page 3D setup dialog: every page in the
+   *  active drawing that has timber-framing measurements, with all groups included and
+   *  zero Z-offset. The user edits the result and confirms via `setMultiPage3DConfig`. */
+  loadMultiPage3DSetup: () => Promise<MultiPage3DPageEntry[]>;
   setDrawingDimmer: (value: number) => void;
   selectMeasurement: (measurementId: number | null) => void;
   toggleSelectMeasurement: (measurementId: number) => void;
@@ -290,6 +355,9 @@ interface AppStore {
   openProject: (filePath: string) => Promise<void>;
   closeProject: () => Promise<void>;
   exportProject: (destPath: string) => Promise<void>;
+  /** Debug/QA: export the current page's timber-framing walls as a 2D elevation PDF. Returns the
+   *  saved file path, or null if there's nothing to export or the user cancelled the dialog. */
+  exportFramingElevations: () => Promise<string | null>;
   removeRecentProject: (filePath: string) => Promise<void>;
   updateProjectMeta: (name: string, client: string, contractNumber: string, status: string) => Promise<void>;
   loadRecentProjects: () => Promise<void>;
@@ -332,6 +400,10 @@ interface AppStore {
   deleteWorkbookRevision: (revisionId: number) => Promise<void>;
   renameWorkbookRevision: (revisionId: number, name: string) => Promise<void>;
 
+  openNamedCellsManager: () => void;
+  closeNamedCellsManager: () => void;
+  setWorkbookConfirmAction: (action: "clean" | "clear" | null) => void;
+
   loadTemplates: () => Promise<void>;
   openTemplateManager: () => void;
   closeTemplateManager: () => void;
@@ -339,12 +411,42 @@ interface AppStore {
   renameTemplate: (templateId: number, name: string) => Promise<void>;
   updateTemplateDescription: (templateId: number, description: string) => Promise<void>;
   deleteTemplate: (templateId: number) => Promise<void>;
+  exportTemplate: (templateId: number, destPath: string) => Promise<void>;
+  importTemplate: (srcPath: string) => Promise<void>;
   enterTemplateEdit: (template: TemplateDto) => void;
   exitTemplateEdit: () => void;
 }
 
 export function drawingPageNodeId(drawingId: number, pageIndex: number) {
   return -(drawingId * 1_000_000 + pageIndex + 1);
+}
+
+/** Recursively walks the dimension-group tree (fetching uncached folder children as needed)
+ *  and returns every "timber_framing" dimension group node. */
+async function collectFramingGroups(
+  roots: TreeNodeDto[],
+  childCache: Record<number, TreeNodeDto[]>,
+): Promise<TreeNodeDto[]> {
+  const result: TreeNodeDto[] = [];
+  const cache = { ...childCache };
+  async function walk(nodes: TreeNodeDto[]) {
+    for (const node of nodes) {
+      if (node.node_type === "dimension_group") {
+        if (node.measurement_type === "timber_framing") result.push(node);
+        continue;
+      }
+      if (node.node_type === "folder") {
+        let children = cache[node.id];
+        if (!children) {
+          children = await invoke<TreeNodeDto[]>("get_children", { parentId: node.id });
+          cache[node.id] = children;
+        }
+        await walk(children);
+      }
+    }
+  }
+  await walk(roots);
+  return result;
 }
 
 function findNode(nodes: TreeNodeDto[], childCache: Record<number, TreeNodeDto[]>, nodeId: number): TreeNodeDto | null {
@@ -603,7 +705,12 @@ export const useAppStore = create<AppStore>((set, get) => ({
   viewerMode: "add",
   selectedMeasurementIds: [],
   openingPlacement: null,
+  arrayTrimMode: false,
+  arrayTrimType: "line",
   view3d: false,
+  view3dMulti: false,
+  multiPage3DConfig: null,
+  multiPage3DDialogOpen: false,
   drawingDimmer: 1,
   pageScale: null,
   calibrating: false,
@@ -617,12 +724,16 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   workbookFormat: DEFAULT_WORKBOOK_FORMAT,
   workbookFormatApi: null,
+  workbookGridApi: null,
   setWorkbookFormat: (format) => set({ workbookFormat: format }),
   setWorkbookFormatApi: (api) => set({ workbookFormatApi: api }),
+  setWorkbookGridApi: (api) => set({ workbookGridApi: api }),
 
   templates: [],
   templateManagerOpen: false,
   templateEditMode: null,
+  namedCellsManagerOpen: false,
+  workbookConfirmAction: null,
   preTemplateRevisionId: null,
 
   setActiveProject: (project) => {
@@ -679,15 +790,95 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   setViewerMode: (mode) => {
     // Switching mode cancels any in-progress door/window placement.
-    set((state) => ({ viewerMode: mode, openingPlacement: null, selectedMeasurementIds: mode === "add" ? [] : state.selectedMeasurementIds }));
+    set((state) => ({ viewerMode: mode, openingPlacement: null, arrayTrimMode: false, selectedMeasurementIds: mode === "add" ? [] : state.selectedMeasurementIds }));
   },
 
   setOpeningPlacement: (template) => {
     set({ openingPlacement: template });
   },
 
+  setArrayTrimMode: (on) => {
+    set({ arrayTrimMode: on });
+  },
+
+  setArrayTrimType: (trimType) => {
+    set({ arrayTrimType: trimType });
+  },
+
   setView3d: (on) => {
     set({ view3d: on });
+  },
+
+  setView3dMulti: (on) => {
+    set({ view3dMulti: on });
+  },
+
+  setMultiPage3DConfig: (config) => {
+    set({ multiPage3DConfig: config });
+  },
+
+  setMultiPage3DDialogOpen: (open) => {
+    set({ multiPage3DDialogOpen: open });
+  },
+
+  loadMultiPage3DSetup: async () => {
+    const state = get();
+    const { activeDrawingId, currentDocument } = state;
+    if (activeDrawingId === null || !currentDocument) return [];
+
+    const groupNodes = await collectFramingGroups(state.dimensionRoots, state.childCache);
+    const groupData = await Promise.all(
+      groupNodes.map(async (node) => {
+        const [measurements, props] = await Promise.all([
+          invoke<MeasurementDto[]>("get_measurements_for_group", { groupId: node.id }),
+          invoke<DimensionGroupPropsDto>("get_dimension_group_props", { nodeId: node.id }),
+        ]);
+        return {
+          node,
+          framingPropsJson: props.framing_props_json ?? null,
+          measurements: measurements.filter(
+            (m) => m.drawing_id === activeDrawingId && m.measurement_type === "timber_framing",
+          ),
+        };
+      }),
+    );
+
+    const pageGroups = new Map<number, MultiPage3DGroupEntry[]>();
+    for (const { node, measurements, framingPropsJson } of groupData) {
+      const byPage = new Map<number, MeasurementDto[]>();
+      for (const m of measurements) {
+        const arr = byPage.get(m.page_index) ?? [];
+        arr.push(m);
+        byPage.set(m.page_index, arr);
+      }
+      for (const [pageIndex, ms] of byPage) {
+        const arr = pageGroups.get(pageIndex) ?? [];
+        arr.push({ groupId: node.id, name: node.name, included: true, framingPropsJson, measurements: ms });
+        pageGroups.set(pageIndex, arr);
+      }
+    }
+
+    const pages: MultiPage3DPageEntry[] = [];
+    for (const pageIndex of Array.from(pageGroups.keys()).sort((a, b) => a - b)) {
+      const key = `${activeDrawingId}:${pageIndex}`;
+      let mmPerPoint = state.scaleCache[key]?.mm_per_point ?? null;
+      if (mmPerPoint === null) {
+        const scale = await invoke<PageScaleDto | null>("get_page_scale", { drawingId: activeDrawingId, pageIndex });
+        mmPerPoint = scale?.mm_per_point ?? null;
+      }
+      const pageMeta = currentDocument.pages[pageIndex];
+      pages.push({
+        pageIndex,
+        label: `Page ${pageIndex + 1}`,
+        included: true,
+        offsetM: 0,
+        mmPerPoint,
+        pageWidthPts: pageMeta?.width_pts ?? 0,
+        pageHeightPts: pageMeta?.height_pts ?? 0,
+        groups: pageGroups.get(pageIndex)!,
+      });
+    }
+    return pages;
   },
 
   setDrawingDimmer: (value) => {
@@ -770,7 +961,11 @@ export const useAppStore = create<AppStore>((set, get) => ({
       selectedMeasurementIds: [],
       viewerMode: "add",
       openingPlacement: null,
+      arrayTrimMode: false,
       view3d: false,
+      view3dMulti: false,
+      multiPage3DConfig: null,
+      multiPage3DDialogOpen: false,
       drawingDimmer: 1,
       pageScale: null,
       calibrating: false,
@@ -788,6 +983,35 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   exportProject: async (destPath) => {
     await invoke<void>("export_project", { destPath });
+  },
+
+  exportFramingElevations: async () => {
+    const { overlayMeasurements, groupProps, pageScale, activePageIndex } = get();
+    const mmpp = pageScale?.mm_per_point ?? null;
+    const walls: WallElevationExport[] = [];
+    let wallIndex = 0;
+    for (const mz of overlayMeasurements) {
+      if (mz.measurement_type !== "timber_framing" || mz.page_index !== activePageIndex) continue;
+      let pts: { x: number; y: number }[];
+      try {
+        pts = JSON.parse(mz.geometry_json);
+      } catch {
+        continue;
+      }
+      if (!Array.isArray(pts) || pts.length < 2) continue;
+      wallIndex += 1;
+      const settings = parseFramingSettings(groupProps[mz.dimension_group_id]?.framing_props_json ?? null);
+      const members = wallMembers(pts, settings, mmpp, parseWallFraming(mz.framing_json));
+      if (members.length === 0) continue;
+      walls.push({ label: `Wall ${wallIndex} (measurement #${mz.id})`, settings, elevations: computeWallElevations(members) });
+    }
+    if (walls.length === 0) {
+      console.warn("[exportFramingElevations] No timber framing walls on the current page.");
+      return null;
+    }
+    const path = await exportElevationPdf(walls);
+    if (path) console.log(`[exportFramingElevations] Saved to ${path}`);
+    return path;
   },
 
   removeRecentProject: async (filePath) => {
@@ -1386,6 +1610,10 @@ export const useAppStore = create<AppStore>((set, get) => ({
     set({ templates });
   },
 
+  openNamedCellsManager: () => set({ namedCellsManagerOpen: true }),
+  closeNamedCellsManager: () => set({ namedCellsManagerOpen: false }),
+  setWorkbookConfirmAction: (action) => set({ workbookConfirmAction: action }),
+
   openTemplateManager: () => {
     set({ templateManagerOpen: true });
     void get().loadTemplates();
@@ -1417,6 +1645,15 @@ export const useAppStore = create<AppStore>((set, get) => ({
   deleteTemplate: async (templateId) => {
     await invoke("delete_template", { templateId });
     await get().loadTemplates();
+  },
+
+  exportTemplate: async (templateId, destPath) => {
+    await invoke("export_template", { templateId, destPath });
+  },
+
+  importTemplate: async (srcPath) => {
+    const template = await invoke<TemplateDto>("import_template", { srcPath });
+    set({ templates: [...get().templates, template].sort((a, b) => a.name.localeCompare(b.name)) });
   },
 
   enterTemplateEdit: (template) => {

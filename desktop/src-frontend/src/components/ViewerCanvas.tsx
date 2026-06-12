@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { useAppStore, type SnapPoint, type SnapType } from "../store/appStore";
-import { deriveQuantity, formatQuantity, type GroupProps } from "../lib/quantity";
+import { deriveQuantity, formatQuantity, parseArrayMeta, serializeArrayMeta, type ArrayMeta, type ArrayTrim, type BoxTrim, type GroupProps } from "../lib/quantity";
 import {
   computeFramingGeometry,
   computeFramingQuantities,
@@ -166,10 +166,10 @@ function pathLengthPts(points: PagePoint[]) {
   return total;
 }
 
-// Length and timber-framing dimensions are open polylines; area-type displays close into a
-// polygon; count is a point set. Centralised so every hit-test/render agrees.
+// Length, timber-framing, and array dimensions are open polylines; area-type displays close
+// into a polygon; count is a point set. Centralised so every hit-test/render agrees.
 function isAreaType(measurementType: string) {
-  return measurementType !== "length" && measurementType !== "count" && measurementType !== "timber_framing";
+  return measurementType !== "length" && measurementType !== "count" && measurementType !== "timber_framing" && measurementType !== "array";
 }
 
 /** Canvas dash pattern for a CostX line style. */
@@ -434,6 +434,15 @@ function drawOverlays(
       continue;
     }
 
+    // Array measurements render as N parallel line segments.
+    if (measurement.measurement_type === "array") {
+      if (points.length >= 2) {
+        const meta = parseArrayMeta(measurement.framing_json ?? null);
+        drawArray(ctx, [points[0], points[1]], meta, colour, style, pan, zoom, page, selected, false);
+      }
+      continue;
+    }
+
     if (points.length < 2) continue;
     // "length"/"timber_framing"/"count" are open; everything else closes into an area.
     const isArea = isAreaType(measurement.measurement_type);
@@ -596,6 +605,22 @@ function shiftMeasurements(measurements: MeasurementDto[], dx: number, dy: numbe
   });
 }
 
+/** Flip a set of measurements about a centroid, mirroring the x or y coordinate of every vertex. */
+function flipMeasurements(measurements: MeasurementDto[], centroid: PagePoint, axis: "x" | "y"): MeasurementDto[] {
+  return measurements.map((m) => {
+    try {
+      const pts = JSON.parse(m.geometry_json) as PagePoint[];
+      const flipped =
+        axis === "x"
+          ? pts.map((p) => ({ x: 2 * centroid.x - p.x, y: p.y }))
+          : pts.map((p) => ({ x: p.x, y: 2 * centroid.y - p.y }));
+      return { ...m, geometry_json: JSON.stringify(flipped) };
+    } catch {
+      return m;
+    }
+  });
+}
+
 /** Centroid (average of all vertices) of a set of measurements, in PDF points. */
 function measurementsCentroid(measurements: MeasurementDto[]): PagePoint {
   let sumX = 0;
@@ -614,6 +639,373 @@ function measurementsCentroid(measurements: MeasurementDto[]): PagePoint {
     }
   }
   return count > 0 ? { x: sumX / count, y: sumY / count } : { x: 0, y: 0 };
+}
+
+// ─── Array measurement utilities ──────────────────────────────────────────────
+
+/** Unit perpendicular vector to the segment p1→p2, rotated 90° CCW (leftward). */
+function arrayPerp(p1: PagePoint, p2: PagePoint): PagePoint {
+  const dx = p2.x - p1.x;
+  const dy = p2.y - p1.y;
+  const len = Math.hypot(dx, dy);
+  if (len < 1e-9) return { x: 0, y: 1 };
+  return { x: -dy / len, y: dx / len };
+}
+
+/** Signed perpendicular distance of cursor from the baseline (positive = left/CCW side). */
+function arraySignedOffset(p1: PagePoint, p2: PagePoint, cursor: PagePoint): number {
+  const perp = arrayPerp(p1, p2);
+  return (cursor.x - p1.x) * perp.x + (cursor.y - p1.y) * perp.y;
+}
+
+/**
+ * Compute all member line segments for an array.
+ * Member 0 is the baseline; members 1..extraMembers are offset by spacingPts × direction.
+ */
+function getArrayMembers(p1: PagePoint, p2: PagePoint, meta: ArrayMeta): [PagePoint, PagePoint][] {
+  const perp = arrayPerp(p1, p2);
+  const members: [PagePoint, PagePoint][] = [];
+  for (let i = 0; i <= meta.extraMembers; i += 1) {
+    const offset = i * meta.spacingPts * meta.direction;
+    members.push([
+      { x: p1.x + perp.x * offset, y: p1.y + perp.y * offset },
+      { x: p2.x + perp.x * offset, y: p2.y + perp.y * offset },
+    ]);
+  }
+  return members;
+}
+
+/** Signed distance of point (px,py) from the infinite line through (lx1,ly1)→(lx2,ly2). */
+function sideOfLine(px: number, py: number, lx1: number, ly1: number, lx2: number, ly2: number): number {
+  return (lx2 - lx1) * (py - ly1) - (ly2 - ly1) * (px - lx1);
+}
+
+/**
+ * Convert relative-stored trim coords back to absolute page coords by adding the baseline origin.
+ * Trims are stored relative to the measurement's pts[0] so they move with the array automatically.
+ */
+function absTrims(trims: ArrayTrim[], origin: PagePoint): ArrayTrim[] {
+  if (trims.length === 0) return trims;
+  return trims.map((t): ArrayTrim => {
+    if (t.kind === "box") {
+      return {
+        kind: "box",
+        points: t.points.map((p) => ({ x: p.x + origin.x, y: p.y + origin.y })),
+        keepX: t.keepX + origin.x, keepY: t.keepY + origin.y,
+      };
+    }
+    return {
+      x1: t.x1 + origin.x, y1: t.y1 + origin.y,
+      x2: t.x2 + origin.x, y2: t.y2 + origin.y,
+      keepX: t.keepX + origin.x, keepY: t.keepY + origin.y,
+    };
+  });
+}
+
+/** Even-odd point-in-polygon test. */
+function pointInPolygon(pt: PagePoint, poly: PagePoint[]): boolean {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const xi = poly[i].x, yi = poly[i].y;
+    const xj = poly[j].x, yj = poly[j].y;
+    const intersect = yi > pt.y !== yj > pt.y && pt.x < ((xj - xi) * (pt.y - yi)) / (yj - yi) + xi;
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
+/** Parameter values t in (0,1) where segment AB crosses an edge of poly. */
+function segmentPolygonCrossings(seg: [PagePoint, PagePoint], poly: PagePoint[]): number[] {
+  const [a, b] = seg;
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const ts: number[] = [];
+  for (let i = 0; i < poly.length; i += 1) {
+    const c = poly[i];
+    const d = poly[(i + 1) % poly.length];
+    const ex = d.x - c.x;
+    const ey = d.y - c.y;
+    const denom = dx * ey - dy * ex;
+    if (Math.abs(denom) < 1e-12) continue;
+    const t = ((c.x - a.x) * ey - (c.y - a.y) * ex) / denom;
+    const u = ((c.x - a.x) * dy - (c.y - a.y) * dx) / denom;
+    if (t > 1e-9 && t < 1 - 1e-9 && u >= 0 && u <= 1) ts.push(t);
+  }
+  return ts;
+}
+
+/** Clip a segment to the inside or outside of a polygon, per trim.keepX/keepY. May yield 0..n pieces. */
+function clipSegmentToBox(seg: [PagePoint, PagePoint], trim: BoxTrim): [PagePoint, PagePoint][] {
+  const poly = trim.points;
+  if (poly.length < 3) return [seg];
+  const keepInside = pointInPolygon({ x: trim.keepX, y: trim.keepY }, poly);
+  const [a, b] = seg;
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  if (dx * dx + dy * dy < 1e-12) {
+    return pointInPolygon(a, poly) === keepInside ? [seg] : [];
+  }
+  const ts = segmentPolygonCrossings(seg, poly).sort((x, y) => x - y);
+  const breakpoints = [0, ...ts, 1];
+  const result: [PagePoint, PagePoint][] = [];
+  for (let i = 0; i < breakpoints.length - 1; i += 1) {
+    const t0 = breakpoints[i];
+    const t1 = breakpoints[i + 1];
+    if (t1 - t0 < 1e-9) continue;
+    const tm = (t0 + t1) / 2;
+    const inside = pointInPolygon({ x: a.x + dx * tm, y: a.y + dy * tm }, poly);
+    if (inside === keepInside) {
+      result.push([
+        { x: a.x + dx * t0, y: a.y + dy * t0 },
+        { x: a.x + dx * t1, y: a.y + dy * t1 },
+      ]);
+    }
+  }
+  return result;
+}
+
+/**
+ * Clips segment [A,B] to the half-plane containing trim.keepPt (line trim) or to the
+ * inside/outside of the polygon containing trim.keepPt (box trim). May yield 0..n pieces.
+ */
+function clipSegmentToSide(seg: [PagePoint, PagePoint], trim: ArrayTrim): [PagePoint, PagePoint][] {
+  if (trim.kind === "box") return clipSegmentToBox(seg, trim);
+
+  const { x1, y1, x2, y2, keepX, keepY } = trim;
+  // Negate sign: sideOfLine gives positive=left in math orientation, but in the Y-up page
+  // coordinate system rendered to a Y-down screen the perceived left/right is inverted.
+  const keepSign = -Math.sign(sideOfLine(keepX, keepY, x1, y1, x2, y2));
+  if (keepSign === 0) return [seg]; // degenerate trim line
+
+  const dA = sideOfLine(seg[0].x, seg[0].y, x1, y1, x2, y2);
+  const dB = sideOfLine(seg[1].x, seg[1].y, x1, y1, x2, y2);
+  const sideA = Math.sign(dA);
+  const sideB = Math.sign(dB);
+
+  const aKept = sideA === 0 || sideA === keepSign;
+  const bKept = sideB === 0 || sideB === keepSign;
+
+  if (aKept && bKept) return [seg];
+  if (!aKept && !bKept) return [];
+
+  // Compute intersection of segment with trim line.
+  const denom = dA - dB;
+  if (Math.abs(denom) < 1e-12) return aKept ? [seg] : [];
+  const t = Math.max(0, Math.min(1, dA / denom));
+  const ix = seg[0].x + t * (seg[1].x - seg[0].x);
+  const iy = seg[0].y + t * (seg[1].y - seg[0].y);
+  const inter: PagePoint = { x: ix, y: iy };
+
+  // The member crosses the *infinite* trim line, but only clip it if that crossing
+  // point falls within the drawn trim segment's extent — members outside the trim
+  // line's extent are left untouched.
+  const trimDx = x2 - x1;
+  const trimDy = y2 - y1;
+  const trimLenSq = trimDx * trimDx + trimDy * trimDy;
+  if (trimLenSq > 1e-12) {
+    const tTrim = ((ix - x1) * trimDx + (iy - y1) * trimDy) / trimLenSq;
+    if (tTrim < 0 || tTrim > 1) return [seg];
+  }
+
+  return aKept ? [[seg[0], inter]] : [[inter, seg[1]]];
+}
+
+/** Apply all trims sequentially to a segment. Each trim may split a segment into multiple pieces. */
+function applyTrimsToSegment(seg: [PagePoint, PagePoint], trims: ArrayTrim[]): [PagePoint, PagePoint][] {
+  let segments: [PagePoint, PagePoint][] = [seg];
+  for (const trim of trims) {
+    const next: [PagePoint, PagePoint][] = [];
+    for (const s of segments) next.push(...clipSegmentToSide(s, trim));
+    segments = next;
+    if (segments.length === 0) return [];
+  }
+  return segments;
+}
+
+/** Whether applying `trim` to `seg` changes it (i.e. the trim shape actually crosses this member). */
+function trimAffectsSegment(seg: [PagePoint, PagePoint], trim: ArrayTrim): boolean {
+  const result = clipSegmentToSide(seg, trim);
+  if (result.length !== 1) return true;
+  const [r] = result;
+  const eps = 1e-9;
+  const same =
+    Math.abs(r[0].x - seg[0].x) < eps && Math.abs(r[0].y - seg[0].y) < eps &&
+    Math.abs(r[1].x - seg[1].x) < eps && Math.abs(r[1].y - seg[1].y) < eps;
+  return !same;
+}
+
+/** Render a committed or draft array onto the canvas. */
+function drawArray(
+  ctx: CanvasRenderingContext2D,
+  baseline: [PagePoint, PagePoint],
+  meta: ArrayMeta,
+  colour: string,
+  style: string | undefined,
+  pan: { x: number; y: number },
+  zoom: number,
+  page: PageMeta,
+  selected: boolean,
+  showVertices: boolean,
+) {
+  const members = getArrayMembers(baseline[0], baseline[1], meta);
+  const absTrimsList = absTrims(meta.trims, baseline[0]);
+  ctx.save();
+  ctx.strokeStyle = colour;
+  ctx.lineWidth = selected ? MEASURE_LINE_WIDTH + 1.5 : MEASURE_LINE_WIDTH;
+  ctx.setLineDash(lineDash(style));
+  ctx.lineCap = "round";
+
+  for (const member of members) {
+    for (const clipped of applyTrimsToSegment(member, absTrimsList)) {
+      const a = pageToScreen(clipped[0].x, clipped[0].y, page.height_pts, pan, zoom);
+      const b = pageToScreen(clipped[1].x, clipped[1].y, page.height_pts, pan, zoom);
+      ctx.beginPath();
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
+      ctx.stroke();
+    }
+  }
+  ctx.setLineDash([]);
+
+  if (showVertices || selected) {
+    const screenPts = baseline.map((p) => pageToScreen(p.x, p.y, page.height_pts, pan, zoom));
+    drawVertices(ctx, screenPts, colour, selected);
+  }
+  ctx.restore();
+}
+
+/** Render a ghost array during extrusion (in-progress drawing). */
+function drawArrayDraft(
+  ctx: CanvasRenderingContext2D,
+  baseline: [PagePoint, PagePoint],
+  extraMembers: number,
+  direction: number,
+  spacingPts: number,
+  colour: string,
+  pan: { x: number; y: number },
+  zoom: number,
+  page: PageMeta,
+) {
+  const meta: ArrayMeta = { extraMembers, spacingPts, direction, trims: [] };
+  const members = getArrayMembers(baseline[0], baseline[1], meta);
+  ctx.save();
+  ctx.lineCap = "round";
+  ctx.setLineDash([]);
+
+  // Baseline drawn at full opacity; extra members at reduced opacity.
+  for (let i = 0; i < members.length; i += 1) {
+    const a = pageToScreen(members[i][0].x, members[i][0].y, page.height_pts, pan, zoom);
+    const b = pageToScreen(members[i][1].x, members[i][1].y, page.height_pts, pan, zoom);
+    ctx.globalAlpha = i === 0 ? 1 : 0.7;
+    ctx.strokeStyle = colour;
+    ctx.lineWidth = MEASURE_LINE_WIDTH;
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  ctx.restore();
+}
+
+/** Draw the in-progress trim outline: a dashed line for "line" trim, or a dashed polygon for "box" trim. */
+function drawArrayTrimOutline(
+  ctx: CanvasRenderingContext2D,
+  draft: PagePoint[],
+  livePoint: PagePoint | null,
+  trimType: "line" | "box",
+  pan: { x: number; y: number },
+  zoom: number,
+  page: PageMeta,
+) {
+  const path = livePoint ? [...draft, livePoint] : draft;
+  if (path.length < 2) return;
+  ctx.save();
+  ctx.strokeStyle = "#FFD700";
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([6, 4]);
+  ctx.beginPath();
+  const screenPts = path.map((p) => pageToScreen(p.x, p.y, page.height_pts, pan, zoom));
+  ctx.moveTo(screenPts[0].x, screenPts[0].y);
+  for (let i = 1; i < screenPts.length; i += 1) ctx.lineTo(screenPts[i].x, screenPts[i].y);
+  if (trimType === "box" && draft.length >= 3) {
+    // Close the polygon back to the start once at least a triangle is drawn.
+    ctx.lineTo(screenPts[0].x, screenPts[0].y);
+  }
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.restore();
+}
+
+/**
+ * Render the ghost trim preview: ghost highlighting showing which array
+ * members on the kept side of `ghostTrim` are still visible.
+ */
+function drawArrayTrimPreview(
+  ctx: CanvasRenderingContext2D,
+  ghostTrim: ArrayTrim,
+  measurements: MeasurementDto[],
+  groupProps: Record<number, GroupProps>,
+  pan: { x: number; y: number },
+  zoom: number,
+  page: PageMeta,
+  pageIndex: number,
+  activeDimensionGroupId: number | null,
+) {
+  ctx.save();
+
+  for (const m of measurements) {
+    if (m.page_index !== pageIndex) continue;
+    if (m.measurement_type !== "array") continue;
+    if (activeDimensionGroupId !== null && m.dimension_group_id !== activeDimensionGroupId) continue;
+    let pts: PagePoint[];
+    try { pts = JSON.parse(m.geometry_json); } catch { continue; }
+    if (!Array.isArray(pts) || pts.length < 2) continue;
+
+    const meta = parseArrayMeta(m.framing_json ?? null);
+    const members = getArrayMembers(pts[0], pts[1], meta);
+    const props = groupProps[m.dimension_group_id];
+    const col = props?.pos_colour ?? "#4A9EFF";
+
+    ctx.strokeStyle = col;
+    ctx.lineWidth = MEASURE_LINE_WIDTH;
+    ctx.lineCap = "round";
+    ctx.setLineDash([]);
+
+    const absMeta = absTrims(meta.trims, pts[0]);
+
+    // Pass 1: draw all existing-trimmed members dimly (shows the full shape as context).
+    ctx.globalAlpha = 0.2;
+    for (const member of members) {
+      for (const seg of applyTrimsToSegment(member, absMeta)) {
+        const a = pageToScreen(seg[0].x, seg[0].y, page.height_pts, pan, zoom);
+        const b = pageToScreen(seg[1].x, seg[1].y, page.height_pts, pan, zoom);
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.y);
+        ctx.lineTo(b.x, b.y);
+        ctx.stroke();
+      }
+    }
+
+    // Pass 2: draw only the kept portions brightly (shows what will survive the trim).
+    ctx.globalAlpha = 0.9;
+    for (const member of members) {
+      for (const afterExisting of applyTrimsToSegment(member, absMeta)) {
+        for (const kept of clipSegmentToSide(afterExisting, ghostTrim)) {
+          const a = pageToScreen(kept[0].x, kept[0].y, page.height_pts, pan, zoom);
+          const b = pageToScreen(kept[1].x, kept[1].y, page.height_pts, pan, zoom);
+          ctx.beginPath();
+          ctx.moveTo(a.x, a.y);
+          ctx.lineTo(b.x, b.y);
+          ctx.stroke();
+        }
+      }
+    }
+
+    ctx.globalAlpha = 1;
+  }
+
+  ctx.restore();
 }
 
 type ScaleUnit = "mm" | "cm" | "m";
@@ -751,7 +1143,7 @@ export function ViewerCanvas({
   // Right-click → Door options: the opening being edited in place.
   const [pendingOpeningEdit, setPendingOpeningEdit] = useState<{ measurementId: number; index: number; template: OpeningTemplate } | null>(null);
   // Right-click → Set Raking Frame: the segment being raked.
-  const [pendingRake, setPendingRake] = useState<{ measurementId: number; segmentIndex: number; start: number; end: number } | null>(null);
+  const [pendingRake, setPendingRake] = useState<{ measurementId: number; segmentIndex: number; start: number; end: number; gable: boolean; middle?: number } | null>(null);
   // Ctrl-hover (select mode): ghost position for a manually-placed extra stud.
   const [studGhost, setStudGhost] = useState<{ measurementId: number; segmentIndex: number; centreMm: number } | null>(null);
   // Right-click → View wall in 3D: the wall shown in the isolated 3D modal.
@@ -768,6 +1160,16 @@ export function ViewerCanvas({
   // Paste ghost mode: centroid = clipboard centroid; ghost follows cursor
   const [pasteMode, setPasteMode] = useState<{ centroid: PagePoint } | null>(null);
   const pasteModeRef = useRef<{ centroid: PagePoint } | null>(null);
+
+  // Array extrusion: how many extra members (beyond the baseline) and in which direction.
+  const [arrayExtraMembers, setArrayExtraMembers] = useState(0);
+  const [arrayDirection, setArrayDirection] = useState(1);
+  const arrayExtraMembersRef = useRef(0);
+  const arrayDirectionRef = useRef(1);
+  // Array trim tool: in-progress trim line (0, 1, or 2 points) and the kept-side reference point.
+  const [arrayTrimDraft, setArrayTrimDraft] = useState<PagePoint[]>([]);
+  const [arrayTrimKeepPt, setArrayTrimKeepPt] = useState<PagePoint | null>(null);
+  const arrayTrimDraftRef = useRef<PagePoint[]>([]);
 
   const vertexDragRef = useRef<{ measurementId: number; vertexIndex: number } | null>(null);
   const draftPointsRef = useRef<PagePoint[]>([]);
@@ -805,6 +1207,9 @@ export function ViewerCanvas({
   const deleteMeasurement = useAppStore((state) => state.deleteMeasurement);
   const openingPlacement = useAppStore((state) => state.openingPlacement);
   const setOpeningPlacement = useAppStore((state) => state.setOpeningPlacement);
+  const arrayTrimMode = useAppStore((state) => state.arrayTrimMode);
+  const setArrayTrimMode = useAppStore((state) => state.setArrayTrimMode);
+  const arrayTrimType = useAppStore((state) => state.arrayTrimType);
   const activeDimensionGroupId = useAppStore((state) => state.activeDimensionGroupId);
   const activeDrawingId = useAppStore((state) => state.activeDrawingId);
   const viewerMode = useAppStore((state) => state.viewerMode);
@@ -830,6 +1235,14 @@ export function ViewerCanvas({
   const drawingArea = activeProps?.measurement_type === "area";
   const drawingCount = activeProps?.measurement_type === "count";
   const drawingFraming = activeProps?.measurement_type === "timber_framing";
+  const drawingArray = activeProps?.measurement_type === "array";
+  // Spacing in PDF points: default_width stores metres; convert using page scale.
+  const arraySpacingPts = (() => {
+    const spacingM = activeProps?.default_width ?? 0.6;
+    const mmpp = pageScale?.mm_per_point ?? null;
+    if (!mmpp || mmpp <= 0) return 0;
+    return (spacingM * 1000) / mmpp;
+  })();
 
   const selectedSet = useMemo(() => new Set(selectedMeasurementIds), [selectedMeasurementIds]);
   // Vertex drag only available when exactly one measurement is selected.
@@ -859,14 +1272,37 @@ export function ViewerCanvas({
     if (!measuring) {
       applyDraft([]);
       lastEndpointRef.current = null;
+      arrayExtraMembersRef.current = 0;
+      arrayDirectionRef.current = 1;
+      setArrayExtraMembers(0);
+      setArrayDirection(1);
     }
   }, [measuring, applyDraft]);
+
+  // Reset trim state when trim mode is toggled off, or the trim type is switched mid-draft.
+  useEffect(() => {
+    if (!arrayTrimMode) {
+      setArrayTrimDraft([]);
+      arrayTrimDraftRef.current = [];
+      setArrayTrimKeepPt(null);
+    }
+  }, [arrayTrimMode]);
+
+  useEffect(() => {
+    setArrayTrimDraft([]);
+    arrayTrimDraftRef.current = [];
+    setArrayTrimKeepPt(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [arrayTrimType]);
 
   // A fresh page has no in-progress path or resumable endpoint.
   useEffect(() => {
     applyDraft([]);
     lastEndpointRef.current = null;
     setHoverInfo(null);
+    setArrayTrimDraft([]);
+    arrayTrimDraftRef.current = [];
+    setArrayTrimKeepPt(null);
   }, [pageIndex, doc?.path, applyDraft]);
 
   // Load the scale for whichever drawing page is in view.
@@ -936,6 +1372,59 @@ export function ViewerCanvas({
       }
     },
     [createMeasurement, onStatusChange, drawingArea],
+  );
+
+  const commitArrayDraft = useCallback(
+    async (baseline: [PagePoint, PagePoint], extraMembers: number, direction: number) => {
+      const meta: ArrayMeta = {
+        extraMembers,
+        spacingPts: arraySpacingPts,
+        direction,
+        trims: [],
+      };
+      try {
+        const created = await createMeasurement({ geometryJson: JSON.stringify(baseline) });
+        if (created) {
+          await updateMeasurementFraming(created.id, serializeArrayMeta(meta));
+        }
+        lastEndpointRef.current = baseline[1];
+      } catch (error) {
+        onStatusChange(`ERROR: ${error}`);
+      }
+    },
+    [arraySpacingPts, createMeasurement, updateMeasurementFraming, onStatusChange],
+  );
+
+  const commitArrayTrim = useCallback(
+    async (absTrim: ArrayTrim) => {
+      const targets = overlayMeasurements.filter(
+        (m) => m.page_index === pageIndex && m.measurement_type === "array" &&
+          (activeDimensionGroupId === null || m.dimension_group_id === activeDimensionGroupId),
+      );
+      // Only trim measurements whose members are actually affected by the trim shape.
+      for (const m of targets) {
+        let pts: PagePoint[];
+        try { pts = JSON.parse(m.geometry_json); } catch { continue; }
+        if (!Array.isArray(pts) || pts.length < 2) continue;
+        const existingMeta = parseArrayMeta(m.framing_json ?? null);
+        const members = getArrayMembers(pts[0], pts[1], existingMeta);
+        const anyAffected = members.some((seg) => trimAffectsSegment(seg, absTrim));
+        if (!anyAffected) continue;
+        // Store trim relative to pts[0] so it follows the array if the geometry is moved.
+        const [relTrim] = absTrims([absTrim], { x: -pts[0].x, y: -pts[0].y });
+        const updated: ArrayMeta = { ...existingMeta, trims: [...existingMeta.trims, relTrim] };
+        try {
+          await updateMeasurementFraming(m.id, serializeArrayMeta(updated));
+        } catch (error) {
+          onStatusChange(`ERROR: ${error}`);
+        }
+      }
+      // Clear trim draft after committing.
+      setArrayTrimDraft([]);
+      arrayTrimDraftRef.current = [];
+      setArrayTrimKeepPt(null);
+    },
+    [overlayMeasurements, pageIndex, activeDimensionGroupId, updateMeasurementFraming, onStatusChange],
   );
 
   const mergeTiles = useCallback((incoming: TileData[]) => {
@@ -1208,7 +1697,14 @@ export function ViewerCanvas({
     ctx.beginPath();
     ctx.rect(-pan.x, -pan.y, pageSize.width, pageSize.height);
     ctx.clip();
-    drawOverlays(ctx, overlayMeasurements, groupColours, groupProps, overlayColour, pan, zoom, page, pageIndex, selectedSet, editPreview, pageScale?.mm_per_point ?? null);
+    // During trim preview (trim line placed, cursor determines kept side) exclude the active-group
+    // arrays from the normal render — drawArrayTrimPreview draws them with ghost opacities instead.
+    const trimDraftReady = arrayTrimType === "box" ? arrayTrimDraft.length >= 3 : arrayTrimDraft.length === 2;
+    const trimPreviewActive = arrayTrimMode && trimDraftReady && activeDimensionGroupId !== null;
+    const overlaysToRender = trimPreviewActive
+      ? overlayMeasurements.filter((m) => !(m.measurement_type === "array" && m.dimension_group_id === activeDimensionGroupId))
+      : overlayMeasurements;
+    drawOverlays(ctx, overlaysToRender, groupColours, groupProps, overlayColour, pan, zoom, page, pageIndex, selectedSet, editPreview, pageScale?.mm_per_point ?? null);
     if (measuring) {
       if (drawingType === "line") {
         // Line mode: draw the detected wall segment as the live preview instead of a rubber-band.
@@ -1223,6 +1719,16 @@ export function ViewerCanvas({
         const draftPath = livePoint ? [...draftPoints, livePoint] : draftPoints;
         const settings = parseFramingSettings(activeProps?.framing_props_json ?? null);
         drawFraming(ctx, draftPath, settings, pageScale?.mm_per_point ?? null, draftColour, draftStyle, pan, zoom, page, false, true);
+      } else if (drawingArray) {
+        const livePoint = snapPoint ?? cursorPagePoint;
+        if (draftPoints.length >= 2) {
+          // Extruding phase: show ghost array based on cursor's perpendicular offset.
+          const baseline: [PagePoint, PagePoint] = [draftPoints[0], draftPoints[1]];
+          drawArrayDraft(ctx, baseline, arrayExtraMembers, arrayDirection, arraySpacingPts, draftColour, pan, zoom, page);
+        } else {
+          // Baseline phase: rubber-band the first segment.
+          drawDraft(ctx, draftPoints, livePoint, draftColour, pan, zoom, page, draftStyle, false);
+        }
       } else {
         const livePoint = snapPoint ?? cursorPagePoint;
         drawDraft(ctx, draftPoints, livePoint, draftColour, pan, zoom, page, draftStyle, drawingArea);
@@ -1329,6 +1835,40 @@ export function ViewerCanvas({
       ctx.restore();
     }
 
+    // Array trim tool: draw in-progress trim outline and ghost of the trim result.
+    if (arrayTrimMode && page) {
+      const livePoint = snapPoint ?? cursorPagePoint;
+      // Use cursor position as keep-side reference; falls back to cursorPagePoint
+      // so the ghost renders immediately once enough points are placed.
+      const effectiveKeepPt = arrayTrimKeepPt ?? cursorPagePoint;
+
+      if (arrayTrimType === "line") {
+        if (arrayTrimDraft.length === 1) {
+          drawArrayTrimOutline(ctx, arrayTrimDraft, livePoint, "line", pan, zoom, page);
+        } else if (arrayTrimDraft.length === 2 && effectiveKeepPt) {
+          const ghostTrim: ArrayTrim = {
+            x1: arrayTrimDraft[0].x, y1: arrayTrimDraft[0].y,
+            x2: arrayTrimDraft[1].x, y2: arrayTrimDraft[1].y,
+            keepX: effectiveKeepPt.x, keepY: effectiveKeepPt.y,
+          };
+          drawArrayTrimPreview(ctx, ghostTrim, overlayMeasurements, groupProps, pan, zoom, page, pageIndex, activeDimensionGroupId);
+        }
+      } else {
+        // Box trim: draw the in-progress polygon outline (rubber-banded to the cursor).
+        if (arrayTrimDraft.length >= 1) {
+          drawArrayTrimOutline(ctx, arrayTrimDraft, livePoint, "box", pan, zoom, page);
+        }
+        if (arrayTrimDraft.length >= 3 && effectiveKeepPt) {
+          const ghostTrim: BoxTrim = {
+            kind: "box",
+            points: arrayTrimDraft,
+            keepX: effectiveKeepPt.x, keepY: effectiveKeepPt.y,
+          };
+          drawArrayTrimPreview(ctx, ghostTrim, overlayMeasurements, groupProps, pan, zoom, page, pageIndex, activeDimensionGroupId);
+        }
+      }
+    }
+
     // Show the point-snap indicator only in point mode; line mode uses the segment preview.
     if (drawingType !== "line") {
       drawSnapIndicator(ctx, snapPoint, snapType, pan, zoom, page);
@@ -1370,7 +1910,7 @@ export function ViewerCanvas({
         }
       }
     }
-  }, [activeProps, calibDialog, calibPoints, calibrating, clipboard, cursorPagePoint, doc, draftColour, draftPoints, draftStyle, drawingArea, drawingFraming, drawingType, editPreview, groupColours, groupProps, lineSnapResult, marqueeState, measuring, moveMode, openingGhost, openingPlacement, overlayColour, overlayMeasurements, page, pageIndex, pageScale, pageSize.height, pageSize.width, pan, pasteMode, selectedSet, shiftHeld, snapPoint, snapType, studGhost, viewportSize.height, viewportSize.width, zoom]);
+  }, [activeProps, activeDimensionGroupId, arrayDirection, arrayExtraMembers, arraySpacingPts, arrayTrimDraft, arrayTrimKeepPt, arrayTrimMode, arrayTrimType, calibDialog, calibPoints, calibrating, clipboard, cursorPagePoint, doc, draftColour, draftPoints, draftStyle, drawingArea, drawingArray, drawingFraming, drawingType, editPreview, groupColours, groupProps, lineSnapResult, marqueeState, measuring, moveMode, openingGhost, openingPlacement, overlayColour, overlayMeasurements, page, pageIndex, pageScale, pageSize.height, pageSize.width, pan, pasteMode, selectedSet, shiftHeld, snapPoint, snapType, studGhost, viewportSize.height, viewportSize.width, zoom]);
 
   function clampPan(nextPan: { x: number; y: number }, nextZoom = zoom) {
     if (!page) return nextPan;
@@ -1426,6 +1966,39 @@ export function ViewerCanvas({
       return;
     }
 
+    // Array trim mode: left click places trim shape points.
+    if (arrayTrimMode && page && activeDimensionGroupId !== null) {
+      const point = placementPoint(event.clientX, event.clientY);
+      if (!point) return;
+      const current = arrayTrimDraftRef.current;
+      if (arrayTrimType === "line") {
+        if (current.length === 0) {
+          arrayTrimDraftRef.current = [point];
+          setArrayTrimDraft([point]);
+        } else if (current.length === 1) {
+          arrayTrimDraftRef.current = [current[0], point];
+          setArrayTrimDraft([current[0], point]);
+          // Keep-side will be determined by cursor on the next move.
+        } else if (current.length === 2) {
+          // Third click commits the trim with the current keep-side.
+          if (arrayTrimKeepPt) {
+            const absTrim: ArrayTrim = {
+              x1: current[0].x, y1: current[0].y,
+              x2: current[1].x, y2: current[1].y,
+              keepX: arrayTrimKeepPt.x, keepY: arrayTrimKeepPt.y,
+            };
+            void commitArrayTrim(absTrim);
+          }
+        }
+      } else {
+        // Box trim: each click adds a polygon vertex; Enter closes and commits.
+        const next = [...current, point];
+        arrayTrimDraftRef.current = next;
+        setArrayTrimDraft(next);
+      }
+      return;
+    }
+
     if (measuring && page) {
       // Line mode: one click places a measurement along the detected wall segment.
       if (drawingType === "line") {
@@ -1443,6 +2016,11 @@ export function ViewerCanvas({
       // Count: each click commits one marker immediately (no path).
       if (drawingCount) {
         void createMeasurement({ geometryJson: JSON.stringify([rawPoint]) }).catch((error) => onStatusChange(`ERROR: ${error}`));
+        return;
+      }
+
+      // Array in extruding phase (baseline already drawn): ignore further clicks.
+      if (drawingArray && draftPointsRef.current.length >= 2) {
         return;
       }
 
@@ -1484,10 +2062,16 @@ export function ViewerCanvas({
         if (vertexIndex >= 0) {
           const points = measurementPoints(singleSelectedId);
           if (points) {
-            event.currentTarget.setPointerCapture(event.pointerId);
-            vertexDragRef.current = { measurementId: singleSelectedId, vertexIndex };
-            setEditPreview({ id: singleSelectedId, points });
-            return;
+            // Block vertex drag on trimmed arrays — resizing the baseline would misalign the trims.
+            const selectedM = overlayMeasurements.find((m) => m.id === singleSelectedId);
+            const isTrimmedArray = selectedM?.measurement_type === "array" &&
+              parseArrayMeta(selectedM.framing_json ?? null).trims.length > 0;
+            if (!isTrimmedArray) {
+              event.currentTarget.setPointerCapture(event.pointerId);
+              vertexDragRef.current = { measurementId: singleSelectedId, vertexIndex };
+              setEditPreview({ id: singleSelectedId, points });
+              return;
+            }
           }
         }
       }
@@ -1567,12 +2151,34 @@ export function ViewerCanvas({
       );
     }
 
-    if (measuring || calibrating || moveMode || pasteMode) {
+    if (measuring || calibrating || moveMode || pasteMode || arrayTrimMode) {
       // Drive the live rubber-band endpoint (drawing a dimension, a calibration line,
       // or a move/paste ghost).
       setCursorClient({ x: event.clientX, y: event.clientY });
       const raw = clientToPagePoint(event.clientX, event.clientY);
       if (raw) setCursorPagePoint(raw);
+
+      // Array extrusion: update ghost member count based on perpendicular offset from baseline.
+      if (measuring && drawingArray && draftPointsRef.current.length >= 2 && raw) {
+        const [p1, p2] = draftPointsRef.current;
+        const spacing = arraySpacingPts;
+        if (spacing > 0) {
+          const signed = arraySignedOffset(p1, p2, raw);
+          const count = Math.floor(Math.abs(signed) / spacing);
+          const dir = signed >= 0 ? 1 : -1;
+          arrayExtraMembersRef.current = count;
+          arrayDirectionRef.current = dir;
+          setArrayExtraMembers(count);
+          setArrayDirection(dir);
+        }
+      }
+
+      // Array trim keep-side: update based on which side/region of the in-progress trim shape the cursor is on.
+      if (arrayTrimMode && raw) {
+        const draftLen = arrayTrimDraftRef.current.length;
+        const ready = arrayTrimType === "box" ? draftLen >= 3 : draftLen === 2;
+        if (ready) setArrayTrimKeepPt({ x: raw.x, y: raw.y });
+      }
     }
 
     // Hover-to-inspect committed dimensions works in add-mode too (add-mode is
@@ -1623,10 +2229,26 @@ export function ViewerCanvas({
   }
 
   function handleContextMenu(event: React.MouseEvent<HTMLDivElement>) {
+    // Trim mode: suppress context menu.
+    if (arrayTrimMode) {
+      event.preventDefault();
+      return;
+    }
+
     if (measuring) {
       if (drawingType === "line") {
         // No draft to finish in line mode; just suppress the context menu.
         event.preventDefault();
+        return;
+      }
+      if (drawingArray) {
+        // Array draw mode: right-click cancels the in-progress draft.
+        event.preventDefault();
+        applyDraft([]);
+        arrayExtraMembersRef.current = 0;
+        arrayDirectionRef.current = 1;
+        setArrayExtraMembers(0);
+        setArrayDirection(1);
         return;
       }
       // Right-click ends the current dimension (CostX finish gesture).
@@ -1711,7 +2333,7 @@ export function ViewerCanvas({
         const vertexIndex = nearestVertex(event.clientX, event.clientY, id, VERTEX_RADIUS + 8);
         if (vertexIndex >= 0 && points.length > minPoints) {
           items.push({ label: "Delete point", danger: true, action: () => deleteVertex(id, vertexIndex) });
-        } else {
+        } else if (measurement.measurement_type !== "array") {
           const segment = hitTestSegment(event.clientX, event.clientY, id);
           if (segment) {
             items.push({ label: "Add point", action: () => addVertex(id, segment.segmentIndex, segment.point) });
@@ -1733,6 +2355,8 @@ export function ViewerCanvas({
                   segmentIndex: seg.segmentIndex,
                   start: existingRake?.startMm ?? groupSettings.wallHeightMm,
                   end: existingRake?.endMm ?? groupSettings.wallHeightMm,
+                  gable: existingRake?.gable ?? false,
+                  middle: existingRake?.middleMm,
                 }),
             });
             if (existingRake) items.push({ label: "Clear raking frame", danger: true, action: () => clearRake(id, seg.segmentIndex) });
@@ -1889,11 +2513,11 @@ export function ViewerCanvas({
   }
 
   // Sets (or replaces) the raking frame on one segment of a wall.
-  function setRake(measurementId: number, segmentIndex: number, startMm: number, endMm: number) {
+  function setRake(measurementId: number, segmentIndex: number, startMm: number, endMm: number, gable: boolean, middleMm?: number) {
     const measurement = overlayMeasurements.find((m) => m.id === measurementId);
     if (!measurement) return;
     const existing = parseWallFraming(measurement.framing_json);
-    const rakes = [...existing.rakes.filter((r) => r.segmentIndex !== segmentIndex), { segmentIndex, startMm, endMm }];
+    const rakes = [...existing.rakes.filter((r) => r.segmentIndex !== segmentIndex), { segmentIndex, startMm, endMm, gable, middleMm: gable ? middleMm : undefined }];
     void updateMeasurementFraming(measurementId, serializeWallFraming({ ...existing, rakes })).catch((error) => onStatusChange(`ERROR: ${error}`));
   }
 
@@ -2090,6 +2714,21 @@ export function ViewerCanvas({
       }
       if (screenPts.length < 2) continue;
 
+      // Array: test all (trimmed) member segments.
+      if (measurement.measurement_type === "array") {
+        const meta = parseArrayMeta(measurement.framing_json ?? null);
+        const members = getArrayMembers(points[0], points[1], meta);
+        const absTrimsList = absTrims(meta.trims, points[0]);
+        for (const member of members) {
+          for (const clipped of applyTrimsToSegment(member, absTrimsList)) {
+            const sa = pageToScreen(clipped[0].x, clipped[0].y, page.height_pts, pan, zoom);
+            const sb = pageToScreen(clipped[1].x, clipped[1].y, page.height_pts, pan, zoom);
+            if (distanceToSegment(screenX, screenY, sa.x, sa.y, sb.x, sb.y) <= tolerance) return measurement.id;
+          }
+        }
+        continue;
+      }
+
       const isArea = isAreaType(measurement.measurement_type);
       const segmentCount = isArea ? screenPts.length : screenPts.length - 1;
       for (let i = 0; i < segmentCount; i += 1) {
@@ -2170,6 +2809,8 @@ export function ViewerCanvas({
         const pts = JSON.parse(m.geometry_json) as PagePoint[];
         const newPts = pts.map((p) => ({ x: p.x + dx, y: p.y + dy }));
         await updateMeasurementGeometry(id, JSON.stringify(newPts)).catch((e) => onStatusChange(`ERROR: ${e}`));
+        // Trims are stored relative to pts[0], so they follow the geometry automatically —
+        // no framing_json update needed here.
       } catch {
         // skip unparseable
       }
@@ -2260,6 +2901,29 @@ export function ViewerCanvas({
         continue;
       }
       if (screenPts.length < 2) continue;
+
+      // Array: hit-test all member segments (after trim).
+      if (measurement.measurement_type === "array") {
+        const meta = parseArrayMeta(measurement.framing_json ?? null);
+        const members = getArrayMembers(points[0], points[1], meta);
+        const absTrimsList = absTrims(meta.trims, points[0]);
+        let hit = false;
+        for (const member of members) {
+          for (const clipped of applyTrimsToSegment(member, absTrimsList)) {
+            const sa = pageToScreen(clipped[0].x, clipped[0].y, page.height_pts, pan, zoom);
+            const sb = pageToScreen(clipped[1].x, clipped[1].y, page.height_pts, pan, zoom);
+            if (distanceToSegment(screenX, screenY, sa.x, sa.y, sb.x, sb.y) <= tolerance) { hit = true; break; }
+          }
+          if (hit) break;
+        }
+        if (hit) {
+          const quantity = props ? deriveQuantity(points, pageScale?.mm_per_point ?? null, props, measurement.framing_json) : null;
+          const text = quantity ? formatQuantity(quantity) : formatLength(pathLengthPts(points), pageScale);
+          setHoverInfo({ x: clientX, y: clientY, text });
+          return;
+        }
+        continue;
+      }
 
       const isArea = isAreaType(measurement.measurement_type);
       const segmentCount = isArea ? screenPts.length : screenPts.length - 1;
@@ -2356,18 +3020,50 @@ export function ViewerCanvas({
     function onKeyDown(event: KeyboardEvent) {
       if (event.key === "Escape") {
         applyDraft([]);
+        arrayExtraMembersRef.current = 0;
+        arrayDirectionRef.current = 1;
+        setArrayExtraMembers(0);
+        setArrayDirection(1);
       } else if (event.key === "Enter") {
-        finishDraft();
+        const pts = draftPointsRef.current;
+        if (drawingArray) {
+          // Array: Enter commits with current extrusion (0 extra = single member).
+          if (pts.length < 2) {
+            onStatusChange("An array needs at least 2 points for the baseline");
+            return;
+          }
+          void commitArrayDraft(
+            [pts[0], pts[1]],
+            arrayExtraMembersRef.current,
+            arrayDirectionRef.current,
+          ).then(() => {
+            applyDraft([]);
+            arrayExtraMembersRef.current = 0;
+            arrayDirectionRef.current = 1;
+            setArrayExtraMembers(0);
+            setArrayDirection(1);
+          });
+        } else {
+          finishDraft();
+        }
       } else if (event.key === "Backspace") {
         event.preventDefault();
-        applyDraft((prev) => prev.slice(0, -1));
+        if (drawingArray && draftPointsRef.current.length >= 2) {
+          // In extruding phase: Backspace cancels extrusion and returns to baseline phase.
+          applyDraft((prev) => prev.slice(0, 1));
+          arrayExtraMembersRef.current = 0;
+          arrayDirectionRef.current = 1;
+          setArrayExtraMembers(0);
+          setArrayDirection(1);
+        } else {
+          applyDraft((prev) => prev.slice(0, -1));
+        }
       }
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-    // finishDraft is defined inline and stable enough for this listener's lifetime.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [measuring, commitDraft, applyDraft]);
+  }, [measuring, drawingArray, commitDraft, commitArrayDraft, applyDraft]);
 
   // Opening placement: Esc cancels; leaving placement clears any ghost.
   useEffect(() => {
@@ -2381,6 +3077,39 @@ export function ViewerCanvas({
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [openingPlacement, setOpeningPlacement]);
+
+  // Array trim mode keyboard: Esc cancels the in-progress trim, Enter commits it.
+  useEffect(() => {
+    if (!arrayTrimMode) return;
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        setArrayTrimDraft([]);
+        arrayTrimDraftRef.current = [];
+        setArrayTrimKeepPt(null);
+      } else if (event.key === "Enter") {
+        const draft = arrayTrimDraftRef.current;
+        if (!arrayTrimKeepPt) return;
+        if (arrayTrimType === "line" && draft.length === 2) {
+          const absTrim: ArrayTrim = {
+            x1: draft[0].x, y1: draft[0].y,
+            x2: draft[1].x, y2: draft[1].y,
+            keepX: arrayTrimKeepPt.x, keepY: arrayTrimKeepPt.y,
+          };
+          void commitArrayTrim(absTrim);
+        } else if (arrayTrimType === "box" && draft.length >= 3) {
+          const absTrim: BoxTrim = {
+            kind: "box",
+            points: draft,
+            keepX: arrayTrimKeepPt.x, keepY: arrayTrimKeepPt.y,
+          };
+          void commitArrayTrim(absTrim);
+        }
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [arrayTrimMode, arrayTrimType, arrayTrimKeepPt, commitArrayTrim]);
 
   // Releasing Ctrl (or leaving select mode) clears the extra-stud ghost.
   useEffect(() => {
@@ -2454,6 +3183,17 @@ export function ViewerCanvas({
         if (clipboardRef.current.length > 0) startPaste();
         return;
       }
+      // Arrow keys while in paste ghost mode — flip the clipboard contents about their
+      // centroid so the ghost preview mirrors left/right or up/down.
+      if (pasteModeRef.current && (event.key === "ArrowLeft" || event.key === "ArrowRight" || event.key === "ArrowUp" || event.key === "ArrowDown")) {
+        event.preventDefault();
+        const axis = event.key === "ArrowLeft" || event.key === "ArrowRight" ? "x" : "y";
+        const centroid = measurementsCentroid(clipboardRef.current);
+        const flipped = flipMeasurements(clipboardRef.current, centroid, axis);
+        clipboardRef.current = flipped;
+        setClipboard(flipped);
+        return;
+      }
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
@@ -2470,6 +3210,16 @@ export function ViewerCanvas({
       return formatLength(pathLengthPts([...calibPoints, livePoint]), pageScale);
     }
     if (measuring && draftPoints.length >= 1) {
+      if (drawingArray) {
+        const pts = livePoint && draftPoints.length < 2 ? [...draftPoints, livePoint] : draftPoints;
+        if (pts.length < 2) return null;
+        const baseLenM = pathLengthPts([pts[0], pts[1]]) * ((pageScale?.mm_per_point ?? 0) / 1000);
+        const totalMembers = 1 + arrayExtraMembers;
+        const totalM = totalMembers * baseLenM;
+        return baseLenM > 0
+          ? `${totalMembers} member${totalMembers !== 1 ? "s" : ""} · ${totalM.toFixed(3)} m`
+          : null;
+      }
       const pts = livePoint ? [...draftPoints, livePoint] : draftPoints;
       if (pts.length < 2) return null;
       if (drawingFraming) {
@@ -2504,7 +3254,7 @@ export function ViewerCanvas({
         minHeight: 0,
         overflow: "hidden",
         cursor: doc
-          ? measuring || calibrating || openingPlacement
+          ? measuring || calibrating || openingPlacement || arrayTrimMode
             ? "crosshair"
             : moveMode || pasteMode
               ? "crosshair"
@@ -2613,9 +3363,11 @@ export function ViewerCanvas({
       <RakingDialog
         initialStart={pendingRake.start}
         initialEnd={pendingRake.end}
+        initialMiddle={pendingRake.middle}
+        initialGable={pendingRake.gable}
         onCancel={() => setPendingRake(null)}
-        onConfirm={(startMm, endMm) => {
-          setRake(pendingRake.measurementId, pendingRake.segmentIndex, startMm, endMm);
+        onConfirm={(startMm, endMm, gable, middleMm) => {
+          setRake(pendingRake.measurementId, pendingRake.segmentIndex, startMm, endMm, gable, middleMm);
           setPendingRake(null);
         }}
       />

@@ -91,6 +91,15 @@ example in /docs called 3d-1.png & 3d-2.png
 the user pan and zoom around to view the 3d render.
 within the right click menu on a wall in select mode, the user can click "View wall in 3D" which renders that wall in isolation within a popup modal. it inherits the same navigation (pan, zoom etc) as the full 3d view.
 
+"View in 3D" is a dropdown (small caret on the button): "Current Page" (the behaviour above) or
+"View Multiple Pages...", which opens a setup dialog. The dialog lists every page of the active
+drawing that has timber-framing dimension groups, with a checkbox to include each page, a
+checkbox per dimension group on that page (to choose which framing to pull in), and a per-page
+Z-offset (metres) used to stack storeys vertically in the 3D scene. Rows can be dragged to set
+draw order. On confirm, all included pages render together in one 3D scene, each offset along
+world Y by its Z-offset; only pages at or below Z-0 show their PDF page as a ground plane (pages
+above Z-0 render framing only, with the page render hidden).
+
 #Implementation Plan#
 
 - plan only at this stage, do not make any code changes until I approve milestones and plan
@@ -99,3 +108,150 @@ within the right click menu on a wall in select mode, the user can click "View w
 - consider the best place to have milestones for this project and thier gates. 
 - thouroughly document the process.
 - we need to visually check that quantity makeup is correct, devise a way to report quantity makeup of walls durirg testing / development so i can verify that the logic is sound.
+
+---
+
+## Array Measurement Tool
+
+A measurement type for evenly-spaced parallel elements — reinforcing bar layouts, floor joists, ceiling battens, stud arrays, fence pales, and similar repeating linear members.
+
+### Injection Point
+
+Selected from the Measurement Type dropdown in Dimension Group Properties — called **Array**. Icon: `data_array` (Material Symbols Outlined).
+
+### Dimension Group Properties
+
+When Array is selected the properties dialog changes as follows:
+
+- **Default Display** is locked to **Length** — no dropdown is shown (array quantity is always expressed as total lineal metres of all members combined).
+- **Default Width** field label changes to **Default Spacing** — sets the centre-to-centre spacing between members in metres (e.g. 0.600 for 600 mm joist spacing). This value is carried into each new measurement at draw time.
+- **Default Height** field is hidden — not applicable.
+- Default Multiplier, Default Offset, colours, and line styles behave identically to other measurement types.
+
+### Drawing Mechanics
+
+Drawing an array is a two-phase process:
+
+**Phase 1 — Baseline**
+The user clicks to place the first endpoint of the baseline, then clicks again to place the second. The baseline defines the direction and length of every member in the array. Snap follows the ribbon Geometry (snap) toggle; standard endpoint/midpoint/intersection snaps apply.
+
+**Phase 2 — Extrusion**
+After the second baseline click the tool enters extrusion mode. Moving the cursor perpendicular to the baseline shows a live ghost array: all members render as dashed lines evenly spaced at the group's Default Spacing. The number of members is derived from the perpendicular distance divided by the spacing, rounded to the nearest integer (minimum 1 member — the baseline itself). The direction of extrusion (which side of the baseline the array fans out toward) tracks the cursor side automatically.
+
+Pressing **Enter** at any point during extrusion commits the array. If Enter is pressed before any perpendicular movement the array is committed as a single-member array (baseline only).
+
+Pressing **Backspace** during extrusion cancels the extrusion and returns to Phase 1 so the baseline can be redrawn.
+
+Pressing **Esc** or **right-click** during either phase cancels the entire draft.
+
+Middle-drag pans the canvas during both phases (consistent with other tools).
+
+### Live Readout
+
+While drawing, the viewer status bar shows: `N members · X.XXX m` — the current member count and total committed length (all members combined).
+
+### Appearance
+
+Committed array members render as solid parallel lines in the group's positive/negative colour and line style, consistent with length measurements. Selected arrays highlight using the standard selection colour with circular endpoint handles on the baseline. Members clip to any applied trims (see Trim, below).
+
+### Calculation Logic
+
+**Quantity = (number of members) × (baseline length in metres) × default multiplier**
+
+Number of members = 1 + extraMembers (extraMembers = 0 for a single-member array, determined at draw time by the extrusion drag).
+
+The quantity is always expressed as total lineal metres (uom: `m`). Polarity (positive/negative) nets in the same way as other measurement types.
+
+Array metadata — extraMembers, spacingPts (spacing in PDF points at the time of drawing), extrusion direction, and any trims — is stored in the measurement's `framing_json` column as a JSON object discriminated by `{ "type": "array", ... }`.
+
+### Trim
+
+When an Array dimension group is active, a **Trim** dropdown appears in the viewer toolbar (replacing the Positive/Negative toggle), with three options: **Trim** (off), **Trim: Line**, and **Trim: Box**. Selecting Line or Box activates trim mode with that trim type; selecting Trim turns trim mode off.
+
+#### Line trim
+
+The user draws a two-point cut line by clicking. A dashed preview line appears after the first click, following the cursor. While the second point is being placed, the array members ghost on the kept side (the side the cursor is currently on). Pressing **Enter** commits the trim; pressing **Esc** cancels the current trim draft without changing anything.
+
+On commit the trim is applied to every array measurement on the current page that belongs to the active group and that the cut line actually affects. **Only individual members that the drawn trim *segment* actually crosses are clipped** — members that lie beyond either end of the trim line (i.e. the member crosses the trim line's infinite extension but not the drawn segment itself) are left untouched, even if the trim line's half-plane test would otherwise apply to them. Each affected member segment is clipped to the kept half-plane using a signed-distance half-plane test.
+
+#### Box trim
+
+The user draws a closed polygon by clicking to place vertices, the same way an Area measurement is drawn — a dashed outline rubber-bands to the cursor after each click, and the polygon edge closes back to the first vertex once at least three vertices are placed. Pressing **Enter** closes and commits the trim; pressing **Esc** cancels the draft. While drawing (3+ vertices placed), array members ghost to show what will be kept, based on whether the cursor is currently **inside** or **outside** the drawn polygon — everything on the same side as the cursor (inside or outside) is kept, the rest is removed.
+
+A box trim can split a single member into multiple surviving pieces (e.g. a member passing through the box, with "outside" kept, survives as two separate segments either side of the box).
+
+#### Common behaviour
+
+Multiple trims accumulate — each successive trim (line or box, in any combination) is applied on top of existing trims. Trims are stored per-measurement in the `framing_json` metadata. A trim (of either type) is only attached to a measurement if it actually changes at least one of that measurement's member segments.
+
+Trimmed measurements continue to contribute their post-trim length to the group quantity.
+
+### Data Storage
+
+| Field | Content |
+|---|---|
+| `geometry_json` | `[{x, y}, {x, y}]` — the two baseline endpoints in PDF points, Y-up |
+| `framing_json` | `{ "type": "array", "extraMembers": N, "spacingPts": S, "direction": ±1, "trims": [...] }` |
+
+Each trim entry is one of two shapes, distinguished by `kind`:
+
+- **Line trim**: `{ "x1", "y1", "x2", "y2", "keepX", "keepY" }` (no `kind`, or `"kind": "line"` — the absent-`kind` form is for trims saved before box trim existed). `keepX`/`keepY` is the cursor position when the trim was committed, identifying the kept half-plane.
+- **Box trim**: `{ "kind": "box", "points": [{x, y}, ...], "keepX", "keepY" }`. `points` is the closed polygon (vertices in drawing order); `keepX`/`keepY` is the cursor position when the trim was committed, identifying whether the *inside* or *outside* of the polygon is kept.
+
+**All coordinates in every trim entry (including each `points` vertex) are stored relative to `pts[0]` (the baseline start point)**, not as absolute page coordinates — see "Trim coordinates are baseline-relative" below.
+
+### Known Issues & Fixes (implementation notes)
+
+A number of bugs were found and fixed while building the Array/Trim feature. These notes
+exist so the same mistakes aren't repeated if the array tool is touched again.
+
+- **"Unsupported measurement_type: array"**: there were two separate validation lists in
+  `desktop/src/lib.rs` — the `MEASUREMENT_TYPES` const, and a second hardcoded `matches!`
+  guard inside the `create_measurement` command. Both must include `"array"`. If a new
+  measurement type is ever added, grep `lib.rs` for `matches!` and `MEASUREMENT_TYPES` to
+  find every gate.
+
+- **Trim ghost preview wasn't visible**: the committed array was still drawn at full opacity
+  by the normal `drawOverlays` pass, so the dimmed/highlighted ghost preview drawn on top was
+  imperceptible. Fix: while a trim is being drafted (two points placed, second point following
+  the cursor), the active group's array measurements are filtered OUT of the `drawOverlays`
+  call, and `drawArrayTrimPreview` takes exclusive control of rendering them (a 20%-alpha pass
+  for the whole shape, then a 90%-alpha pass for the kept portion only).
+
+- **Trim didn't affect the group quantity**: `deriveQuantity`'s array branch originally
+  computed `(1 + extraMembers) * baselineLength`, ignoring `meta.trims` entirely. Fixed by
+  `arrayTrimmedLengthPts()` in `quantity.ts`, which clips every member segment against all
+  accumulated trims and sums only the surviving lengths.
+
+- **Trim applied to the wrong side relative to the cursor**: the half-plane "keep" side is
+  derived from a 2D cross-product sign test (`sideOfLine`/`_sideOfLine`). Because the canvas
+  renders in screen space (Y-down) while measurement geometry is Y-up, the naive sign came out
+  inverted from what the user saw on screen. Fixed by negating the keep-side sign
+  (`-Math.sign(...)`) in both `clipSegmentToSide` (`ViewerCanvas.tsx`) and `_clipSegmentToTrim`
+  (`quantity.ts`). **Both copies must stay in sync** — the trim math is duplicated between the
+  canvas (for rendering) and quantity.ts (for the derived total).
+
+- **Trim coordinates are baseline-relative (critical for move/edit safety)**: trims were
+  initially stored as absolute page coordinates, with `commitMove` shifting them by the same
+  (dx, dy) as the geometry. This only covered one move path — using the Select tool to drag the
+  array could still separate it from its trim. Fixed by storing each `ArrayTrim`'s six fields
+  relative to `pts[0]` at commit time (`commitArrayTrim` subtracts `pts[0]`), and converting
+  back to absolute coordinates on the fly via `absTrims()` (`ViewerCanvas.tsx`) /
+  `_absTrims()` (`quantity.ts`) wherever trims are used for hit-testing, drawing, or quantity.
+  Because the offset is relative, **any** future code path that moves the baseline keeps the
+  trim aligned automatically — no per-path bookkeeping required. Do not reintroduce
+  absolute-coordinate trim storage or per-move trim-shifting code.
+
+- **Resizing a trimmed array's baseline desyncs the trim**: even with relative trim storage,
+  changing the *length/angle* of the baseline (not just translating it) moves the trim line's
+  effective position relative to the members in a way that no longer matches what the user cut.
+  Per the user's explicit instruction, this is **disallowed**: in `handlePointerDown`, vertex-drag
+  (`vertexDragRef`) setup is blocked when the selected measurement is an array
+  (`measurement_type === "array"`) with `parseArrayMeta(framing_json).trims.length > 0`. The
+  array can still be selected and translated as a whole, just not resized, once it has any trim.
+
+- **"Add point" context menu broke arrays**: adding a vertex to an array's baseline via the
+  right-click "Add point" item produced a 3-point baseline, which the array drawing/quantity
+  code doesn't support (it always reads `points[0]`/`points[1]`). Fixed by excluding
+  `measurement_type === "array"` from the branch of the right-click menu builder that pushes
+  "Add point". "Delete point" / whole-measurement delete are unaffected.

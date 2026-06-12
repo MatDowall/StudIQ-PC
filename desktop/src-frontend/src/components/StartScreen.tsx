@@ -4,6 +4,7 @@ import { useAppStore } from "../store/appStore";
 import { theme } from "../theme";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { NewProjectDialog } from "./NewProjectDialog";
+import studiqLogo from "../assets/studiq-logo.png";
 
 export function StartScreen() {
   const recentProjects = useAppStore((state) => state.recentProjects);
@@ -83,23 +84,16 @@ export function StartScreen() {
         }}
       >
         <header style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          <div
-            aria-label="Project logo placeholder"
+          <img
+            src={studiqLogo}
+            alt="StudIQ"
             style={{
               width: 220,
               height: 72,
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              border: `1px dashed ${theme.border.divider}`,
-              borderRadius: 4,
-              color: theme.text.disabled,
-              fontSize: 13,
-              letterSpacing: 1,
+              objectFit: "contain",
+              objectPosition: "left center",
             }}
-          >
-            LOGO
-          </div>
+          />
         </header>
 
         <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>

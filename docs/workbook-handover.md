@@ -615,6 +615,386 @@ corrupting the grid.
 4. Drop a framing group with **two** different override lintel sizes present — confirm two
    separate "`<size> Lintel to last`" rows appear, each with its own total.
 
+> **Bugfix (2026-06-09): lintel `C:Quantity` cells were drillable, causing their values to
+> be overwritten on drill-up.**
+>
+> A lintel row placed by `insertLintelRowsBelow` has a flat quantity — there is no
+> sub-breakdown to build up, and the value placed is already the final figure. But because
+> `C:Quantity` at Level 2 is a drill column (`isDrillColumn` returns true for
+> `col === COL_QTY` at level 2), double-clicking a lintel row's quantity would create a
+> new `/Q<row>` Quantity Build-up sub-sheet. Drilling back up from that (empty) sub-sheet
+> wrote `SUM(child H)` = `0` into the parent's `C:Quantity`, silently zeroing the lintel
+> total.
+>
+> **Fix:** `insertLintelRowsBelow` now calls `setCellExcluded(path, r, COL_QTY, true)` for
+> each placed lintel row immediately after writing its data cells. The existing Sub-milestone
+> 3.9 guard in `beforeOnCellMouseDown` (`if (isDrill && isCellExcluded(...)) return`) then
+> blocks the double-click before it can fire `drillDown`. The cell renderer shows the
+> quantity in black (not drill-blue), matching the convention for excluded drill columns.
+> Exclusions are persisted to `workbook_sheet_exclusions` and travel with the row if a
+> subsequent drop forces `shiftStandardRowsDown` to relocate it (the existing
+> `shiftRowKeyedSet` call inside that helper already handles this).
+
+---
+
+#### Sub-milestone 3.8 — Named Cells (Excel-style names) ✅ (2026-06-08)
+
+> **Bugfix (2026-06-08):** workbooks created *from a template* that contained named cells
+> showed `#NAME?` everywhere those names were referenced, and the Name Manager listed
+> nothing — but only after an app restart (within the same session, the template's prior
+> load had already pushed its named expressions into HyperFormula's shared registry,
+> masking the gap). Root cause: `create_workbook_revision_from_template` in `lib.rs`
+> copied `workbook_sheet_data` / `workbook_sheet_styles` / `workbook_sheet_exclusions`
+> for the seed sheets but never copied the template revision's `workbook_named_cells`
+> rows — that table is revision-scoped, not sheet-scoped, so it sat outside the per-sheet
+> seeding loop and was simply missed. Fixed by copying every `(name, sheet_path, row, col)`
+> row from `template_revision_id` to the new `revision_id` right after the sheet-seeding
+> loop, before the function returns its `WorkbookRevisionDto`.
+
+> **Bugfix (2026-06-09): named-cell formulas showed stale values on first open** — e.g. a
+> cell `=1+margin/100` displaying `1.00` instead of `1.10` even though the `margin` named
+> cell held `10`. Re-entering the named cell value in the grid fixed it, but the value was
+> wrong immediately after opening the workbook.
+>
+> **Root cause — two interacting issues in `WorkbookView.tsx`:**
+>
+> 1. `loadLevelDataExcl` is internally async: it calls `ensureSheetExclusionsLoaded(...).then(()
+>    => loadLevelData(...))`, so it returns *immediately* — before HyperFormula has actually seen
+>    the sheet data. All six call sites then called `refreshNamedCellsForPath` in the very next
+>    line, which ran before `loadLevelData` and therefore read `hot.getDataAtCell(...)` = null.
+>    `namedExprFromValue(null)` → `"=0"`, so every named cell got registered as `0` into
+>    HyperFormula. When `loadLevelData` finally fired, HyperFormula evaluated
+>    `=1+margin/100` with `margin=0` → `1.00`.
+>
+> 2. `invoke("load_workbook_sheet")` and `invoke("load_workbook_named_cells")` are parallel
+>    fire-and-forget promises. If named cells resolved *before* the sheet, `readCellValue`
+>    returned null (hot held no data yet) → `margin=0` registered. If named cells resolved
+>    *after* the sheet finished (including `loadLevelData`), `addNamedExpression("margin","=10")`
+>    was called correctly but Handsontable did not automatically re-render — the update happened
+>    outside its normal edit-cycle so the `valuesUpdated` event from HyperFormula did not
+>    trigger a visible repaint.
+>
+> **Fix (both issues must be addressed):**
+>
+> - Moved `refreshNamedCellsForPath(path)` *inside* `loadLevelDataExcl`'s async callback,
+>   immediately after `loadLevelData` completes. At that point `hot.getDataAtCell` returns the
+>   actual cell values, so named expressions are registered with correct literals. Added
+>   `if (namedCellMap.current.size > 0) hot.render()` right after to force Handsontable to
+>   repaint any formula cells that now display different values.
+> - Removed the six premature `refreshNamedCellsForPath` calls from every call site
+>   (`load_workbook_sheet` `.then`/`.catch`, `drillDown`, `drillUp`, `jumpToSheet`,
+>   `resetToRootSheet`) — they were all executing before `loadLevelData` and reading stale/null
+>   values.
+> - Added `if (entries.length > 0) hotRef.current?.hotInstance?.render()` at the end of the
+>   `load_workbook_named_cells` `.then()` callback, to handle the race where named cells
+>   resolve *after* the sheet is already displayed. HyperFormula recalculates synchronously
+>   when `addNamedExpression` is called; the explicit `render()` ensures Handsontable
+>   repaints cells that depend on the newly-registered names.
+
+> **Bugfix (2026-06-09): named-cell references didn't update live when the bound cell changed**
+> — the literal-snapshot model above was the root cause. A named cell registered as `=10`
+> (a literal) sits *outside* HyperFormula's dependency graph, so editing the bound cell only
+> updated the snapshot if some other code path happened to re-register it. Dependent formulas
+> therefore went stale and only "caught up" on a sheet/tab change or app reopen (which reloads
+> + re-derives the sheet) — and sometimes not at all. The earlier `syncNamedCellsForChanges`
+> hack (re-register + manual `hot.render()` from `afterChange`) was unreliable because it
+> mutated the engine mid-edit-cycle, outside Handsontable's repaint flow.
+>
+> **Fix — hybrid live-reference model (`namedExprFormula`):** a named cell is now registered as
+> a **live HyperFormula reference** (`=Sheet1!$C$5`) *whenever its bound cell is on the
+> currently-active sheet*. HyperFormula then tracks the dependency natively, so editing the
+> bound cell recomputes **and repaints** every dependent formula instantly — exactly Excel's
+> named-range behaviour, with zero manual sync. Only when the bound cell is on a *different*
+> sheet (HyperFormula reuses one internal `"Sheet1"` across drill levels, so a live ref would
+> resolve against the wrong sheet) do we fall back to a **literal snapshot** of its last-known
+> evaluated value — and that case needs no live update anyway, since the bound cell isn't
+> visible to edit. `refreshNamedCellsForPath` now re-registers *every* named cell after each
+> sheet load (not just those on the loaded path): names entering the active sheet flip to live
+> references, names leaving it flip back to fresh literals (read from `sheetComputedMap`).
+> `syncNamedCellsForChanges` and its `afterChange` call were removed entirely as the live
+> reference makes them redundant.
+
+> **Bugfix (2026-06-09): named cells couldn't be used from a *different* sheet than their
+> bound cell** — referencing `=margin*2` on a child/other sheet showed `#VALUE!` (or a stale
+> value that only sometimes corrected itself on re-edit/reopen). Root cause was an *ordering*
+> bug in `loadLevelData`, which ran `clearSheet → loadData → deriveLevelFormulas` and only
+> re-pointed the named expressions to the new active sheet *afterwards*. So when `loadData`
+> first evaluated the new sheet's formulas, the cross-sheet name was still a **live reference**
+> (`=Sheet1!$A$1`) aimed at the cell that `clearSheet` had just emptied → it resolved to
+> `null` → `#VALUE!`, and the Handsontable Formulas plugin painted that error. Re-pointing the
+> name to its literal afterwards recomputed the HyperFormula engine but did not reliably
+> repaint the grid (the change came in *outside* the plugin's edit cycle), so the error stuck.
+>
+> **Fix:** `loadLevelData` takes a new optional `reRegisterNamed?: () => void` callback and
+> invokes it **between `clearSheet` and `loadData`** — `loadLevelDataExcl` passes
+> `() => refreshNamedCellsForPath(path)`. Because `pathStack` is updated to the target path
+> *before* any sheet load on every navigation route (`drillDown`, `drillUp`, `jumpToSheet`,
+> `resetToRootSheet`, the initial L1 effect), `namedExprFormula` already sees the correct
+> active sheet: names bound to it become live references, names bound elsewhere become fresh
+> literals — *before* the new sheet's formulas are ever evaluated. The very first evaluation
+> therefore sees the correct value and no transient `#VALUE!` is ever painted. (Verified
+> against HyperFormula 3.3.0 by replaying the exact `clearSheet → reRegister → loadData`
+> sequence: cross-sheet `=margin*2` resolves to `20` on first eval, and the live reference is
+> correctly restored — including live propagation — on navigating back to the bound sheet.)
+>
+> Caveat: a literal snapshot reads the bound cell's last *evaluated* value from
+> `sheetComputedMap` (captured on `drillDown`/`drillUp`). `jumpToSheet`/`resetToRootSheet`
+> reset that map, so a name bound to a sheet not visited since such a jump falls back to its
+> raw stored source — acceptable for those rarer entry points; ordinary drill navigation keeps
+> the snapshots intact.
+
+
+**Goal:** Let the user bind a workbook-wide name to a single cell (Excel's "Define Name"),
+usable in formulas at any drill level, plus a Name Manager dialog to view / jump to / rename
+/ delete those bindings (Excel's "Name Manager").
+
+**Where:** all logic lives in `WorkbookView.tsx`, with a new presentational dialog component
+`NamedCellsManagerDialog.tsx`.
+
+##### Data model & persistence
+
+- New type `NamedCell { name, path, row, col }` — a workbook-wide name bound to one cell
+  (sheet path + row/col), unique per revision.
+- New SQLite table `workbook_named_cells(id PK, revision_id FK CASCADE, name, sheet_path,
+  row, col, UNIQUE(revision_id, name))` and three Tauri commands in `lib.rs`:
+  `save_workbook_named_cell` (upsert via `ON CONFLICT(revision_id, name) DO UPDATE`),
+  `delete_workbook_named_cell`, `load_workbook_named_cells` (returns the full set as JSON).
+- Frontend keeps two pieces of bookkeeping: `namedCellMap` (`Map<name, NamedCell>` — the
+  source of truth for the app) and `registeredNamedExprRef` (`Set<name>` — tracks which
+  names already exist in the live HyperFormula engine, since it needs `addNamedExpression`
+  the first time and `changeNamedExpression` thereafter). Both are `useRef`s, loaded once per
+  active revision in the same effect that loads sheet data, and reset on revision switch.
+
+##### Why values are embedded as literals, not live references
+
+`registerNamedExpression(nc, value)` builds the named expression as `=<literal>`
+(`namedExprFromValue` renders numbers bare and quotes text) rather than `=Sheet1!A1` —
+because HyperFormula reuses a single internal `"Sheet1"` across every drill level, a live
+cell reference would resolve against whatever sheet happens to be loaded, not the sheet the
+name was actually bound to. `readCellValue(path, row, col)` resolves the bound cell's
+*evaluated* value regardless of which sheet currently has the grid (active sheet via
+Handsontable, an ancestor via its rollup snapshot in `sheetComputedMap`, or the raw stored
+string as a last resort), and `refreshNamedCellsForPath` / `syncNamedCellsForChanges` keep
+the cached literal in sync on navigation and live edits respectively.
+
+##### Creating a name
+
+Right-clicking any cell always offers **"New Named Cell…"** in the grid context menu, which
+opens a `TextInputDialog` (state `namedCellDialog: { row, col } | null`). The entered name is
+checked against `isValidNamedCellName` (Excel-style identifier rules — must start with a
+letter/underscore, contain only letters/digits/underscores/periods, and must *not* look like
+a cell reference such as `A1`, since HyperFormula rejects those names anyway) before
+`defineNamedCell(name, path, row, col)` persists it, updates `namedCellMap`, and registers it
+with HyperFormula.
+
+##### Name Manager dialog
+
+A new toolbar button **"Named Cells"** (icon `sell`, alongside the workbook-maintenance
+buttons) opens `NamedCellsManagerDialog` — a list+detail dialog modelled directly on
+`TemplateManagerDialog`'s layout/styling (`theme.*` tokens throughout):
+
+- **List** (left column) — every bound name with its sheet path and `"A1"`-style cell
+  reference (via the existing `cellRefLabel` helper), built fresh from `namedCellMap` each
+  time the dialog opens (it's a plain prop — `Array.from(namedCellMap.current.values())…`,
+  not separately-tracked reactive state, since the dialog is short-lived and the map is the
+  source of truth).
+- **Go to** — `goToNamedCell(name)` either selects/scrolls within the current sheet
+  (`hot.selectCell` + `hot.scrollViewportTo`) or, for a different sheet, calls `jumpToSheet`
+  with a new optional third parameter `selectAfter?: { row, col }` that performs the same
+  select-and-scroll once the target sheet's data has loaded and rendered. The target level is
+  derived purely from path depth via a new helper `levelForPath` (`"L1"` → 1, `"L1/R3"` → 2,
+  `"L1/R3/R2"` / `"L1/R3/Q5"` → 3) since the manager only has the bound cell's path to work from.
+- **Rename** — `renameNamedCell(oldName, newName)`, implemented as delete-then-redefine
+  (`removeNamedCell` followed by `defineNamedCell`) because `workbook_named_cells` is unique
+  on `name`, so there's no in-place rename at the DB layer. The dialog itself guards against
+  invalid names and collisions with existing names before calling it.
+- **Delete** — `removeNamedCell(name)`, gated behind a `ConfirmDialog` (consistent with every
+  other destructive action in the workbook), tears down all three layers: the persisted row
+  (`delete_workbook_named_cell`), the live HyperFormula named expression
+  (`hf.removeNamedExpression`, wrapped in try/catch since the engine may not have it
+  registered), and local bookkeeping (`namedCellMap`, `registeredNamedExprRef`).
+
+**Verification needed (UI/UX — please check in `cargo tauri dev`):**
+1. Right-click a cell, create a named cell, then reference it by name in a formula on a
+   different sheet/level — confirm it resolves to the bound cell's value.
+2. Open **Named Cells** from the toolbar — confirm the list shows the name, sheet path and
+   cell reference correctly, and that **Go to** jumps to (and highlights/scrolls to) the right
+   cell whether it's on the current sheet or a different one (including a different drill level).
+3. **Rename** a named cell to a new valid name — confirm formulas referencing the old name now
+   show `#NAME?`-style errors and formulas updated to the new name resolve correctly; confirm
+   renaming to an existing name or an invalid identifier (e.g. `A1`, `1abc`) is rejected with
+   an explanatory message.
+4. **Delete** a named cell (with the confirm dialog) — confirm it disappears from the list,
+   any formula referencing it now errors, and it does not reappear after closing/reopening the
+   workbook (i.e. it's actually gone from `workbook_named_cells`, not just the in-memory map).
+
+---
+
+#### Sub-milestone 3.9 — Exclude cells from auto-calculation ✅ (2026-06-08)
+
+**Goal:** Let the user "switch off" the F:Subtotal/G:Factor/H:Total auto-derivation for a
+range of cells, per sheet. Needed for templates with a hand-built summary block at the
+bottom of the page (e.g. SUBTOTAL/MARGIN/TENDER TOTAL rows) whose F/G/H cells carry their
+own formulas — without exclusion, the drill-up rollup, the factor default-to-1, and the
+`H = F×G` formula injection would all clobber that block on every sheet load/edit/navigation.
+
+##### Data model & persistence
+
+- New SQLite table `workbook_sheet_exclusions(id PK, revision_id FK CASCADE, sheet_path,
+  exclusions_json, UNIQUE(revision_id, sheet_path))` — `exclusions_json` is a flat JSON object
+  keyed by `"row,col"` → `true`, mirroring `workbook_sheet_links`/`workbook_sheet_styles`.
+- Two Tauri commands in `lib.rs`: `save_workbook_sheet_exclusions` (upsert),
+  `load_workbook_sheet_exclusions` (returns `"{}"` when none saved). Cleaned up alongside
+  links/styles in `delete_workbook_sheet_subtree` and `clear_workbook_revision_data`, and
+  carried along with the rest of a sheet's persisted state when a project is created from a
+  template (the `["L1", "TEMPLATE_MASTER_L2", "TEMPLATE_MASTER_L3", "TEMPLATE_MASTER_LQ"]`
+  copy loop in `create_workbook_revision`) — so a template author's exclusions travel into
+  every project created from it.
+- Frontend mirrors the existing per-cell maps: `cellExclusionMap` (`Map<path, Set<"row,col">>`)
+  + `loadedExclusionPathsRef` (`Set<path>`, once-per-path load guard), both `useRef`s reset on
+  revision switch / workbook clear and pruned in `purgeCachedSubtree`. Helpers `isCellExcluded`,
+  `setCellExcluded` (mutates + persists immediately via `persistSheetExclusions`), and
+  `shiftRowKeyedSet` (row-shift for the Set-based map, alongside `shiftRowKeyedEntries` for the
+  link/style `Map`s) follow the same shape as the link/style equivalents. `persistSheet` now
+  also calls `persistSheetExclusions`.
+
+##### Avoiding the cold-load race
+
+Unlike links/styles (cosmetic — safe to apply after the fact), exclusions must be known
+*before* the first auto-derivation pass runs, or an excluded cell's hand-built formula gets
+overwritten the instant the sheet is first displayed. `loadLevelDataExcl` wraps `loadLevelData`:
+it awaits `ensureSheetExclusionsLoaded(revId, path)` and only then calls `loadLevelData(...,
+cellExclusionMap.current.get(path))` — guaranteeing the exclusion set is populated before
+`deriveLevelFormulas` ever touches that sheet. All six `loadLevelData` call sites (initial
+load, drill down/up, jump-to-sheet, workbook-clear reset) go through this wrapper.
+
+##### Guarding the three auto-derivation paths
+
+`deriveLevelFormulas` takes an optional `excluded?: Set<string>` and checks
+`isExcluded(r, c)` before pushing each `[row, col, value]` write to its batch — for both the
+"qty" leaf-sheet pass (Factor auto-1 + `H = PRODUCT(...)`) and the standard three-pass
+derivation (F = E×C, Factor auto-1 + H = F×G, J/L/N/P pull-through). The same guard pattern
+is duplicated (by necessity — it's a different code path) in three more places:
+- The `afterChange` hook's live auto-derivation (reads `cellExclusionMap.current.get(curSheetPath())`
+  fresh on every batch of changes).
+- `propagateLiveRollup` — the live breadcrumb preview; skips overwriting `liveRow[col]` for any
+  excluded `(parentPath, rowInParent, col)` so the breadcrumb shows the hand-built value, not a
+  rolled-up one.
+- `drillUp`'s actual persisted rollup write into `parentData[rowInParent][col]` — the real
+  data mutation that previously unconditionally overwrote F (L2→L1), C (Qty buildup→L2), or
+  E/I/K/M/O/J/L/N/P (L3→L2).
+- The row-move helper also shifts the exclusion set (`shiftRowKeyedSet`) so exclusions follow
+  their cells when rows are moved, then re-derives with the shifted set.
+
+##### UI — toggling exclusion
+
+Right-click on the grid now offers **"Exclude from auto-calculation"** / **"Re-enable
+auto-calculation"** (label flips based on whether every cell in the live selection — or the
+right-clicked cell, if nothing is selected — is currently excluded). `toggleExclusionForSelection`
+applies `setCellExcluded` to every selected cell, re-renders, and immediately calls
+`deriveLevelFormulas` with the updated set so the effect (formulas appearing/disappearing in
+F/G/H) is visible without navigating away and back. Excluded cells are marked with a faint
+dashed amber top border (`EXCLUDED_BORDER_COLOUR`) drawn in `workbookCellRenderer` — a
+discoverable visual cue, in the same spirit as the green link-font colour for dimension-group
+imports and the blue drill-column font colour.
+
+##### Excluding a drill column also switches off its drill-down
+
+A drill column (L1 F:Subtotal, L2 E:Rate/C:Quantity — see `isDrillColumn`) that's been
+excluded no longer drills down: `beforeOnCellMouseDown` checks `isCellExcluded` and bails out
+before the double-click → `drillDownRef.current(row, col)` dispatch, since drilling into it
+would create/seed a sub-sheet whose rollup the exclusion is specifically meant to suppress.
+`workbookCellRenderer` reflects this by reverting the cell's font from drill-blue
+(`DRILL_FONT_COLOUR`) to plain black — the same blue→black shift is the user-facing cue that
+the cell no longer drills, alongside the dashed amber exclusion border.
+
+**Verification needed (UI/UX — please check in `cargo tauri dev`):**
+1. Select a range of cells in F/G/H (e.g. a summary block), right-click → **"Exclude from
+   auto-calculation"** — confirm any existing auto-injected formulas in that range disappear
+   and typing a hand-built formula into those cells survives navigation away/back, edits to
+   C/E elsewhere on the sheet, and drill up/down.
+2. Confirm the dashed amber border appears on excluded cells and disappears when you select
+   the same range and choose **"Re-enable auto-calculation"** (and that auto-derivation resumes
+   for those cells immediately).
+3. Create a project from a template that has an excluded summary block — confirm the
+   exclusions (and the block's hand-built content) carry over into the new project's L1 sheet.
+4. Confirm exclusions persist across closing/reopening the project (i.e. they're actually in
+   `workbook_sheet_exclusions`, not just the in-memory map), and that they're removed when the
+   sheet/subtree is deleted or the workbook is cleared.
+
+---
+
+#### Sub-milestone 3.10 — Ribbon tools wired up ✅ (2026-06-09)
+
+**Goal:** Make the previously-inert workbook ribbon buttons functional: Delete, Add Row,
+Insert Above, Insert Below, Export, and Print. Remove the non-functional View group
+(Expand All / Collapse All). Start the app maximized.
+
+##### Features delivered
+
+- **Delete revision** — `WorkbookRibbon` "Delete" triggers a `ConfirmDialog`; on confirm
+  calls `deleteWorkbookRevision(activeRevisionId)`. Enabled only when a revision is active.
+- **Add Row** — appends a blank row after the last occupied line-item row at the current
+  sheet level. Scrolls to the new row.
+- **Insert Above / Insert Below** — insert a blank row immediately above/below the
+  currently-selected row, shifting all occupied rows below it down by one within the
+  fixed 100-row grid. Implemented via the new `insertBlankRowAt` helper (see bugs below).
+- **Export** — saves the active sheet as CSV; uses `@tauri-apps/plugin-dialog`'s `save`
+  dialog with a `.csv` filter; writes via a new `write_text_file` Rust command (registered
+  in `invoke_handler` in `lib.rs`).
+- **Print** — generates an HTML table of all occupied rows in the current sheet,
+  injects it into a hidden zero-size `<iframe>`, and calls `iframe.contentWindow.print()`.
+  The iframe is removed from the DOM after 1 second. Note: `window.open()` is blocked in
+  Tauri WebView2 — the hidden-iframe approach is the correct solution.
+- **View group removed** — the "Expand All / Collapse All" group was permanently removed
+  from `WorkbookRibbon` (no behaviour was wired; re-adding dummy buttons to the ribbon is
+  against the ribbon layout rules in CLAUDE.md).
+- **App starts maximized** — `"maximized": true` added to the window config in
+  `desktop/tauri.conf.json`.
+
+##### API bridge pattern (`WorkbookGridApi`)
+
+All five imperative grid operations are exposed to the ribbon via the same stable-ref
+delegate pattern used by `WorkbookFormatApi`:
+
+1. A `gridApiImplRef` holds the current-render closure implementations.
+2. A stable `gridApiRef` delegates each method to `gridApiImplRef.current.*`.
+3. A mount effect calls `setWorkbookGridApi(gridApiRef.current)` once; the store holds `workbookGridApi: WorkbookGridApi | null`.
+4. `WorkbookRibbon` reads `workbookGridApi` from the store and calls methods directly.
+
+This avoids prop-drilling through `GridCore` (which is `React.memo`'d to prevent Handsontable
+height resets) while keeping the closure fresh every render.
+
+##### New backend commands
+
+- `write_text_file(path: String, content: String)` — `std::fs::write` wrapper; used by
+  the Export CSV path. Registered in `invoke_handler`.
+- `rename_workbook_sheet_subtree(revision_id, old_path, new_path)` — bulk-renames all
+  `workbook_sheet_data`, `workbook_sheet_links`, `workbook_sheet_styles`, and
+  `workbook_sheet_exclusions` rows whose `sheet_path` equals `old_path` or starts with
+  `old_path/`. Used by `insertBlankRowAt` to keep sub-sheet paths in sync when rows shift
+  (see Bug 2 below).
+
+##### Bugs encountered & fixes
+
+**Bug 1 — Insert Above/Below wiped all values at Level 1 (data-loss)**
+
+| | Detail |
+|---|---|
+| **Symptom** | After inserting a row at Level 1, all F:Subtotal and J/L/N/P-Total values in the sheet disappeared and the blank state was auto-saved (permanent data loss). Creating a new workbook from template also produced a blank sheet. |
+| **Root cause** | The initial implementation reused `shiftStandardRowsDown`, which was written solely for the `insertLintelRowsBelow` path (always called at Level 2+). That helper copies only the *input* columns (A/B/C/D/E/G/I/K/M/O), blanks the "formula columns" (F/H/J/L/N/P), and then calls `deriveLevelFormulas` to regenerate them. At Level 2/3 this is correct — those columns hold row-relative formulas (`=E{r}*C{r}`, `=F{r}*G{r}`, `=I{r}*C{r}`, …) that must be rewritten with the new row index. At Level 1, however, F:Subtotal and J/L/N/P-Total are **plain rolled-up numbers** (the `SUM(H)` drill-ups from sub-sheets), not row-relative formulas. Blanking them and running `deriveLevelFormulas` regenerated nothing — there are no sub-sheets currently loaded to sum. The 500 ms debounced auto-save then persisted the blank state. |
+| **Fix** | Wrote `insertBlankRowAt(hot, path, insertAt)`, a level-agnostic helper that: (1) copies **all** columns verbatim (not just input columns) using `hot.setDataAtCell` inside an `isAutoUpdatingRef` guard; (2) calls `deriveLevelFormulas` once after the copy to regenerate only the row-relative formula cells at the current level. At Level 1, `deriveLevelFormulas` writes nothing to F/J/L/N/P (those are not formula cells at that level), so rolled-up numbers survive the shift untouched. `insertBlankRowAt` is the canonical insert-row implementation for all levels; `shiftStandardRowsDown` remains for the lintel-insertion path only (Level 2+). |
+
+**Bug 2 — Drilling into a Level 2 row after an insert showed a blank sub-sheet**
+
+| | Detail |
+|---|---|
+| **Symptom** | After Bug 1 was fixed, inserting a row at Level 1 and then double-clicking into a previously-populated Level 2 row showed a blank sub-sheet — even though the breadcrumb toolbar still showed correct totals for that row. |
+| **Root cause** | Sub-sheet paths are keyed by row index: `"L1/R0"`, `"L1/R1"`, etc. When a row is inserted above row `N`, all rows `N…last` shift to `N+1…last+1` in the grid data — but their associated sub-sheet paths (and all in-memory caches keyed by those paths) did not move with them. Drilling into the moved row `N+1` loaded from path `"L1/R<N+1>"` (empty), not `"L1/R<N>"` where the data still lived. The breadcrumb was correct because it was populated from the Level 1 cell value captured before drill-down, not from the sub-sheet path. |
+| **Fix** | `insertBlankRowAt` now performs a bottom-up path remap for all rows from `lastOccupied` down to `insertAt`, renaming `${path}/${prefix}${r}` → `${path}/${prefix}${r+1}` for each applicable sub-prefix (`"R"` at Level 1; `"R"` and `"Q"` at Level 2). The remap covers six in-memory structures: `sheetDataMap`, `sheetComputedMap`, `cellLinkMap`, `cellStyleMap`, `cellExclusionMap`, and the three loaded-path Sets. It also calls `rename_workbook_sheet_subtree` via `invoke` for each renamed path to update SQLite. The remap must be done bottom-up (highest row index first) to prevent a rename at row `N+1` clobbering the path about to be renamed from row `N` in the next iteration. |
+
+**Gate:** Both bug fixes confirmed working by the user in `cargo tauri dev`.
+
 ---
 
 ### Milestone 4 — Drag dimension groups into workbook

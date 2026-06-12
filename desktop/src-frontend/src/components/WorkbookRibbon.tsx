@@ -3,13 +3,12 @@ import { createPortal } from "react-dom";
 import { useAppStore } from "../store/appStore";
 import { theme } from "../theme";
 import { NewFromTemplateDialog } from "./NewFromTemplateDialog";
+import { ConfirmDialog } from "./ConfirmDialog";
 
 const BUTTON_ICONS: Record<string, string> = {
-  "New Revision": "add_circle",
+  "Blank Workbook": "add_circle",
   "New from Template": "dashboard_customize",
   Delete: "delete",
-  "Expand All": "unfold_more",
-  "Collapse All": "unfold_less",
   "Add Row": "playlist_add",
   "Insert Above": "vertical_align_top",
   "Insert Below": "vertical_align_bottom",
@@ -168,7 +167,9 @@ function SettingsDropdown() {
   const [menuPos, setMenuPos] = useState<{ top: number; left: number } | null>(null);
   const wrapperRef = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
-  const openTemplateManager = useAppStore((s) => s.openTemplateManager);
+  const openTemplateManager    = useAppStore((s) => s.openTemplateManager);
+  const openNamedCellsManager  = useAppStore((s) => s.openNamedCellsManager);
+  const setWorkbookConfirmAction = useAppStore((s) => s.setWorkbookConfirmAction);
 
   useEffect(() => {
     if (!open) return;
@@ -208,31 +209,36 @@ function SettingsDropdown() {
               boxShadow: "0 8px 24px rgba(0, 0, 0, 0.35)",
             }}
           >
-            <button
-              onClick={() => {
-                setOpen(false);
-                openTemplateManager();
-              }}
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 8,
-                width: "100%",
-                height: 30,
-                padding: "0 10px",
-                border: "none",
-                background: "transparent",
-                color: theme.text.primary,
-                textAlign: "left",
-                cursor: "pointer",
-                fontSize: 12,
-              }}
-              onMouseEnter={(e) => (e.currentTarget.style.background = theme.bg.input)}
-              onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
-            >
-              <span className="material-symbols-outlined" style={{ fontSize: 16 }}>dashboard_customize</span>
-              Template Manager
-            </button>
+            {[
+              { icon: "dashboard_customize", label: "Template Manager", onClick: () => openTemplateManager() },
+              { icon: "sell",                label: "Named Cells",       onClick: () => openNamedCellsManager() },
+              { icon: "cleaning_services",   label: "Clean orphaned sheets", onClick: () => setWorkbookConfirmAction("clean") },
+              { icon: "delete_sweep",        label: "Clear workbook",    onClick: () => setWorkbookConfirmAction("clear") },
+            ].map(({ icon, label, onClick }) => (
+              <button
+                key={label}
+                onClick={() => { setOpen(false); onClick(); }}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  width: "100%",
+                  height: 30,
+                  padding: "0 10px",
+                  border: "none",
+                  background: "transparent",
+                  color: theme.text.primary,
+                  textAlign: "left",
+                  cursor: "pointer",
+                  fontSize: 12,
+                }}
+                onMouseEnter={(e) => (e.currentTarget.style.background = theme.bg.input)}
+                onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+              >
+                <span className="material-symbols-outlined" style={{ fontSize: 16 }}>{icon}</span>
+                {label}
+              </button>
+            ))}
           </div>,
           document.body,
         )}
@@ -241,39 +247,61 @@ function SettingsDropdown() {
 }
 
 export function WorkbookRibbon() {
-  const workbooks = useAppStore((s) => s.workbooks);
+  const workbooks              = useAppStore((s) => s.workbooks);
+  const activeRevisionId       = useAppStore((s) => s.activeRevisionId);
   const createWorkbookRevision = useAppStore((s) => s.createWorkbookRevision);
   const createWorkbookRevisionFromTemplate = useAppStore((s) => s.createWorkbookRevisionFromTemplate);
+  const deleteWorkbookRevision = useAppStore((s) => s.deleteWorkbookRevision);
+  const gridApi                = useAppStore((s) => s.workbookGridApi);
   const [newFromTemplateOpen, setNewFromTemplateOpen] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
 
   function handleNewRevision() {
     if (workbooks.length > 0) {
       const wb = workbooks[0];
       const nextNum = wb.revisions.length + 1;
-      createWorkbookRevision(wb.id, `Revision ${nextNum}`);
+      createWorkbookRevision(wb.id, `Blank Workbook ${nextNum}`);
     }
   }
 
+  function handleDeleteConfirmed() {
+    setConfirmDelete(false);
+    if (activeRevisionId != null) void deleteWorkbookRevision(activeRevisionId);
+  }
+
   const hasWorkbook = workbooks.length > 0;
+  const canDelete   = hasWorkbook && activeRevisionId != null;
+  const hasGrid     = gridApi != null;
   const nextRevisionName = hasWorkbook ? `Revision ${workbooks[0].revisions.length + 1}` : "Revision 1";
 
   const groups = [
-    { label: "Workbook", tools: ["New Revision", "New from Template", "Delete"] },
+    { label: "Workbook", tools: ["Blank Workbook", "New from Template", "Delete"] },
     { label: "Rows", tools: ["Add Row", "Insert Above", "Insert Below"] },
-    { label: "View", tools: ["Expand All", "Collapse All"] },
     { label: "Format", tools: [] as string[] },
     { label: "Output", tools: ["Export", "Print"] },
     { label: "Settings", tools: ["Settings"] },
   ];
 
   const handlers: Record<string, (() => void) | undefined> = {
-    "New Revision": hasWorkbook ? handleNewRevision : undefined,
-    "New from Template": hasWorkbook ? () => setNewFromTemplateOpen(true) : undefined,
+    "Blank Workbook":       hasWorkbook ? handleNewRevision : undefined,
+    "New from Template":  hasWorkbook ? () => setNewFromTemplateOpen(true) : undefined,
+    "Delete":             canDelete   ? () => setConfirmDelete(true) : undefined,
+    "Add Row":            hasGrid     ? () => gridApi.addRow() : undefined,
+    "Insert Above":       hasGrid     ? () => gridApi.insertAbove() : undefined,
+    "Insert Below":       hasGrid     ? () => gridApi.insertBelow() : undefined,
+    "Export":             hasGrid     ? () => void gridApi.exportCsv() : undefined,
+    "Print":              hasGrid     ? () => gridApi.print() : undefined,
   };
 
   const enabled: Record<string, boolean> = {
-    "New Revision": hasWorkbook,
+    "Blank Workbook":      hasWorkbook,
     "New from Template": hasWorkbook,
+    "Delete":            canDelete,
+    "Add Row":           hasGrid,
+    "Insert Above":      hasGrid,
+    "Insert Below":      hasGrid,
+    "Export":            hasGrid,
+    "Print":             hasGrid,
   };
 
   return (
@@ -286,6 +314,15 @@ export function WorkbookRibbon() {
             setNewFromTemplateOpen(false);
             if (workbooks.length > 0) void createWorkbookRevisionFromTemplate(workbooks[0].id, name, templateId);
           }}
+        />
+      )}
+      {confirmDelete && (
+        <ConfirmDialog
+          title="Delete revision"
+          body="This permanently deletes the selected workbook revision and all its sheet data. This cannot be undone. Continue?"
+          confirmLabel="Delete"
+          onCancel={() => setConfirmDelete(false)}
+          onConfirm={handleDeleteConfirmed}
         />
       )}
       {groups.map((group) => (

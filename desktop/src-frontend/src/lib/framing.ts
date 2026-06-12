@@ -86,11 +86,14 @@ export interface Opening {
 }
 
 /** A raking frame on one wall segment: the top plate slopes between `startMm` (wall height at the
- *  segment start) and `endMm` (at the segment end). */
+ *  segment start) and `endMm` (at the segment end). If `gable` is set, the top plate instead rises
+ *  from `startMm` to the apex `middleMm` at the segment midpoint, then falls to `endMm`. */
 export interface Rake {
   segmentIndex: number;
   startMm: number;
   endMm: number;
+  gable?: boolean;
+  middleMm?: number;
 }
 
 /** A manually-placed extra stud on a wall segment (select-mode Ctrl-hover), at arc-length `centreMm`. */
@@ -272,6 +275,22 @@ export function studLayout(
   const out: SegLayout[] = [];
   const n = path.length;
 
+  // Direction of each path segment (or null if degenerate), used to tell a real corner (the NZ
+  // 3-stud makeup applies) from a straight-through joint — e.g. where a rake/gable meets an
+  // adjacent flat (or differently-raked) collinear segment, which just wants a single end stud
+  // on each side following its own segment's height.
+  const dirs: ({ x: number; y: number } | null)[] = [];
+  for (let seg = 0; seg < n - 1; seg += 1) {
+    const a = path[seg];
+    const b = path[seg + 1];
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const len = Math.hypot(dx, dy);
+    dirs.push(len < GEOM_EPS ? null : { x: dx / len, y: dy / len });
+  }
+  const collinear = (d1: { x: number; y: number } | null, d2: { x: number; y: number } | null) =>
+    !!d1 && !!d2 && d1.x * d2.x + d1.y * d2.y > 1 - 1e-6;
+
   for (let seg = 0; seg < n - 1; seg += 1) {
     const a = path[seg];
     const b = path[seg + 1];
@@ -283,10 +302,12 @@ export function studLayout(
 
     const isFirst = seg === 0;
     const isLast = seg === n - 2;
-    const startStuds = isFirst
+    const startStraight = !isFirst && collinear(dirs[seg - 1], dirs[seg]);
+    const endStraight = !isLast && collinear(dirs[seg], dirs[seg + 1]);
+    const startStuds = isFirst || startStraight
       ? [halfThk]
       : [-halfDepth + halfThk, -halfDepth + studThkPts + gapPts + halfThk];
-    const endStuds = isLast ? [segLen - halfThk] : [segLen - halfDepth - halfThk];
+    const endStuds = isLast || endStraight ? [segLen - halfThk] : [segLen - halfDepth - halfThk];
 
     const regular: number[] = [];
     const regularFrom = startStuds[startStuds.length - 1];
@@ -306,6 +327,23 @@ function memberRect(seg: SegLayout, s0: number, s1: number, halfDepth: number): 
   const nrm = { x: -seg.dir.y, y: seg.dir.x };
   const corner = (s: number, c: number): PagePoint => ({ x: seg.a.x + seg.dir.x * s + c * nrm.x, y: seg.a.y + seg.dir.y * s + c * nrm.y });
   return [corner(s0, halfDepth), corner(s1, halfDepth), corner(s1, -halfDepth), corner(s0, -halfDepth)];
+}
+
+/** Point-in-convex-polygon test (used to test a stud position against an opening's expanded
+ *  footprint, possibly belonging to an adjacent wall segment). */
+function pointInRect(p: PagePoint, rect: PagePoint[]): boolean {
+  let sign = 0;
+  for (let i = 0; i < rect.length; i += 1) {
+    const a = rect[i];
+    const b = rect[(i + 1) % rect.length];
+    const cross = (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
+    if (cross !== 0) {
+      const s = Math.sign(cross);
+      if (sign === 0) sign = s;
+      else if (s !== sign) return false;
+    }
+  }
+  return true;
 }
 
 /** Jamb stud centre arc-lengths for an opening: a trimmer just outside each daylight edge, then a
@@ -365,17 +403,32 @@ export function computeFramingGeometry(
   const plateRight = offsetPolyline(path, -halfDepth);
   const layout = studLayout(path, depthPts, studThkPts, spacingPts, gapPts);
   const openings = framing?.openings ?? [];
+  const rakes = framing?.rakes ?? [];
 
   const studs: PagePoint[][] = [];
   const openingRects: { daylight: PagePoint[]; kind: "door" | "window" }[] = [];
 
+  const halfDepthForCut = halfDepth;
+  const nearAnyOpening = (p: PagePoint): boolean => {
+    for (let j = 0; j < layout.length; j += 1) {
+      const segJ = layout[j];
+      for (const o of openings.filter((op) => op.segmentIndex === j)) {
+        const c = o.centreMm / mmPerPoint;
+        const dh = o.daylightWidthMm / mmPerPoint / 2;
+        const rect = memberRect(segJ, c - dh - 2 * studThkPts, c + dh + 2 * studThkPts, halfDepthForCut + depthPts);
+        if (pointInRect(p, rect)) return true;
+      }
+    }
+    return false;
+  };
+
   layout.forEach((seg, segIndex) => {
     const segOpenings = openings.filter((o) => o.segmentIndex === segIndex);
-    for (const s of seg.anchors) studs.push(makeStudRect(pointAt(seg, s), seg.dir, halfThk, halfDepth));
-
-    for (const s of seg.regular) {
-      const cut = segOpenings.some((o) => Math.abs(s - o.centreMm / mmPerPoint) <= o.daylightWidthMm / mmPerPoint / 2 + 2 * studThkPts);
-      if (!cut) studs.push(makeStudRect(pointAt(seg, s), seg.dir, halfThk, halfDepth));
+    const cut = (s: number) =>
+      segOpenings.some((o) => Math.abs(s - o.centreMm / mmPerPoint) <= o.daylightWidthMm / mmPerPoint / 2 + 2 * studThkPts) ||
+      nearAnyOpening(pointAt(seg, s));
+    for (const s of [...seg.anchors, ...seg.regular]) {
+      if (!cut(s)) studs.push(makeStudRect(pointAt(seg, s), seg.dir, halfThk, halfDepth));
     }
 
     for (const o of segOpenings) {
@@ -384,6 +437,17 @@ export function computeFramingGeometry(
       const jambs = openingJambs(centrePts, dwHalf, studThkPts);
       for (const p of [...jambs.trimmers, ...jambs.kings]) studs.push(makeStudRect(pointAt(seg, p), seg.dir, halfThk, halfDepth));
       openingRects.push({ daylight: memberRect(seg, centrePts - dwHalf, centrePts + dwHalf, halfDepth), kind: o.kind });
+    }
+
+    // Gable apex: a stud under each side's top plate, meeting at the ridge (unless cut by an
+    // opening, in which case it becomes a jack/sill-jack instead — not drawn here, matching
+    // how cut regular studs are handled above).
+    const rake = rakes.find((r) => r.segmentIndex === segIndex);
+    if (rake?.gable && rake.middleMm !== undefined) {
+      const midS = seg.segLen / 2;
+      for (const s of [midS - halfThk, midS + halfThk]) {
+        if (!cut(s)) studs.push(makeStudRect(pointAt(seg, s), seg.dir, halfThk, halfDepth));
+      }
     }
   });
 
@@ -531,6 +595,13 @@ export interface WallMember {
   size: [number, number, number]; // [along, vertical thickness/height, depth across the wall]
   yaw: number;
   pitch: number;
+  /** Rake/plumb-cut override: a quad cross-section in the local X (along-wall, metres from
+   *  `position`) / Y (world height, metres) plane, extruded `depthM` along local Z (across the
+   *  wall). When present this replaces the box geometry for rendering — `position` is the local
+   *  origin (ground level at the cut piece's start point) and `pitch` is ignored. Used for studs
+   *  whose tops are rake-cut to the underside of a sloped top plate, and for top-plate pieces
+   *  whose ends are plumb-cut to the full wall length. */
+  wedge?: { quad: [number, number][]; depthM: number };
 }
 
 /**
@@ -570,7 +641,47 @@ export function wallMembers(
   const layout = studLayout(path, depthPts, studThkPts, spacingPts, gapPts);
   const heightAt = (segIndex: number, frac: number) => {
     const rake = rakes.find((r) => r.segmentIndex === segIndex);
-    return rake ? rake.startMm + (rake.endMm - rake.startMm) * Math.max(0, Math.min(1, frac)) : settings.wallHeightMm;
+    if (!rake) return settings.wallHeightMm;
+    const f = Math.max(0, Math.min(1, frac));
+    if (rake.gable && rake.middleMm !== undefined) {
+      return f <= 0.5
+        ? rake.startMm + (rake.middleMm - rake.startMm) * (f / 0.5)
+        : rake.middleMm + (rake.endMm - rake.middleMm) * ((f - 0.5) / 0.5);
+    }
+    return rake.startMm + (rake.endMm - rake.startMm) * f;
+  };
+
+  // Corner-makeup anchors of one segment can sit at negative `s` (or beyond `segLen`), physically
+  // overlapping the footprint of an ADJACENT segment. These two helpers test a world point against
+  // every segment's openings/roofline, so cuts and head-height caps work across the corner.
+  const halfDepthPts = depthPts / 2;
+  const nearAnyOpening = (p: PagePoint): boolean => {
+    for (let j = 0; j < layout.length; j += 1) {
+      const segJ = layout[j];
+      for (const o of openings.filter((op) => op.segmentIndex === j)) {
+        const c = o.centreMm / mmPerPoint;
+        const dh = o.daylightWidthMm / mmPerPoint / 2;
+        const rect = memberRect(segJ, c - dh - 2 * studThkPts, c + dh + 2 * studThkPts, halfDepthPts + depthPts);
+        if (pointInRect(p, rect)) return true;
+      }
+    }
+    return false;
+  };
+  /** The lowest underside-of-top-plate height (mm) of any segment whose footprint covers `p`. */
+  const ceilingMmAt = (p: PagePoint): number => {
+    let min = Infinity;
+    layout.forEach((segJ, j) => {
+      if (segJ.segLen <= 0) return;
+      const dx = p.x - segJ.a.x;
+      const dy = p.y - segJ.a.y;
+      const s = dx * segJ.dir.x + dy * segJ.dir.y;
+      const perp = -dx * segJ.dir.y + dy * segJ.dir.x;
+      if (Math.abs(perp) <= halfDepthPts + studThkPts && s >= -depthPts && s <= segJ.segLen + depthPts) {
+        const frac = Math.max(0, Math.min(1, s / segJ.segLen));
+        min = Math.min(min, heightAt(j, frac) - topMakeup);
+      }
+    });
+    return min;
   };
 
   layout.forEach((seg, segIndex) => {
@@ -585,30 +696,112 @@ export function wallMembers(
     const startH = rake ? rake.startMm : settings.wallHeightMm;
     const endH = rake ? rake.endMm : settings.wallHeightMm;
 
-    // Vertical member (stud-like): records it for the dwang pass and emits its box.
+    // Vertical member (stud-like): records it for the dwang pass and emits its box. When
+    // `rakeCut` is set on a raked segment, the top is cut to the underside of the sloped top
+    // plate instead of being flat (a wedge in place of a box).
     const verticals: { x: number; yB: number; yT: number }[] = [];
-    const addV = (kind: FramingComponentKind, s: number, yB: number, yT: number) => {
+    const addV = (kind: FramingComponentKind, s: number, yB: number, yT: number, rakeCut = false) => {
       if (yT - yB <= 0) return;
       verticals.push({ x: s, yB, yT });
-      members.push({ kind, lengthM: M(yT - yB), position: [fx(s), M((yB + yT) / 2), fz(s)], size: [thkM, M(yT - yB), depthM], yaw, pitch: 0 });
+      if (rakeCut && rake && seg.segLen > 0) {
+        const sLeft = s - studThkPts / 2;
+        const sRight = s + studThkPts / 2;
+        const yTopLeft = heightAt(segIndex, sLeft / seg.segLen) - topMakeup;
+        const yTopRight = heightAt(segIndex, sRight / seg.segLen) - topMakeup;
+        if (Math.min(yTopLeft, yTopRight) - yB <= 0) return;
+        const quad: [number, number][] = [
+          [0, M(yB)],
+          [thkM, M(yB)],
+          [thkM, M(yTopRight)],
+          [0, M(yTopLeft)],
+        ];
+        members.push({
+          kind,
+          lengthM: M((yTopLeft + yTopRight) / 2 - yB),
+          position: [fx(sLeft), 0, fz(sLeft)],
+          size: [thkM, M(Math.max(yTopLeft, yTopRight) - yB), depthM],
+          yaw,
+          pitch: 0,
+          wedge: { quad, depthM },
+        });
+        return;
+      }
+      // Cap a plain (non-rake-cut) member's top to whichever segment's roofline is lowest at its
+      // position — corner studs/kings on a flat segment must not poke above an adjacent raked
+      // segment's lower top plate at a shared corner.
+      const cappedYT = Math.min(yT, ceilingMmAt(pointAt(seg, s)));
+      if (cappedYT - yB <= 0) return;
+      members.push({ kind, lengthM: M(cappedYT - yB), position: [fx(s), M((yB + cappedYT) / 2), fz(s)], size: [thkM, M(cappedYT - yB), depthM], yaw, pitch: 0 });
     };
 
     // Plates (bottom flat; top sloped + pitched on a rake).
     for (let l = 0; l < bottomLayers; l += 1) {
       members.push({ kind: "plate", lengthM: segLenM, position: [fx(midS), M(l * STUD_THICKNESS_MM + STUD_THICKNESS_MM / 2), fz(midS)], size: [segLenM, thkM, depthM], yaw, pitch: 0 });
     }
-    const pitch = rake ? Math.atan2(endH - startH, segRunMm) : 0;
-    const topLenM = rake ? M(Math.hypot(segRunMm, endH - startH)) : segLenM;
-    const avgTop = (startH + endH) / 2;
-    for (let l = 0; l < topLayers; l += 1) {
-      members.push({ kind: "plate", lengthM: topLenM, position: [fx(midS), M(avgTop - topMakeup + l * STUD_THICKNESS_MM + STUD_THICKNESS_MM / 2), fz(midS)], size: [topLenM, thkM, depthM], yaw, pitch });
+    // Top plate(s): one sloped piece spanning the segment, or (for a gable) two pieces meeting at
+    // the apex (`middleMm`) at the segment midpoint.
+    const topPieces =
+      rake?.gable && rake.middleMm !== undefined
+        ? [
+            { s0: 0, s1: midS, h0: startH, h1: rake.middleMm },
+            { s0: midS, s1: seg.segLen, h0: rake.middleMm, h1: endH },
+          ]
+        : [{ s0: 0, s1: seg.segLen, h0: startH, h1: endH }];
+    for (const piece of topPieces) {
+      const runMm = (piece.s1 - piece.s0) * mmPerPoint;
+      if (rake && runMm > 0) {
+        // Plumb-cut ends: the plate spans the full horizontal run of the piece (long point at the
+        // outside of the end stud / the ridge), with vertical end faces and sloped top/bottom faces.
+        const runM = M(runMm);
+        const lenM = M(Math.hypot(runMm, piece.h1 - piece.h0));
+        const startX = fx(piece.s0);
+        const startZ = fz(piece.s0);
+        for (let l = 0; l < topLayers; l += 1) {
+          const yBottomStart = M(piece.h0 - topMakeup + l * STUD_THICKNESS_MM);
+          const yBottomEnd = M(piece.h1 - topMakeup + l * STUD_THICKNESS_MM);
+          const quad: [number, number][] = [
+            [0, yBottomStart],
+            [runM, yBottomEnd],
+            [runM, yBottomEnd + thkM],
+            [0, yBottomStart + thkM],
+          ];
+          members.push({
+            kind: "plate",
+            lengthM: lenM,
+            position: [startX, 0, startZ],
+            size: [lenM, thkM, depthM],
+            yaw,
+            pitch: 0,
+            wedge: { quad, depthM },
+          });
+        }
+      } else {
+        const midPieceS = (piece.s0 + piece.s1) / 2;
+        for (let l = 0; l < topLayers; l += 1) {
+          members.push({
+            kind: "plate",
+            lengthM: segLenM,
+            position: [fx(midPieceS), M(settings.wallHeightMm - topMakeup + l * STUD_THICKNESS_MM + STUD_THICKNESS_MM / 2), fz(midPieceS)],
+            size: [segLenM, thkM, depthM],
+            yaw,
+            pitch: 0,
+          });
+        }
+      }
     }
 
-    // Studs (anchors + regulars not cut by an opening).
+    // Studs (anchors + regulars + gable apex studs not cut by an opening).
     const segOpenings = openings.filter((o) => o.segmentIndex === segIndex);
-    const cut = (s: number) => segOpenings.some((o) => Math.abs(s - o.centreMm / mmPerPoint) <= o.daylightWidthMm / mmPerPoint / 2 + 2 * studThkPts);
-    for (const s of [...seg.anchors, ...seg.regular.filter((x) => !cut(x))]) {
-      addV("stud", s, bottomMakeup, heightAt(segIndex, seg.segLen > 0 ? s / seg.segLen : 0) - topMakeup);
+    const cut = (s: number) =>
+      segOpenings.some((o) => Math.abs(s - o.centreMm / mmPerPoint) <= o.daylightWidthMm / mmPerPoint / 2 + 2 * studThkPts) ||
+      nearAnyOpening(pointAt(seg, s));
+    // Gable apex: a stud under each side's top plate, meeting at the ridge. Corner-makeup anchors
+    // and the gable apex pair are otherwise drawn unconditionally — but if an opening cuts through
+    // here, they become jack (and sill jack) studs below, like any other cut stud.
+    const gableApexS = rake?.gable && rake.middleMm !== undefined ? [midS - studThkPts / 2, midS + studThkPts / 2] : [];
+    const cutCandidates = [...seg.anchors, ...gableApexS];
+    for (const s of [...cutCandidates.filter((x) => !cut(x)), ...seg.regular.filter((x) => !cut(x))]) {
+      addV("stud", s, bottomMakeup, heightAt(segIndex, seg.segLen > 0 ? s / seg.segLen : 0) - topMakeup, true);
     }
 
     // Opening members.
@@ -619,11 +812,15 @@ export function wallMembers(
       const jambs = openingJambs(centrePts, dwHalf, studThkPts);
       const isWindow = o.kind === "window";
       const sill = isWindow ? o.sillHeightMm ?? 0 : 0;
-      const head = sill + o.daylightHeightMm;
       const lintelDepth = framingDepthMm(o.lintelSize);
+      // Cap the head (and so the lintel/trimmers) to the underside of the lowest top plate above
+      // the king studs — whether that's this segment's own rake, or an adjacent (possibly raked)
+      // segment's roofline at a shared corner — so the opening is trimmed rather than poking through.
+      const rakeHeadLimit = Math.min(...jambs.kings.map((k) => ceilingMmAt(pointAt(seg, k)))) - lintelDepth;
+      const head = Math.min(sill + o.daylightHeightMm, rakeHeadLimit);
       openMeta.push({ centrePts, dwHalf, sill, head });
 
-      for (const k of jambs.kings) addV("king", k, bottomMakeup, heightAt(segIndex, k / seg.segLen) - topMakeup); // full, follows rake
+      for (const k of jambs.kings) addV("king", k, bottomMakeup, heightAt(segIndex, k / seg.segLen) - topMakeup, true); // full, follows rake
       for (const t of jambs.trimmers) addV("trimmer", t, bottomMakeup, head); // full: bottom plate → underside of lintel
       const lintelLenM = M(o.daylightWidthMm + 2 * STUD_THICKNESS_MM);
       const lintelSizeOverride = o.lintelSize !== settings.framingSize ? o.lintelSize : undefined;
@@ -631,8 +828,8 @@ export function wallMembers(
       for (let p = 0; p < o.lintelPly; p += 1) {
         members.push({ kind: "lintel", sizeOverride: lintelSizeOverride, lengthM: lintelLenM, position: [fx(centrePts), M(head + lintelDepth / 2), fz(centrePts)], size: [lintelLenM, M(lintelDepth), depthM / Math.max(1, o.lintelPly)], yaw, pitch: 0 });
       }
-      const jackPositions = seg.regular.filter((s) => Math.abs(s - centrePts) < dwHalf);
-      for (const s of jackPositions) addV("jack", s, head + lintelDepth, heightAt(segIndex, s / seg.segLen) - topMakeup);
+      const jackPositions = [...seg.regular, ...cutCandidates].filter((s) => Math.abs(s - centrePts) < dwHalf);
+      for (const s of jackPositions) addV("jack", s, head + lintelDepth, heightAt(segIndex, s / seg.segLen) - topMakeup, true);
 
       if (isWindow) {
         members.push({ kind: "sill", lengthM: M(o.daylightWidthMm), position: [fx(centrePts), M(sill - STUD_THICKNESS_MM / 2), fz(centrePts)], size: [M(o.daylightWidthMm), thkM, depthM], yaw, pitch: 0 });

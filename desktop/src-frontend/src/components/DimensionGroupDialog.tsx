@@ -8,6 +8,7 @@ const MEASUREMENT_TYPES = [
   { value: "area", label: "Area" },
   { value: "count", label: "Count" },
   { value: "timber_framing", label: "Timber Framing" },
+  { value: "array", label: "Array" },
 ] as const;
 
 interface DimensionGroupDialogProps {

@@ -5,7 +5,7 @@ import { theme } from "../theme";
 import { DocumentMeta, ViewerCanvas } from "./ViewerCanvas";
 import { FramingBreakdownPanel } from "./FramingBreakdownPanel";
 import { OpeningDialog } from "./OpeningDialog";
-import { Framing3DView } from "./Framing3DView";
+import { Framing3DView, type Framing3DPage } from "./Framing3DView";
 import { DEFAULT_DOOR, DEFAULT_WINDOW, parseFramingSettings, parseWallFraming, type OpeningTemplate } from "../lib/framing";
 import { computeWall3D, type Member3D } from "../lib/framing3d";
 
@@ -27,9 +27,17 @@ export function Viewer() {
   const [openingDialog, setOpeningDialog] = useState<OpeningTemplate | null>(null);
   const openingPlacement = useAppStore((state) => state.openingPlacement);
   const setOpeningPlacement = useAppStore((state) => state.setOpeningPlacement);
+  const arrayTrimMode = useAppStore((state) => state.arrayTrimMode);
+  const setArrayTrimMode = useAppStore((state) => state.setArrayTrimMode);
+  const arrayTrimType = useAppStore((state) => state.arrayTrimType);
+  const setArrayTrimType = useAppStore((state) => state.setArrayTrimType);
   const view3d = useAppStore((state) => state.view3d);
+  const view3dMulti = useAppStore((state) => state.view3dMulti);
+  const multiPage3DConfig = useAppStore((state) => state.multiPage3DConfig);
   const activeIsFraming =
     activeDimensionGroupId !== null && groupProps[activeDimensionGroupId]?.measurement_type === "timber_framing";
+  const activeIsArray =
+    activeDimensionGroupId !== null && groupProps[activeDimensionGroupId]?.measurement_type === "array";
 
   // Preview image URL for the current page — loaded on demand when view3d is active.
   const [previewUrl3d, setPreviewUrl3d] = useState<string | undefined>(undefined);
@@ -70,6 +78,80 @@ export function Viewer() {
     }
     return out;
   }, [view3d, overlayMeasurements, groupProps, pageScale, pageIndex]);
+  // Preview images for the multi-page 3D scene's "ground" pages (offset <= 0).
+  const [multiPreviewUrls, setMultiPreviewUrls] = useState<Record<number, string>>({});
+  useEffect(() => {
+    if (!view3d || !view3dMulti || !multiPage3DConfig) { setMultiPreviewUrls({}); return; }
+    let alive = true;
+    const groundPages = multiPage3DConfig.pages.filter((p) => p.included && p.offsetM <= 0);
+    Promise.all(
+      groundPages.map(async (p) => {
+        try {
+          const data = await invoke<{ page: number; width: number; height: number; image_path: string }>(
+            "render_preview", { pageIndex: p.pageIndex }
+          );
+          return [p.pageIndex, convertFileSrc(data.image_path)] as const;
+        } catch {
+          return null;
+        }
+      }),
+    ).then((entries) => {
+      if (!alive) return;
+      const urls: Record<number, string> = {};
+      for (const entry of entries) {
+        if (entry) urls[entry[0]] = entry[1];
+      }
+      setMultiPreviewUrls(urls);
+    });
+    return () => { alive = false; };
+  }, [view3d, view3dMulti, multiPage3DConfig]);
+
+  // 3D scene pages for the multi-page view: each included page's framing members (offset
+  // along world Y by its configured Z-offset), with the PDF page rendered as a ground
+  // plane only for pages at or below Z-0.
+  const pages3d = useMemo<Framing3DPage[]>(() => {
+    if (!view3d || !view3dMulti || !multiPage3DConfig) return [];
+    return multiPage3DConfig.pages
+      .filter((p) => p.included)
+      .map((p) => {
+        const out: Member3D[] = [];
+        for (const g of p.groups) {
+          if (!g.included) continue;
+          const settings = parseFramingSettings(g.framingPropsJson);
+          for (const mz of g.measurements) {
+            let pts: { x: number; y: number }[];
+            try {
+              pts = JSON.parse(mz.geometry_json);
+            } catch {
+              continue;
+            }
+            if (!Array.isArray(pts) || pts.length < 2) continue;
+            out.push(...computeWall3D(pts, settings, p.mmPerPoint, parseWallFraming(mz.framing_json)));
+          }
+        }
+        const S = p.mmPerPoint ? p.mmPerPoint / 1000 : null;
+        return {
+          members: out,
+          offsetM: p.offsetM,
+          pageWidthM: S ? p.pageWidthPts * S : undefined,
+          pageHeightM: S ? p.pageHeightPts * S : undefined,
+          previewUrl: multiPreviewUrls[p.pageIndex],
+          showGround: p.offsetM <= 0,
+        };
+      });
+  }, [view3d, view3dMulti, multiPage3DConfig, multiPreviewUrls]);
+
+  // Debug/QA: console-only export of the current page's timber-framing walls as a 2D
+  // elevation PDF. Run `exportFramingElevations()` in devtools. Same action backs the
+  // ribbon's "Elevation PDF" button.
+  useEffect(() => {
+    (window as unknown as Record<string, unknown>).exportFramingElevations = () =>
+      useAppStore.getState().exportFramingElevations();
+    return () => {
+      delete (window as unknown as Record<string, unknown>).exportFramingElevations;
+    };
+  }, []);
+
   const calibrating = useAppStore((state) => state.calibrating);
   const setCalibrating = useAppStore((state) => state.setCalibrating);
   const drawPolarity = useAppStore((state) => state.drawPolarity);
@@ -160,7 +242,7 @@ export function Viewer() {
             ))}
           </div>
         ) : null}
-        {activeDimensionGroupId !== null && viewerMode === "add" && !activeIsFraming ? (
+        {activeDimensionGroupId !== null && viewerMode === "add" && !activeIsFraming && !activeIsArray ? (
           <div style={{ display: "flex", border: `1px solid ${theme.border.divider}`, borderRadius: 3, overflow: "hidden" }}>
             {([1, -1] as const).map((polarity) => (
               <button
@@ -181,6 +263,34 @@ export function Viewer() {
               </button>
             ))}
           </div>
+        ) : null}
+        {activeIsArray ? (
+          <select
+            value={arrayTrimMode ? arrayTrimType : "off"}
+            onChange={(e) => {
+              const value = e.target.value;
+              if (value === "off") {
+                setArrayTrimMode(false);
+              } else {
+                setArrayTrimType(value as "line" | "box");
+                setArrayTrimMode(true);
+              }
+            }}
+            title="Trim array: draw a cut line or box to clip array members"
+            style={{
+              height: 24,
+              padding: "0 6px",
+              background: arrayTrimMode ? theme.accent : theme.bg.input,
+              color: arrayTrimMode ? "#fff" : theme.text.primary,
+              border: `1px solid ${arrayTrimMode ? theme.accent : theme.border.divider}`,
+              cursor: "pointer",
+              fontSize: 11,
+            }}
+          >
+            <option value="off">Trim</option>
+            <option value="line">Trim: Line</option>
+            <option value="box">Trim: Box</option>
+          </select>
         ) : null}
         {activeIsFraming ? (
           <div style={{ display: "flex", border: `1px solid ${theme.border.divider}`, borderRadius: 3, overflow: "hidden" }}>
@@ -243,7 +353,15 @@ export function Viewer() {
       </div>
       <div style={{ flex: 1, minHeight: 0, position: "relative", display: "flex", flexDirection: "column" }}>
         {view3d ? (
-          members3d.length > 0 ? (
+          view3dMulti && multiPage3DConfig ? (
+            pages3d.some((p) => p.members.length > 0) ? (
+              <Framing3DView members={[]} pages={pages3d} />
+            ) : (
+              <div style={{ flex: 1, display: "grid", placeItems: "center", background: "#dfe4ea", color: "#5a636c", fontSize: 13 }}>
+                No timber framing found on the selected pages.
+              </div>
+            )
+          ) : members3d.length > 0 ? (
             <Framing3DView members={members3d} pageWidthM={pageWidthM3d} pageHeightM={pageHeightM3d} previewUrl={previewUrl3d} />
           ) : (
             <div style={{ flex: 1, display: "grid", placeItems: "center", background: "#dfe4ea", color: "#5a636c", fontSize: 13 }}>

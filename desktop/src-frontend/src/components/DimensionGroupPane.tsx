@@ -36,6 +36,7 @@ const MEASUREMENT_TYPE_ICONS: Record<string, string> = {
   area: "crop_free",
   count: "123",
   length: "straighten",
+  array: "data_array",
 };
 
 function DimensionNodeIcon({ node, measurementType }: { node: TreeNodeDto; measurementType?: string }) {

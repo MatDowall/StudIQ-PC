@@ -1,9 +1,11 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { save } from "@tauri-apps/plugin-dialog";
 import { theme } from "../theme";
 import { useAppStore } from "../store/appStore";
 import { ProjectInfoDialog } from "./ProjectInfoDialog";
 import { WorkbookRibbon } from "./WorkbookRibbon";
+import { MultiPage3DDialog } from "./MultiPage3DDialog";
 
 // Material Symbol icon name for each ribbon button label.
 const BUTTON_ICONS: Record<string, string> = {
@@ -16,12 +18,13 @@ const BUTTON_ICONS: Record<string, string> = {
   "View in 3D": "view_in_ar",
   Dim: "contrast",
   Geometry: "my_location",
+  "Elevation PDF": "picture_as_pdf",
 };
 
 const groups = [
   { label: "Dimension Group", tools: ["Add", "Properties", "Copy", "Import", "Export"] },
   { label: "Type", tools: ["Point", "Line"] },
-  { label: "Drawing", tools: ["Plan View", "View in 3D", "Dim"] },
+  { label: "Drawing", tools: ["Plan View", "View in 3D", "Dim", "Elevation PDF"] },
   { label: "Snap", tools: ["Geometry"] },
 ];
 
@@ -46,12 +49,16 @@ export function Ribbon() {
   const activeProject = useAppStore((state) => state.activeProject);
   const closeProject = useAppStore((state) => state.closeProject);
   const exportProject = useAppStore((state) => state.exportProject);
+  const exportFramingElevations = useAppStore((state) => state.exportFramingElevations);
   const activeDimensionGroupId = useAppStore((state) => state.activeDimensionGroupId);
   const requestDgPaneCommand = useAppStore((state) => state.requestDgPaneCommand);
   const drawingType = useAppStore((state) => state.drawingType);
   const setDrawingType = useAppStore((state) => state.setDrawingType);
   const view3d = useAppStore((state) => state.view3d);
   const setView3d = useAppStore((state) => state.setView3d);
+  const setView3dMulti = useAppStore((state) => state.setView3dMulti);
+  const multiPage3DDialogOpen = useAppStore((state) => state.multiPage3DDialogOpen);
+  const setMultiPage3DDialogOpen = useAppStore((state) => state.setMultiPage3DDialogOpen);
   const drawingDimmer = useAppStore((state) => state.drawingDimmer);
   const setDrawingDimmer = useAppStore((state) => state.setDrawingDimmer);
   const snapEnabled = useAppStore((state) => state.snapEnabled);
@@ -60,8 +67,34 @@ export function Ribbon() {
 
   const [showProjectInfo, setShowProjectInfo] = useState(false);
   const [exportStatus, setExportStatus] = useState("");
+  const [show3dMenu, setShow3dMenu] = useState(false);
+  const view3dWrapperRef = useRef<HTMLDivElement | null>(null);
+  const view3dMenuRef = useRef<HTMLDivElement | null>(null);
+  const [menuPos, setMenuPos] = useState<{ top: number; left: number } | null>(null);
+
+  useEffect(() => {
+    if (!show3dMenu) return;
+    const onDocClick = (e: MouseEvent) => {
+      const target = e.target as Node;
+      if (view3dWrapperRef.current?.contains(target)) return;
+      if (view3dMenuRef.current?.contains(target)) return;
+      setShow3dMenu(false);
+    };
+    document.addEventListener("mousedown", onDocClick);
+    return () => document.removeEventListener("mousedown", onDocClick);
+  }, [show3dMenu]);
 
   const dimActive = drawingDimmer < 1;
+
+  async function handleExportElevations() {
+    try {
+      const path = await exportFramingElevations();
+      setExportStatus(path ? "Elevation PDF saved." : "");
+      if (path) setTimeout(() => setExportStatus(""), 2500);
+    } catch (err) {
+      setExportStatus(`Elevation export failed: ${err}`);
+    }
+  }
 
   async function handleExport() {
     if (!activeProject) return;
@@ -105,18 +138,19 @@ export function Ribbon() {
                 style={{
                   display: "flex",
                   flexDirection: "column",
-                  minWidth: groupIndex === 0 ? 138 : isDrawingGroup ? 148 : 72,
+                  minWidth: groupIndex === 0 ? 138 : isDrawingGroup ? 196 : 72,
                   padding: "4px 8px 0",
                   borderRight: `1px solid ${theme.border.divider}`,
                 }}
               >
                 <div style={{ display: "flex", gap: 5, alignItems: "center", overflow: "hidden" }}>
-                  {group.tools.slice(0, 3).map((tool, toolIndex) => {
+                  {group.tools.slice(0, isDrawingGroup ? 4 : 3).map((tool, toolIndex) => {
                     const dgCommand = groupIndex === 0 ? DIMENSION_GROUP_TOOLS[tool] : undefined;
                     const isTypeToggle = group.label === "Type" && (tool === "Point" || tool === "Line");
                     const isViewToggle = group.label === "Drawing" && (tool === "Plan View" || tool === "View in 3D");
                     const isDimToggle = group.label === "Drawing" && tool === "Dim";
                     const isSnapToggle = group.label === "Snap" && tool === "Geometry";
+                    const isElevationExport = group.label === "Drawing" && tool === "Elevation PDF";
 
                     let enabled: boolean;
                     let cursor: string;
@@ -142,6 +176,10 @@ export function Ribbon() {
                       enabled = true;
                       active = snapEnabled;
                       cursor = "pointer";
+                    } else if (isElevationExport) {
+                      enabled = !view3d;
+                      active = false;
+                      cursor = enabled ? "pointer" : "not-allowed";
                     } else {
                       enabled = toolIndex === 0;
                       active = enabled;
@@ -153,16 +191,26 @@ export function Ribbon() {
                       : isTypeToggle
                         ? () => setDrawingType(tool === "Line" ? "line" : "point")
                         : isViewToggle
-                          ? () => setView3d(tool === "View in 3D")
+                          ? () => {
+                              if (tool === "View in 3D") {
+                                setView3d(true);
+                                setView3dMulti(false);
+                              } else {
+                                setView3d(false);
+                              }
+                            }
                           : isDimToggle
                             ? () => setDrawingDimmer(dimActive ? 1 : 0.4)
                             : isSnapToggle
                               ? () => setSnapEnabled(!snapEnabled)
-                              : undefined;
+                              : isElevationExport
+                                ? () => { void handleExportElevations(); }
+                                : undefined;
 
                     const iconName = BUTTON_ICONS[tool];
+                    const isView3d = tool === "View in 3D";
 
-                    return (
+                    const button = (
                       <button
                         key={`${group.label}-${tool}`}
                         disabled={!enabled && !isTypeToggle}
@@ -191,6 +239,98 @@ export function Ribbon() {
                           {tool}
                         </span>
                       </button>
+                    );
+
+                    if (!isView3d) return button;
+
+                    return (
+                      <div key={`${group.label}-${tool}`} ref={view3dWrapperRef} style={{ display: "flex", alignItems: "stretch", height: 50, flexShrink: 0 }}>
+                        {button}
+                        <button
+                          onClick={(e) => {
+                            const rect = e.currentTarget.parentElement!.getBoundingClientRect();
+                            setMenuPos({ top: rect.bottom, left: rect.left });
+                            setShow3dMenu((v) => !v);
+                          }}
+                          title="3D view options"
+                          style={{
+                            width: 16,
+                            height: 50,
+                            padding: 0,
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "center",
+                            flexShrink: 0,
+                            border: `1px solid ${active ? theme.accent : theme.border.divider}`,
+                            borderLeft: "none",
+                            background: active ? theme.bg.active : theme.bg.input,
+                            color: active ? theme.text.primary : theme.text.disabled,
+                            cursor: "pointer",
+                          }}
+                        >
+                          <span className="material-symbols-outlined" style={{ fontSize: 16, lineHeight: 1 }}>
+                            arrow_drop_down
+                          </span>
+                        </button>
+                        {show3dMenu && menuPos
+                          ? createPortal(
+                          <div
+                            ref={view3dMenuRef}
+                            style={{
+                              position: "fixed",
+                              top: menuPos.top,
+                              left: menuPos.left,
+                              zIndex: 1200,
+                              minWidth: 160,
+                              background: theme.bg.pane,
+                              border: `1px solid ${theme.border.divider}`,
+                              boxShadow: "0 8px 24px rgba(0,0,0,0.4)",
+                              fontSize: 11,
+                            }}
+                          >
+                            <button
+                              onClick={() => {
+                                setView3d(true);
+                                setView3dMulti(false);
+                                setShow3dMenu(false);
+                              }}
+                              style={{
+                                display: "block",
+                                width: "100%",
+                                textAlign: "left",
+                                padding: "6px 10px",
+                                background: "transparent",
+                                color: theme.text.primary,
+                                border: "none",
+                                cursor: "pointer",
+                              }}
+                            >
+                              Current Page
+                            </button>
+                            <button
+                              onClick={() => {
+                                setMultiPage3DDialogOpen(true);
+                                setShow3dMenu(false);
+                              }}
+                              style={{
+                                display: "block",
+                                width: "100%",
+                                textAlign: "left",
+                                padding: "6px 10px",
+                                background: "transparent",
+                                color: theme.text.primary,
+                                border: "none",
+                                borderTop: `1px solid ${theme.border.subtle}`,
+                                cursor: "pointer",
+                              }}
+                            >
+                              View Multiple Pages...
+                            </button>
+                          </div>,
+                          document.body,
+                        )
+                          : null}
+                      </div>
                     );
                   })}
                 </div>
@@ -326,6 +466,7 @@ export function Ribbon() {
           onConfirm={() => setShowProjectInfo(false)}
         />
       ) : null}
+      {multiPage3DDialogOpen ? <MultiPage3DDialog onCancel={() => setMultiPage3DDialogOpen(false)} /> : null}
     </>
   );
 }

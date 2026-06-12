@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Canvas } from "@react-three/fiber";
 import { OrbitControls } from "@react-three/drei";
 import * as THREE from "three";
@@ -11,14 +11,102 @@ function quaternionFor(yaw: number, pitch: number): [number, number, number, num
   return [q.x, q.y, q.z, q.w];
 }
 
+/** Builds a hexahedron (rake/plumb-cut wedge): `quad` is a 4-point cross-section in the local
+ *  X (along)/Y (height) plane, extruded `depthM` along local Z (across the wall). */
+function wedgeGeometry(quad: [number, number][], depthM: number): THREE.BufferGeometry {
+  const d = depthM / 2;
+  const front = quad.map(([x, y]) => [x, y, -d]);
+  const back = quad.map(([x, y]) => [x, y, d]);
+  const tri = (a: number[], b: number[], c: number[]) => [...a, ...b, ...c];
+  const face = (a: number[], b: number[], c: number[], dd: number[]) => [...tri(a, b, c), ...tri(a, c, dd)];
+  const positions = new Float32Array([
+    ...face(front[0], front[1], front[2], front[3]), // front
+    ...face(back[3], back[2], back[1], back[0]), // back
+    ...face(front[0], front[1], back[1], back[0]), // bottom
+    ...face(front[3], front[2], back[2], back[3]), // top
+    ...face(front[3], front[0], back[0], back[3]), // start end
+    ...face(front[1], front[2], back[2], back[1]), // finish end
+  ]);
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  geometry.computeVertexNormals();
+  return geometry;
+}
+
+function WedgeMesh({ mem }: { mem: Member3D }) {
+  const geometry = useMemo(() => wedgeGeometry(mem.wedge!.quad, mem.wedge!.depthM), [mem.wedge]);
+  return (
+    <mesh position={mem.position} rotation={[0, mem.yaw, 0]} geometry={geometry}>
+      <meshLambertMaterial color={MEMBER_COLOURS[mem.kind] ?? "#999999"} side={THREE.DoubleSide} />
+    </mesh>
+  );
+}
+
+/** Renders all box-shaped members sharing a `(kind, size)` as a single InstancedMesh — one
+ *  geometry, one material, one draw call regardless of how many members are in the group. */
+function InstancedMembers({
+  kind,
+  size,
+  members,
+}: {
+  kind: Member3D["kind"];
+  size: [number, number, number];
+  members: Member3D[];
+}) {
+  const ref = useRef<THREE.InstancedMesh>(null);
+
+  useEffect(() => {
+    const mesh = ref.current;
+    if (!mesh) return;
+    const matrix = new THREE.Matrix4();
+    const scale = new THREE.Vector3(1, 1, 1);
+    members.forEach((mem, i) => {
+      const [qx, qy, qz, qw] = quaternionFor(mem.yaw, mem.pitch);
+      matrix.compose(new THREE.Vector3(...mem.position), new THREE.Quaternion(qx, qy, qz, qw), scale);
+      mesh.setMatrixAt(i, matrix);
+    });
+    mesh.instanceMatrix.needsUpdate = true;
+  }, [members]);
+
+  return (
+    <instancedMesh ref={ref} args={[undefined, undefined, members.length]}>
+      <boxGeometry args={size} />
+      <meshLambertMaterial color={MEMBER_COLOURS[kind] ?? "#999999"} />
+    </instancedMesh>
+  );
+}
+
+/** Box-shaped members are batched into one InstancedMesh per (kind, size) combination —
+ *  this is by far the common case (studs, plates, dwangs, etc.) and collapses what would
+ *  otherwise be hundreds of individual draw calls into a handful. Wedges (rake/plumb cuts)
+ *  are comparatively rare and each get their own mesh since their geometry is unique. */
 function Members({ members }: { members: Member3D[] }) {
+  const { wedges, groups } = useMemo(() => {
+    const wedges: Member3D[] = [];
+    const map = new Map<string, { kind: Member3D["kind"]; size: [number, number, number]; members: Member3D[] }>();
+    for (const mem of members) {
+      if (mem.wedge) {
+        wedges.push(mem);
+        continue;
+      }
+      const key = `${mem.kind}|${mem.size.join(",")}`;
+      let group = map.get(key);
+      if (!group) {
+        group = { kind: mem.kind, size: mem.size, members: [] };
+        map.set(key, group);
+      }
+      group.members.push(mem);
+    }
+    return { wedges, groups: Array.from(map.values()) };
+  }, [members]);
+
   return (
     <group>
-      {members.map((mem, i) => (
-        <mesh key={i} position={mem.position} quaternion={quaternionFor(mem.yaw, mem.pitch)}>
-          <boxGeometry args={mem.size} />
-          <meshStandardMaterial color={MEMBER_COLOURS[mem.kind] ?? "#999999"} />
-        </mesh>
+      {wedges.map((mem, i) => (
+        <WedgeMesh key={i} mem={mem} />
+      ))}
+      {groups.map((g, i) => (
+        <InstancedMembers key={i} kind={g.kind} size={g.size} members={g.members} />
       ))}
     </group>
   );
@@ -101,6 +189,18 @@ function PageGround({ widthM, heightM, url }: { widthM: number; heightM: number;
   );
 }
 
+/** One page's contribution to a multi-page 3D scene: its members and (optionally) its PDF
+ *  page rendered as a ground plane, translated up by `offsetM` along world Y. */
+export interface Framing3DPage {
+  members: Member3D[];
+  offsetM: number;
+  pageWidthM?: number;
+  pageHeightM?: number;
+  previewUrl?: string;
+  /** Whether to render this page's PDF as a ground plane (typically only the offsetM === 0 page). */
+  showGround: boolean;
+}
+
 interface Framing3DViewProps {
   members: Member3D[];
   /** PDF page width in world metres — when provided with pageHeightM and previewUrl, renders the page as ground. */
@@ -108,18 +208,37 @@ interface Framing3DViewProps {
   pageHeightM?: number;
   /** Tauri asset URL for the page preview image. */
   previewUrl?: string;
+  /** Multi-page 3D scene: when provided (non-empty), takes precedence over the single-page props above. */
+  pages?: Framing3DPage[];
 }
 
 /** Renders timber-framing members as 3D boxes with orbit/pan/zoom. Members come from
  *  `computeWall3D` (world metres, Y up, the PDF page as the floor). */
-export function Framing3DView({ members, pageWidthM, pageHeightM, previewUrl }: Framing3DViewProps) {
+export function Framing3DView({ members, pageWidthM, pageHeightM, previewUrl, pages }: Framing3DViewProps) {
+  const effectivePages: Framing3DPage[] = useMemo(() => {
+    if (pages && pages.length > 0) return pages;
+    return [{ members, offsetM: 0, pageWidthM, pageHeightM, previewUrl, showGround: true }];
+  }, [pages, members, pageWidthM, pageHeightM, previewUrl]);
+
   const { center, radius, camPos } = useMemo(() => {
     const box = new THREE.Box3();
     const v = new THREE.Vector3();
-    for (const mem of members) {
-      const h = Math.max(...mem.size) / 2 + 0.05;
-      box.expandByPoint(v.set(mem.position[0] - h, mem.position[1] - h, mem.position[2] - h));
-      box.expandByPoint(v.set(mem.position[0] + h, mem.position[1] + h, mem.position[2] + h));
+    for (const page of effectivePages) {
+      for (const mem of page.members) {
+        const offset = new THREE.Vector3(0, page.offsetM, 0);
+        if (mem.wedge) {
+          const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), mem.yaw);
+          for (const [x, y] of mem.wedge.quad) {
+            for (const z of [-mem.wedge.depthM / 2, mem.wedge.depthM / 2]) {
+              box.expandByPoint(v.set(x, y, z).applyQuaternion(q).add(new THREE.Vector3(...mem.position)).add(offset));
+            }
+          }
+          continue;
+        }
+        const h = Math.max(...mem.size) / 2 + 0.05;
+        box.expandByPoint(v.set(mem.position[0] - h, mem.position[1] - h + page.offsetM, mem.position[2] - h));
+        box.expandByPoint(v.set(mem.position[0] + h, mem.position[1] + h + page.offsetM, mem.position[2] + h));
+      }
     }
     if (box.isEmpty()) box.set(new THREE.Vector3(-1, 0, -1), new THREE.Vector3(1, 2, 1));
     const c = box.getCenter(new THREE.Vector3());
@@ -130,22 +249,27 @@ export function Framing3DView({ members, pageWidthM, pageHeightM, previewUrl }: 
       radius: r,
       camPos: [c.x + r * 1.3, c.y + r * 0.9, c.z + r * 1.3] as [number, number, number],
     };
-  }, [members]);
-
-  const showPage = pageWidthM != null && pageHeightM != null && previewUrl != null;
+  }, [effectivePages]);
 
   return (
-    <Canvas camera={{ position: camPos, fov: 45, near: 0.01, far: radius * 30 + 50 }} style={{ background: "#dfe4ea" }}>
+    <Canvas
+      frameloop="demand"
+      dpr={[1, 1.5]}
+      camera={{ position: camPos, fov: 45, near: 0.01, far: radius * 30 + 50 }}
+      style={{ background: "#dfe4ea" }}
+    >
       <ambientLight intensity={0.75} />
       <directionalLight position={[radius, radius * 2.5, radius * 1.5]} intensity={0.85} />
       <directionalLight position={[-radius, radius, -radius]} intensity={0.25} />
-      {/* Grid as spatial reference; the PDF plane (when present) sits just above it. */}
-      <gridHelper
-        args={[radius * 8, Math.round(radius * 8), "#b6bec6", "#93a3b3"]}
-        position={[center[0], -0.004, center[2]]}
-      />
-      {showPage && <PageGround widthM={pageWidthM!} heightM={pageHeightM!} url={previewUrl!} />}
-      <Members members={members} />
+      {effectivePages.map((page, i) => {
+        const showPage = page.showGround && page.pageWidthM != null && page.pageHeightM != null && page.previewUrl != null;
+        return (
+          <group key={i} position={[0, page.offsetM, 0]}>
+            {showPage && <PageGround widthM={page.pageWidthM!} heightM={page.pageHeightM!} url={page.previewUrl!} />}
+            <Members members={page.members} />
+          </group>
+        );
+      })}
       <OrbitControls makeDefault target={center} />
     </Canvas>
   );
