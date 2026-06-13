@@ -1,9 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { save } from "@tauri-apps/plugin-dialog";
 import { theme } from "../theme";
 import { useAppStore } from "../store/appStore";
-import { ProjectInfoDialog } from "./ProjectInfoDialog";
 import { WorkbookRibbon } from "./WorkbookRibbon";
 import { MultiPage3DDialog } from "./MultiPage3DDialog";
 
@@ -47,8 +45,6 @@ function Icon({ name, size = 14 }: { name: string; size?: number }) {
 
 export function Ribbon() {
   const activeProject = useAppStore((state) => state.activeProject);
-  const closeProject = useAppStore((state) => state.closeProject);
-  const exportProject = useAppStore((state) => state.exportProject);
   const exportFramingElevations = useAppStore((state) => state.exportFramingElevations);
   const activeDimensionGroupId = useAppStore((state) => state.activeDimensionGroupId);
   const requestDgPaneCommand = useAppStore((state) => state.requestDgPaneCommand);
@@ -65,7 +61,6 @@ export function Ribbon() {
   const setSnapEnabled = useAppStore((state) => state.setSnapEnabled);
   const activeTab = useAppStore((state) => state.activeTab);
 
-  const [showProjectInfo, setShowProjectInfo] = useState(false);
   const [exportStatus, setExportStatus] = useState("");
   const [show3dMenu, setShow3dMenu] = useState(false);
   const view3dWrapperRef = useRef<HTMLDivElement | null>(null);
@@ -93,22 +88,6 @@ export function Ribbon() {
       if (path) setTimeout(() => setExportStatus(""), 2500);
     } catch (err) {
       setExportStatus(`Elevation export failed: ${err}`);
-    }
-  }
-
-  async function handleExport() {
-    if (!activeProject) return;
-    const dest = await save({
-      defaultPath: activeProject.name + ".tcop",
-      filters: [{ name: "Take-it-Off Project", extensions: ["tcop"] }],
-    });
-    if (!dest || typeof dest !== "string") return;
-    try {
-      await exportProject(dest);
-      setExportStatus("Exported.");
-      setTimeout(() => setExportStatus(""), 2500);
-    } catch (err) {
-      setExportStatus(`Export failed: ${err}`);
     }
   }
 
@@ -158,7 +137,7 @@ export function Ribbon() {
 
                     if (dgCommand !== undefined) {
                       enabled = dgCommand === "add" || activeDimensionGroupId !== null;
-                      active = enabled;
+                      active = false;
                       cursor = !enabled ? "not-allowed" : "pointer";
                     } else if (isTypeToggle) {
                       enabled = true;
@@ -210,10 +189,11 @@ export function Ribbon() {
                     const iconName = BUTTON_ICONS[tool];
                     const isView3d = tool === "View in 3D";
 
+                    const isDisabled = !enabled && !isTypeToggle;
                     const button = (
                       <button
                         key={`${group.label}-${tool}`}
-                        disabled={!enabled && !isTypeToggle}
+                        disabled={isDisabled}
                         onClick={handleClick}
                         title={tool}
                         style={{
@@ -226,9 +206,10 @@ export function Ribbon() {
                           justifyContent: "center",
                           gap: 2,
                           overflow: "hidden",
+                          borderRadius: 4,
                           border: `1px solid ${active ? theme.accent : theme.border.divider}`,
                           background: active ? theme.bg.active : theme.bg.input,
-                          color: active ? theme.text.primary : theme.text.disabled,
+                          color: isDisabled ? theme.text.disabled : theme.text.primary,
                           fontSize: 9,
                           cursor,
                           flexShrink: 0,
@@ -261,6 +242,7 @@ export function Ribbon() {
                             alignItems: "center",
                             justifyContent: "center",
                             flexShrink: 0,
+                            borderRadius: "0 4px 4px 0",
                             border: `1px solid ${active ? theme.accent : theme.border.divider}`,
                             borderLeft: "none",
                             background: active ? theme.bg.active : theme.bg.input,
@@ -356,7 +338,7 @@ export function Ribbon() {
                       paddingBottom: 3,
                       fontSize: 10,
                       lineHeight: "12px",
-                      color: theme.text.secondary,
+                      color: theme.text.muted,
                       whiteSpace: "nowrap",
                       overflow: "hidden",
                       textOverflow: "ellipsis",
@@ -394,78 +376,9 @@ export function Ribbon() {
             {exportStatus ? (
               <span style={{ color: theme.text.secondary, fontSize: 11, flexShrink: 0 }}>{exportStatus}</span>
             ) : null}
-            <button
-              type="button"
-              onClick={() => setShowProjectInfo(true)}
-              title="Edit project info"
-              style={{
-                height: 24,
-                padding: "0 8px",
-                marginLeft: 4,
-                display: "flex",
-                alignItems: "center",
-                gap: 4,
-                background: theme.bg.input,
-                color: theme.text.primary,
-                border: `1px solid ${theme.border.divider}`,
-                cursor: "pointer",
-                fontSize: 11,
-                flexShrink: 0,
-              }}
-            >
-              <Icon name="edit" size={13} />
-              Project Info
-            </button>
-            <button
-              type="button"
-              onClick={() => { void handleExport(); }}
-              title="Export project file"
-              style={{
-                height: 24,
-                padding: "0 8px",
-                display: "flex",
-                alignItems: "center",
-                gap: 4,
-                background: theme.bg.input,
-                color: theme.text.primary,
-                border: `1px solid ${theme.border.divider}`,
-                cursor: "pointer",
-                fontSize: 11,
-                flexShrink: 0,
-              }}
-            >
-              <Icon name="save_as" size={13} />
-              Export
-            </button>
-            <button
-              type="button"
-              onClick={() => { void closeProject(); }}
-              style={{
-                height: 24,
-                padding: "0 8px",
-                display: "flex",
-                alignItems: "center",
-                gap: 4,
-                background: theme.bg.input,
-                color: theme.text.primary,
-                border: `1px solid ${theme.border.divider}`,
-                cursor: "pointer",
-                fontSize: 11,
-                flexShrink: 0,
-              }}
-            >
-              Close Project
-            </button>
           </div>
         ) : null}
       </div>
-      {showProjectInfo && activeProject ? (
-        <ProjectInfoDialog
-          initial={{ name: activeProject.name, client: activeProject.client, contractNumber: activeProject.contract_number, status: activeProject.status }}
-          onCancel={() => setShowProjectInfo(false)}
-          onConfirm={() => setShowProjectInfo(false)}
-        />
-      ) : null}
       {multiPage3DDialogOpen ? <MultiPage3DDialog onCancel={() => setMultiPage3DDialogOpen(false)} /> : null}
     </>
   );

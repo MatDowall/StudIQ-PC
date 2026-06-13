@@ -13,7 +13,7 @@ import { TextInputDialog } from "./TextInputDialog";
 import { groupNetQuantity, quantityValueText, type PagePoint, type Quantity } from "../lib/quantity";
 import { aggregateFramingGroup, parseFramingSettings, parseWallFraming, type FramingGroupBreakdown, type FramingWallInput } from "../lib/framing";
 
-const tabs = ["Dimension Groups", "Dimensions", "Auto Count"];
+const tabs = ["Dimension Groups"];
 const gridColumns = "22px minmax(150px, 1fr) 72px 48px 26px";
 
 function findPath(nodes: TreeNodeDto[], targetId: number, childCache: Record<number, TreeNodeDto[]>, path: string[] = []): string[] | null {
