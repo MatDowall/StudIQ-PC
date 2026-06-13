@@ -1,5 +1,4 @@
-import { useEffect, useRef, useState } from "react";
-import { createPortal } from "react-dom";
+import { useState } from "react";
 import { useAppStore } from "../store/appStore";
 import { theme } from "../theme";
 import { NewFromTemplateDialog } from "./NewFromTemplateDialog";
@@ -12,9 +11,6 @@ const BUTTON_ICONS: Record<string, string> = {
   "Add Row": "playlist_add",
   "Insert Above": "vertical_align_top",
   "Insert Below": "vertical_align_bottom",
-  Export: "save_as",
-  Print: "print",
-  Settings: "settings",
 };
 
 const FONT_FAMILIES = ["Arial", "Calibri", "Segoe UI", "Times New Roman", "Courier New", "Verdana"];
@@ -46,6 +42,7 @@ function FormatToggleButton({
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
+        borderRadius: 4,
         border: `1px solid ${active ? theme.accent : theme.border.divider}`,
         background: active ? theme.bg.active : theme.bg.input,
         color: disabled ? theme.text.disabled : theme.text.primary,
@@ -146,6 +143,7 @@ function RibbonButton({
         justifyContent: "center",
         gap: 2,
         overflow: "hidden",
+        borderRadius: 4,
         border: `1px solid ${theme.border.divider}`,
         background: theme.bg.input,
         color: disabled ? theme.text.disabled : theme.text.primary,
@@ -159,90 +157,6 @@ function RibbonButton({
         {label}
       </span>
     </button>
-  );
-}
-
-function SettingsDropdown() {
-  const [open, setOpen] = useState(false);
-  const [menuPos, setMenuPos] = useState<{ top: number; left: number } | null>(null);
-  const wrapperRef = useRef<HTMLDivElement>(null);
-  const menuRef = useRef<HTMLDivElement>(null);
-  const openTemplateManager    = useAppStore((s) => s.openTemplateManager);
-  const openNamedCellsManager  = useAppStore((s) => s.openNamedCellsManager);
-  const setWorkbookConfirmAction = useAppStore((s) => s.setWorkbookConfirmAction);
-
-  useEffect(() => {
-    if (!open) return;
-    function handlePointerDown(event: PointerEvent) {
-      const target = event.target as Node;
-      if (wrapperRef.current?.contains(target)) return;
-      if (menuRef.current?.contains(target)) return;
-      setOpen(false);
-    }
-    window.addEventListener("pointerdown", handlePointerDown);
-    return () => window.removeEventListener("pointerdown", handlePointerDown);
-  }, [open]);
-
-  function handleToggle() {
-    if (!open && wrapperRef.current) {
-      const rect = wrapperRef.current.getBoundingClientRect();
-      setMenuPos({ top: rect.bottom + 2, left: rect.left });
-    }
-    setOpen((v) => !v);
-  }
-
-  return (
-    <div ref={wrapperRef} style={{ position: "relative" }}>
-      <RibbonButton label="Settings" disabled={false} onClick={handleToggle} />
-      {open && menuPos &&
-        createPortal(
-          <div
-            ref={menuRef}
-            style={{
-              position: "fixed",
-              top: menuPos.top,
-              left: menuPos.left,
-              zIndex: 1300,
-              minWidth: 160,
-              background: theme.bg.pane,
-              border: `1px solid ${theme.border.divider}`,
-              boxShadow: "0 8px 24px rgba(0, 0, 0, 0.35)",
-            }}
-          >
-            {[
-              { icon: "dashboard_customize", label: "Template Manager", onClick: () => openTemplateManager() },
-              { icon: "sell",                label: "Named Cells",       onClick: () => openNamedCellsManager() },
-              { icon: "cleaning_services",   label: "Clean orphaned sheets", onClick: () => setWorkbookConfirmAction("clean") },
-              { icon: "delete_sweep",        label: "Clear workbook",    onClick: () => setWorkbookConfirmAction("clear") },
-            ].map(({ icon, label, onClick }) => (
-              <button
-                key={label}
-                onClick={() => { setOpen(false); onClick(); }}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 8,
-                  width: "100%",
-                  height: 30,
-                  padding: "0 10px",
-                  border: "none",
-                  background: "transparent",
-                  color: theme.text.primary,
-                  textAlign: "left",
-                  cursor: "pointer",
-                  fontSize: 12,
-                }}
-                onMouseEnter={(e) => (e.currentTarget.style.background = theme.bg.input)}
-                onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
-              >
-                <span className="material-symbols-outlined" style={{ fontSize: 16 }}>{icon}</span>
-                {label}
-              </button>
-            ))}
-          </div>,
-          document.body,
-        )}
-    </div>
   );
 }
 
@@ -278,8 +192,6 @@ export function WorkbookRibbon() {
     { label: "Workbook", tools: ["Blank Workbook", "New from Template", "Delete"] },
     { label: "Rows", tools: ["Add Row", "Insert Above", "Insert Below"] },
     { label: "Format", tools: [] as string[] },
-    { label: "Output", tools: ["Export", "Print"] },
-    { label: "Settings", tools: ["Settings"] },
   ];
 
   const handlers: Record<string, (() => void) | undefined> = {
@@ -289,8 +201,6 @@ export function WorkbookRibbon() {
     "Add Row":            hasGrid     ? () => gridApi.addRow() : undefined,
     "Insert Above":       hasGrid     ? () => gridApi.insertAbove() : undefined,
     "Insert Below":       hasGrid     ? () => gridApi.insertBelow() : undefined,
-    "Export":             hasGrid     ? () => void gridApi.exportCsv() : undefined,
-    "Print":              hasGrid     ? () => gridApi.print() : undefined,
   };
 
   const enabled: Record<string, boolean> = {
@@ -300,8 +210,6 @@ export function WorkbookRibbon() {
     "Add Row":           hasGrid,
     "Insert Above":      hasGrid,
     "Insert Below":      hasGrid,
-    "Export":            hasGrid,
-    "Print":             hasGrid,
   };
 
   return (
@@ -340,18 +248,14 @@ export function WorkbookRibbon() {
             <FormatToolbar />
           ) : (
             <div style={{ display: "flex", gap: 5, alignItems: "center", overflow: "hidden" }}>
-              {group.tools.map((tool) =>
-                tool === "Settings" ? (
-                  <SettingsDropdown key={tool} />
-                ) : (
-                  <RibbonButton
-                    key={tool}
-                    label={tool}
-                    disabled={!enabled[tool]}
-                    onClick={handlers[tool]}
-                  />
-                )
-              )}
+              {group.tools.map((tool) => (
+                <RibbonButton
+                  key={tool}
+                  label={tool}
+                  disabled={!enabled[tool]}
+                  onClick={handlers[tool]}
+                />
+              ))}
             </div>
           )}
           <div
@@ -360,7 +264,7 @@ export function WorkbookRibbon() {
               paddingBottom: 3,
               fontSize: 10,
               lineHeight: "12px",
-              color: theme.text.secondary,
+              color: theme.text.muted,
               whiteSpace: "nowrap",
               overflow: "hidden",
               textOverflow: "ellipsis",

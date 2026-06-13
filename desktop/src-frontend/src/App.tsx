@@ -6,6 +6,7 @@ import { StartScreen } from "./components/StartScreen";
 import { Viewer } from "./components/Viewer";
 import { WorkbookView } from "./components/WorkbookView";
 import { ProjectMeta, useAppStore } from "./store/appStore";
+import { TitleBar } from "./components/TitleBar";
 import { theme } from "./theme";
 
 export default function App() {
@@ -39,10 +40,19 @@ export default function App() {
   }
 
   if (!activeProject) {
-    return <StartScreen />;
+    return (
+      <div style={{ display: "flex", flexDirection: "column", height: "100%", width: "100%", overflow: "hidden" }}>
+        <TitleBar />
+        <div style={{ flex: 1, minHeight: 0, overflow: "hidden" }}>
+          <StartScreen />
+        </div>
+      </div>
+    );
   }
 
   return (
+    <div style={{ display: "flex", flexDirection: "column", height: "100%", width: "100%", overflow: "hidden" }}>
+      <TitleBar />
     <div
       onPointerMove={handlePointerMove}
       onPointerUp={stopDrag}
@@ -51,7 +61,8 @@ export default function App() {
         display: "grid",
         gridTemplateRows: `${theme.tabHeight}px ${theme.ribbonHeight}px 1fr`,
         gridTemplateColumns: `${leftWidth}px 1fr`,
-        height: "100%",
+        flex: 1,
+        minHeight: 0,
         width: "100%",
         overflow: "hidden",
         background: theme.bg.shell,
@@ -145,6 +156,7 @@ export default function App() {
           </div>
         )}
       </div>
+    </div>
     </div>
   );
 }

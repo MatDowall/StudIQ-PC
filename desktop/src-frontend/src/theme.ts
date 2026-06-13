@@ -11,6 +11,7 @@ export const theme = {
   text: {
     primary: "#CCCCCC",
     secondary: "#888888",
+    muted: "#AAAAAA",
     disabled: "#555555",
     accent: "#4A9EFF",
   },

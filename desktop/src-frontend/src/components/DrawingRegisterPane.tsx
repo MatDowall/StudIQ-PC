@@ -8,7 +8,7 @@ import { ContextMenu } from "./ContextMenu";
 import { FolderPathDialog } from "./FolderPathDialog";
 import { TreeNode } from "./TreeNode";
 
-const tabs = ["Drawings", "Layers", "Model", "Views"];
+const tabs = ["Drawings"];
 
 export function DrawingRegisterPane() {
   const drawingRoots = useAppStore((state) => state.drawingRoots);

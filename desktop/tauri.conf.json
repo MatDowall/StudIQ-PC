@@ -19,7 +19,8 @@
         "maximized": true,
         "resizable": true,
         "dragDropEnabled": false,
-        "visible": false
+        "visible": false,
+        "decorations": false
       },
       {
         "label": "splashscreen",
