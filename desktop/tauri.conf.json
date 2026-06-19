@@ -7,7 +7,7 @@
     "frontendDist": "src-frontend/dist",
     "devUrl": "http://localhost:5173",
     "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "dotnet build -c Release --project ../excel-com-addin && npm run build"
+    "beforeBuildCommand": "dotnet build ../../excel-com-addin -c Release && npm run build"
   },
   "app": {
     "windows": [
@@ -48,6 +48,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "resources": {
       "../libs/pdfium/*": "libs/pdfium/",
       "../target/release/pdf_renderer.exe": "pdf_renderer.exe",
