@@ -7,6 +7,7 @@ import { Viewer } from "./components/Viewer";
 import { WorkbookView } from "./components/WorkbookView";
 import { ProjectMeta, useAppStore } from "./store/appStore";
 import { TitleBar } from "./components/TitleBar";
+import { startBridgeListener } from "./lib/bridge";
 import { theme } from "./theme";
 
 export default function App() {
@@ -21,6 +22,10 @@ export default function App() {
   if (activeTab === "workbook") workbookEverVisited.current = true;
 
   useEffect(() => {
+    // Mount the Excel-bridge listener once: it answers compute requests proxied
+    // from the Rust bridge server (desktop/src/bridge.rs) for the Excel add-in.
+    startBridgeListener();
+
     invoke<ProjectMeta | null>("get_active_project")
       .then((project) => {
         if (project) useAppStore.getState().setActiveProject(project);
@@ -28,6 +33,18 @@ export default function App() {
       .catch((error) => {
         console.error("Failed to load active project", error);
       });
+
+    invoke<string | null>("get_startup_file")
+      .then((filePath) => {
+        if (!filePath) return;
+        const lower = filePath.toLowerCase();
+        if (lower.endsWith(".tcop")) {
+          void useAppStore.getState().openProject(filePath);
+        } else if (lower.endsWith(".tcopkg")) {
+          useAppStore.getState().setPendingImportPath(filePath);
+        }
+      })
+      .catch(() => {});
   }, []);
 
   function handlePointerMove(event: React.PointerEvent<HTMLDivElement>) {

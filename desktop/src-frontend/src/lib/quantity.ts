@@ -263,6 +263,11 @@ function arrayTrimmedLengthPts(p1: PagePoint, p2: PagePoint, meta: ArrayMeta): n
  */
 export function deriveQuantity(points: PagePoint[], mmPerPoint: number | null, props: GroupProps, framingJson?: string | null): Quantity | null {
   if (points.length < 1) return null;
+  // Array + Count: total number of members in the array (including extras), times the multiplier.
+  if (props.measurement_type === "array" && props.default_display === "count") {
+    const meta = parseArrayMeta(framingJson ?? null);
+    return { value: (1 + meta.extraMembers) * props.default_multiplier, uom: "no" };
+  }
   // Count needs no scale or geometry beyond a single point — each marker counts as the multiplier.
   if (props.default_display === "count") return { value: props.default_multiplier, uom: "no" };
   if (points.length < 2 || mmPerPoint == null || !(mmPerPoint > 0)) return null;

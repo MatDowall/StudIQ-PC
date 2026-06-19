@@ -6,6 +6,12 @@
       "runtimeExecutable": "npm",
       "runtimeArgs": ["run", "dev", "--prefix", "desktop/src-frontend"],
       "port": 5173
+    },
+    {
+      "name": "excel-addin (vite)",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["--prefix", "excel-addin", "vite", "--port", "3997"],
+      "port": 3997
     }
   ]
 }

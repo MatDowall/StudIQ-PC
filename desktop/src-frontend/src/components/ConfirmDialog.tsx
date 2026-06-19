@@ -1,6 +1,6 @@
 import { useEffect } from "react";
-import { createPortal } from "react-dom";
 import { theme } from "../theme";
+import { DialogShell } from "./DialogShell";
 
 interface ConfirmDialogProps {
   title: string;
@@ -20,83 +20,45 @@ export function ConfirmDialog({ title, body, confirmLabel, onCancel, onConfirm }
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [onCancel]);
 
-  return createPortal(
-    <div
-      style={{
-        position: "fixed",
-        inset: 0,
-        zIndex: 1300,
-        display: "grid",
-        placeItems: "center",
-        background: "rgba(0, 0, 0, 0.48)",
-      }}
-    >
+  return (
+    <DialogShell title={title} width={430} zIndex={1300} onClose={onCancel}>
+      <div style={{ padding: 12, color: theme.text.primary, fontSize: 12, lineHeight: 1.5, whiteSpace: "pre-line" }}>{body}</div>
       <div
-        role="dialog"
-        aria-modal="true"
         style={{
-          width: 430,
-          maxWidth: "calc(100vw - 40px)",
-          background: theme.bg.pane,
-          border: `1px solid ${theme.border.divider}`,
-          boxShadow: "0 18px 48px rgba(0, 0, 0, 0.45)",
-          color: theme.text.primary,
-          fontFamily: "Segoe UI, sans-serif",
+          display: "flex",
+          justifyContent: "flex-end",
+          gap: 8,
+          padding: "10px 12px",
+          borderTop: `1px solid ${theme.border.subtle}`,
         }}
       >
-        <div
+        <button
+          onClick={onCancel}
           style={{
-            height: 38,
-            display: "flex",
-            alignItems: "center",
+            height: 28,
             padding: "0 12px",
-            background: theme.bg.ribbon,
-            borderBottom: `1px solid ${theme.border.subtle}`,
-            fontSize: 13,
-            fontWeight: 600,
+            background: theme.bg.input,
+            color: theme.text.primary,
+            border: `1px solid ${theme.border.divider}`,
+            cursor: "pointer",
           }}
         >
-          {title}
-        </div>
-        <div style={{ padding: 12, color: theme.text.primary, fontSize: 12, lineHeight: 1.5, whiteSpace: "pre-line" }}>{body}</div>
-        <div
+          Cancel
+        </button>
+        <button
+          onClick={onConfirm}
           style={{
-            display: "flex",
-            justifyContent: "flex-end",
-            gap: 8,
-            padding: "10px 12px",
-            borderTop: `1px solid ${theme.border.subtle}`,
+            height: 28,
+            padding: "0 12px",
+            background: theme.danger,
+            color: "#FFFFFF",
+            border: `1px solid ${theme.danger}`,
+            cursor: "pointer",
           }}
         >
-          <button
-            onClick={onCancel}
-            style={{
-              height: 28,
-              padding: "0 12px",
-              background: theme.bg.input,
-              color: theme.text.primary,
-              border: `1px solid ${theme.border.divider}`,
-              cursor: "pointer",
-            }}
-          >
-            Cancel
-          </button>
-          <button
-            onClick={onConfirm}
-            style={{
-              height: 28,
-              padding: "0 12px",
-              background: theme.danger,
-              color: "#FFFFFF",
-              border: `1px solid ${theme.danger}`,
-              cursor: "pointer",
-            }}
-          >
-            {confirmLabel}
-          </button>
-        </div>
+          {confirmLabel}
+        </button>
       </div>
-    </div>,
-    document.body,
+    </DialogShell>
   );
 }

@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
-import { createPortal } from "react-dom";
 import { theme } from "../theme";
 import { useAppStore, type MultiPage3DPageEntry } from "../store/appStore";
+import { DialogShell } from "./DialogShell";
 
 const inputStyle: React.CSSProperties = {
   boxSizing: "border-box",
@@ -34,8 +34,6 @@ export function MultiPage3DDialog({ onCancel }: { onCancel: () => void }) {
       const fresh = await loadMultiPage3DSetup();
       if (!alive) return;
       if (existingConfig && existingConfig.drawingId === activeDrawingId) {
-        // Re-opening: preserve the user's previous order/offsets/selection where the page
-        // still exists, but pick up any newly-drawn pages/groups from the fresh scan.
         const byPage = new Map(existingConfig.pages.map((p) => [p.pageIndex, p]));
         const merged: MultiPage3DPageEntry[] = [];
         for (const prev of existingConfig.pages) {
@@ -97,142 +95,116 @@ export function MultiPage3DDialog({ onCancel }: { onCancel: () => void }) {
     onCancel();
   }
 
-  return createPortal(
-    <div style={{ position: "fixed", inset: 0, zIndex: 1250, display: "grid", placeItems: "center", background: "rgba(0,0,0,0.45)" }}>
-      <div
-        role="dialog"
-        aria-modal="true"
-        style={{
-          width: 520,
-          maxHeight: "80vh",
-          display: "flex",
-          flexDirection: "column",
-          background: theme.bg.pane,
-          border: `1px solid ${theme.border.divider}`,
-          boxShadow: "0 18px 48px rgba(0,0,0,0.45)",
-          color: theme.text.primary,
-          fontFamily: "Segoe UI, sans-serif",
-        }}
-      >
-        <div
+  return (
+    <DialogShell
+      title="View Multiple Pages in 3D"
+      width={520}
+      zIndex={1250}
+      panelStyle={{ maxHeight: "80vh", display: "flex", flexDirection: "column" }}
+      onClose={onCancel}
+    >
+      <div style={{ overflowY: "auto", padding: 14, flex: 1, minHeight: 0 }}>
+        {pages === null ? (
+          <div style={{ color: theme.text.secondary, fontSize: 12 }}>Scanning drawing for timber framing…</div>
+        ) : pages.length === 0 ? (
+          <div style={{ color: theme.text.secondary, fontSize: 12 }}>
+            No timber framing dimension groups were found on any page of this drawing.
+          </div>
+        ) : (
+          <>
+            <div style={{ color: theme.text.secondary, fontSize: 11, marginBottom: 10 }}>
+              Drag rows to set the stacking order (top = highest). Set a Z-offset per page to position each
+              storey's framing — pages at offset 0 also show the drawing as a floor plan; pages above 0 hide it.
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {pages.map((page, index) => (
+                <div
+                  key={page.pageIndex}
+                  draggable
+                  onDragStart={() => setDragIndex(index)}
+                  onDragOver={(e) => e.preventDefault()}
+                  onDrop={() => handleDrop(index)}
+                  style={{
+                    border: `1px solid ${theme.border.divider}`,
+                    background: theme.bg.input,
+                    opacity: page.included ? 1 : 0.55,
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 8px" }}>
+                    <span
+                      className="material-symbols-outlined"
+                      style={{ fontSize: 16, lineHeight: 1, cursor: "grab", color: theme.text.secondary }}
+                      title="Drag to reorder"
+                    >
+                      drag_indicator
+                    </span>
+                    <input
+                      type="checkbox"
+                      checked={page.included}
+                      onChange={(e) => updatePage(index, { included: e.target.checked })}
+                      title="Include this page in the 3D view"
+                    />
+                    <span style={{ fontSize: 12, fontWeight: 600, minWidth: 64 }}>{page.label}</span>
+                    <span style={{ flex: 1, fontSize: 11, color: theme.text.secondary }}>
+                      {page.groups.length} framing group{page.groups.length === 1 ? "" : "s"}
+                    </span>
+                    <span style={{ fontSize: 11, color: theme.text.secondary }}>Z offset</span>
+                    <input
+                      type="number"
+                      step="any"
+                      value={page.offsetM}
+                      onChange={(e) => updatePage(index, { offsetM: Number(e.target.value) || 0 })}
+                      style={{ ...inputStyle, width: 70 }}
+                    />
+                    <span style={{ fontSize: 11, color: theme.text.secondary }}>m</span>
+                  </div>
+                  {page.groups.length > 0 ? (
+                    <div
+                      style={{
+                        display: "flex",
+                        flexWrap: "wrap",
+                        gap: "4px 14px",
+                        padding: "0 8px 8px 34px",
+                      }}
+                    >
+                      {page.groups.map((g) => (
+                        <label key={g.groupId} style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11 }}>
+                          <input
+                            type="checkbox"
+                            checked={g.included}
+                            onChange={() => toggleGroup(index, g.groupId)}
+                          />
+                          {g.name}
+                        </label>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+      </div>
+      <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, padding: "10px 12px", borderTop: `1px solid ${theme.border.subtle}`, flexShrink: 0 }}>
+        <button onClick={onCancel} style={{ height: 28, padding: "0 12px", background: theme.bg.input, color: theme.text.primary, border: `1px solid ${theme.border.divider}`, cursor: "pointer" }}>
+          Cancel
+        </button>
+        <button
+          onClick={handleConfirm}
+          disabled={!pages || pages.length === 0}
           style={{
-            height: 38,
-            display: "flex",
-            alignItems: "center",
+            height: 28,
             padding: "0 12px",
-            background: theme.bg.ribbon,
-            borderBottom: `1px solid ${theme.border.subtle}`,
-            fontSize: 13,
-            fontWeight: 600,
-            flexShrink: 0,
+            background: theme.bg.active,
+            color: "#FFFFFF",
+            border: `1px solid ${theme.accent}`,
+            cursor: pages && pages.length > 0 ? "pointer" : "not-allowed",
+            opacity: pages && pages.length > 0 ? 1 : 0.6,
           }}
         >
-          View Multiple Pages in 3D
-        </div>
-        <div style={{ overflowY: "auto", padding: 14, flex: 1, minHeight: 0 }}>
-          {pages === null ? (
-            <div style={{ color: theme.text.secondary, fontSize: 12 }}>Scanning drawing for timber framing…</div>
-          ) : pages.length === 0 ? (
-            <div style={{ color: theme.text.secondary, fontSize: 12 }}>
-              No timber framing dimension groups were found on any page of this drawing.
-            </div>
-          ) : (
-            <>
-              <div style={{ color: theme.text.secondary, fontSize: 11, marginBottom: 10 }}>
-                Drag rows to set the stacking order (top = highest). Set a Z-offset per page to position each
-                storey's framing — pages at offset 0 also show the drawing as a floor plan; pages above 0 hide it.
-              </div>
-              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                {pages.map((page, index) => (
-                  <div
-                    key={page.pageIndex}
-                    draggable
-                    onDragStart={() => setDragIndex(index)}
-                    onDragOver={(e) => e.preventDefault()}
-                    onDrop={() => handleDrop(index)}
-                    style={{
-                      border: `1px solid ${theme.border.divider}`,
-                      background: theme.bg.input,
-                      opacity: page.included ? 1 : 0.55,
-                    }}
-                  >
-                    <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 8px" }}>
-                      <span
-                        className="material-symbols-outlined"
-                        style={{ fontSize: 16, lineHeight: 1, cursor: "grab", color: theme.text.secondary }}
-                        title="Drag to reorder"
-                      >
-                        drag_indicator
-                      </span>
-                      <input
-                        type="checkbox"
-                        checked={page.included}
-                        onChange={(e) => updatePage(index, { included: e.target.checked })}
-                        title="Include this page in the 3D view"
-                      />
-                      <span style={{ fontSize: 12, fontWeight: 600, minWidth: 64 }}>{page.label}</span>
-                      <span style={{ flex: 1, fontSize: 11, color: theme.text.secondary }}>
-                        {page.groups.length} framing group{page.groups.length === 1 ? "" : "s"}
-                      </span>
-                      <span style={{ fontSize: 11, color: theme.text.secondary }}>Z offset</span>
-                      <input
-                        type="number"
-                        step="any"
-                        value={page.offsetM}
-                        onChange={(e) => updatePage(index, { offsetM: Number(e.target.value) || 0 })}
-                        style={{ ...inputStyle, width: 70 }}
-                      />
-                      <span style={{ fontSize: 11, color: theme.text.secondary }}>m</span>
-                    </div>
-                    {page.groups.length > 0 ? (
-                      <div
-                        style={{
-                          display: "flex",
-                          flexWrap: "wrap",
-                          gap: "4px 14px",
-                          padding: "0 8px 8px 34px",
-                        }}
-                      >
-                        {page.groups.map((g) => (
-                          <label key={g.groupId} style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11 }}>
-                            <input
-                              type="checkbox"
-                              checked={g.included}
-                              onChange={() => toggleGroup(index, g.groupId)}
-                            />
-                            {g.name}
-                          </label>
-                        ))}
-                      </div>
-                    ) : null}
-                  </div>
-                ))}
-              </div>
-            </>
-          )}
-        </div>
-        <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, padding: "10px 12px", borderTop: `1px solid ${theme.border.subtle}`, flexShrink: 0 }}>
-          <button onClick={onCancel} style={{ height: 28, padding: "0 12px", background: theme.bg.input, color: theme.text.primary, border: `1px solid ${theme.border.divider}`, cursor: "pointer" }}>
-            Cancel
-          </button>
-          <button
-            onClick={handleConfirm}
-            disabled={!pages || pages.length === 0}
-            style={{
-              height: 28,
-              padding: "0 12px",
-              background: theme.bg.active,
-              color: "#FFFFFF",
-              border: `1px solid ${theme.accent}`,
-              cursor: pages && pages.length > 0 ? "pointer" : "not-allowed",
-              opacity: pages && pages.length > 0 ? 1 : 0.6,
-            }}
-          >
-            View in 3D
-          </button>
-        </div>
+          View in 3D
+        </button>
       </div>
-    </div>,
-    document.body,
+    </DialogShell>
   );
 }

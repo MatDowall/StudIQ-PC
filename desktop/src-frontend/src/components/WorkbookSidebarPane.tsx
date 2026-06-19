@@ -3,6 +3,8 @@ import { useAppStore } from "../store/appStore";
 import { theme } from "../theme";
 import type { WorkbookDto, WorkbookRevisionDto } from "../store/appStore";
 
+const TOTAL_FORMAT = new Intl.NumberFormat("en-NZ", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
 const KIND_ICONS = {
   workbook: "folder_open",
   revision: "history",
@@ -35,6 +37,7 @@ function RevisionRow({
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(revision.name);
   const inputRef = useRef<HTMLInputElement>(null);
+  const projectTotal = revision.project_total;
 
   function commitRename() {
     const trimmed = draft.trim();
@@ -94,6 +97,21 @@ function RevisionRow({
       ) : (
         <span style={{ fontSize: 12, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
           {revision.name}
+        </span>
+      )}
+
+      {projectTotal != null && !editing && (
+        <span
+          title="Project total"
+          style={{
+            fontSize: 11,
+            color: theme.text.secondary,
+            flexShrink: 0,
+            fontVariantNumeric: "tabular-nums",
+            marginRight: 2,
+          }}
+        >
+          {TOTAL_FORMAT.format(projectTotal)}
         </span>
       )}
 

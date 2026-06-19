@@ -38,6 +38,18 @@ milestone4_window.png
 # Claude Code local (machine-specific) settings — keep shared settings.json tracked
 .claude/settings.local.json
 
+# Vite dependency pre-bundle cache
+.vite/
+
+# Excel Office JS add-in build output
+excel-addin/dist/
+excel-addin/node_modules/
+excel-addin/deps_temp_*/
+
+# Excel COM add-in .NET build output
+excel-com-addin/bin/
+excel-com-addin/obj/
+
 # OS / editor cruft
 .DS_Store
 Thumbs.db

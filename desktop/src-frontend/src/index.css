@@ -17,3 +17,60 @@ body {
 *::after {
   box-sizing: border-box;
 }
+
+/* ── Theme tokens ─────────────────────────────────────────────────────────── */
+
+:root,
+[data-theme="dark"] {
+  --bg-shell:    #1E1E1E;
+  --bg-pane:     #252526;
+  --bg-ribbon:   #2B2B2B;
+  --bg-hover:    #2D2D2D;
+  --bg-active:   #094771;
+  --bg-input:    #3C3C3C;
+  --bg-tab-bar:  #2D2D2D;
+
+  --text-primary:   #CCCCCC;
+  --text-secondary: #888888;
+  --text-muted:     #AAAAAA;
+  --text-disabled:  #555555;
+  --text-accent:    #4A9EFF;
+
+  --border-subtle:  #333333;
+  --border-divider: #444444;
+
+  --color-accent: #4A9EFF;
+  --color-danger: #F44747;
+
+  /* Background of the PDF canvas area (the region surrounding PDF pages). */
+  --bg-canvas: #15171a;
+
+  /* Semi-transparent surface highlight used for hover overlays on dark backgrounds. */
+  --hover-overlay: rgba(255, 255, 255, 0.09);
+}
+
+[data-theme="light"] {
+  --bg-shell:    #F3F3F3;
+  --bg-pane:     #FFFFFF;
+  --bg-ribbon:   #E8E8E8;
+  --bg-hover:    #DEDEDE;
+  --bg-active:   #CCE4FF;
+  --bg-input:    #F0F0F0;
+  --bg-tab-bar:  #E8E8E8;
+
+  --text-primary:   #1A1A1A;
+  --text-secondary: #555555;
+  --text-muted:     #666666;
+  --text-disabled:  #AAAAAA;
+  --text-accent:    #0066CC;
+
+  --border-subtle:  #DDDDDD;
+  --border-divider: #CCCCCC;
+
+  --color-accent: #0066CC;
+  --color-danger: #D32F2F;
+
+  --bg-canvas: #D0D5DE;
+
+  --hover-overlay: rgba(0, 0, 0, 0.07);
+}

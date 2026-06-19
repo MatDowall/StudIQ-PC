@@ -4,6 +4,8 @@ import { save } from "@tauri-apps/plugin-dialog";
 import { theme } from "../theme";
 import { useAppStore } from "../store/appStore";
 import { ProjectInfoDialog } from "./ProjectInfoDialog";
+import { ErrorDialog } from "./ErrorDialog";
+import { RateConstantsDialog } from "./RateConstantsDialog";
 
 function Icon({ name, size = 16 }: { name: string; size?: number }) {
   return (
@@ -101,17 +103,22 @@ export function FileMenu() {
   const [open, setOpen] = useState(false);
   const [menuPos, setMenuPos] = useState<{ top: number; left: number } | null>(null);
   const [showProjectInfo, setShowProjectInfo] = useState(false);
+  const [showRateLibrary, setShowRateLibrary] = useState(false);
   const [status, setStatus] = useState("");
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const wrapperRef = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
 
   const activeProject = useAppStore((state) => state.activeProject);
   const closeProject = useAppStore((state) => state.closeProject);
   const exportProject = useAppStore((state) => state.exportProject);
+  const exportPackage = useAppStore((state) => state.exportPackage);
   const gridApi = useAppStore((state) => state.workbookGridApi);
   const openTemplateManager = useAppStore((state) => state.openTemplateManager);
   const openNamedCellsManager = useAppStore((state) => state.openNamedCellsManager);
   const setWorkbookConfirmAction = useAppStore((state) => state.setWorkbookConfirmAction);
+  const lightMode = useAppStore((state) => state.lightMode);
+  const setLightMode = useAppStore((state) => state.setLightMode);
 
   useEffect(() => {
     if (!open) return;
@@ -145,7 +152,25 @@ export function FileMenu() {
       setStatus("Exported.");
       setTimeout(() => setStatus(""), 2500);
     } catch (err) {
-      setStatus(`Export failed: ${err}`);
+      setErrorMessage(`Export failed: ${err}`);
+    }
+  }
+
+  async function handleExportPackage() {
+    if (!activeProject) return;
+    const dest = await save({
+      defaultPath: activeProject.name + ".tcopkg",
+      filters: [{ name: "Take-it-Off Package", extensions: ["tcopkg"] }],
+    });
+    if (!dest || typeof dest !== "string") return;
+    try {
+      setStatus("Packaging…");
+      await exportPackage(dest);
+      setStatus("Package exported.");
+      setTimeout(() => setStatus(""), 3000);
+    } catch (err) {
+      setStatus("");
+      setErrorMessage(`Export package failed: ${err}`);
     }
   }
 
@@ -154,6 +179,7 @@ export function FileMenu() {
   const items: MenuItem[] = [
     { label: "Project Info", icon: "edit", enabled: !!activeProject, onClick: () => setShowProjectInfo(true) },
     { label: "Export Project...", icon: "save_as", enabled: !!activeProject, onClick: () => { void handleExportProject(); } },
+    { label: "Export Package...", icon: "inventory_2", enabled: !!activeProject, onClick: () => { void handleExportPackage(); } },
     { divider: true, label: "", enabled: false },
     { label: "Export CSV", icon: "save_as", enabled: hasGrid, onClick: () => { void gridApi?.exportCsv(); } },
     { label: "Print", icon: "print", enabled: hasGrid, onClick: () => gridApi?.print() },
@@ -164,10 +190,13 @@ export function FileMenu() {
       submenu: [
         { label: "Template Manager", icon: "dashboard_customize", enabled: true, onClick: () => openTemplateManager() },
         { label: "Named Cells", icon: "sell", enabled: true, onClick: () => openNamedCellsManager() },
+        { label: "Rate Library", icon: "price_change", enabled: !!activeProject, onClick: () => setShowRateLibrary(true) },
         { label: "Clean orphaned sheets", icon: "cleaning_services", enabled: true, onClick: () => setWorkbookConfirmAction("clean") },
         { label: "Clear workbook", icon: "delete_sweep", enabled: true, onClick: () => setWorkbookConfirmAction("clear") },
       ],
     },
+    { divider: true, label: "", enabled: false },
+    { label: lightMode ? "Dark Mode" : "Light Mode", icon: lightMode ? "dark_mode" : "light_mode", enabled: true, onClick: () => setLightMode(!lightMode) },
     { divider: true, label: "", enabled: false },
     { label: "Close Project", enabled: !!activeProject, onClick: () => { void closeProject(); } },
   ];
@@ -232,6 +261,10 @@ export function FileMenu() {
           onConfirm={() => setShowProjectInfo(false)}
         />
       ) : null}
+      {errorMessage ? (
+        <ErrorDialog title="Error" body={errorMessage} onDismiss={() => setErrorMessage(null)} />
+      ) : null}
+      {showRateLibrary && <RateConstantsDialog onClose={() => setShowRateLibrary(false)} />}
     </div>
   );
 }

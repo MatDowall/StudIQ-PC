@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 import { useState } from "react";
-import { createPortal } from "react-dom";
 import { theme } from "../theme";
+import { DialogShell } from "./DialogShell";
 import type { DimensionGroupPropsDto } from "../store/appStore";
 import {
   FRAMING_SIZES,
@@ -49,7 +49,10 @@ const DISPLAYS_BY_TYPE: Record<string, { value: string; label: string }[]> = {
     { value: "weight", label: "Weight" },
   ],
   timber_framing: [{ value: "length", label: "Timber (lineal m)" }],
-  array: [{ value: "length", label: "Length" }],
+  array: [
+    { value: "length", label: "Length" },
+    { value: "count", label: "Count" },
+  ],
 };
 
 function Field({ label, children }: { label: string; children: ReactNode }) {
@@ -149,8 +152,8 @@ export function DimensionGroupPropertiesDialog({
     onConfirm({
       node_id: initial.node_id,
       measurement_type: measurementType,
-      // Framing and array always display as length.
-      default_display: (isFraming || isArray) ? "length" : defaultDisplay,
+      // Framing always displays as length. Array displays as length or count.
+      default_display: isFraming ? "length" : defaultDisplay,
       default_multiplier: parseNumber(multiplier, 1),
       default_width: parseNumber(width, 0),
       default_height: parseNumber(height, 0),
@@ -168,24 +171,8 @@ export function DimensionGroupPropertiesDialog({
 
   const isWeight = defaultDisplay === "weight";
 
-  return createPortal(
-    <div style={{ position: "fixed", inset: 0, zIndex: 1250, display: "grid", placeItems: "center", background: "rgba(0,0,0,0.45)" }}>
-      <div
-        role="dialog"
-        aria-modal="true"
-        style={{
-          width: 460,
-          maxWidth: "calc(100vw - 40px)",
-          background: theme.bg.pane,
-          border: `1px solid ${theme.border.divider}`,
-          boxShadow: "0 18px 48px rgba(0,0,0,0.45)",
-          color: theme.text.primary,
-          fontFamily: "Segoe UI, sans-serif",
-        }}
-      >
-        <div style={{ height: 38, display: "flex", alignItems: "center", padding: "0 12px", background: theme.bg.ribbon, borderBottom: `1px solid ${theme.border.subtle}`, fontSize: 13, fontWeight: 600 }}>
-          Dimension Group Properties — {groupName}
-        </div>
+  return (
+    <DialogShell title={`Dimension Group Properties — ${groupName}`} width={460} zIndex={1250} onClose={onCancel}>
         <div style={{ display: "flex", flexDirection: "column", gap: 8, padding: 14 }}>
           <Field label="Measurement Type">
             <select value={measurementType} onChange={(e) => changeMeasurementType(e.target.value)} style={{ ...inputStyle, flex: 1 }}>
@@ -198,17 +185,15 @@ export function DimensionGroupPropertiesDialog({
           </Field>
           {!isFraming ? (
             <>
-              {!isArray ? (
-                <Field label="Default Display">
-                  <select value={defaultDisplay} onChange={(e) => setDefaultDisplay(e.target.value)} style={{ ...inputStyle, flex: 1 }}>
-                    {displayOptions.map((option) => (
-                      <option key={option.value} value={option.value}>
-                        {option.label}
-                      </option>
-                    ))}
-                  </select>
-                </Field>
-              ) : null}
+              <Field label="Default Display">
+                <select value={defaultDisplay} onChange={(e) => setDefaultDisplay(e.target.value)} style={{ ...inputStyle, flex: 1 }}>
+                  {displayOptions.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </Field>
               <Field label="Default Multiplier">
                 <input type="number" value={multiplier} onChange={(e) => setMultiplier(e.target.value)} style={{ ...inputStyle, flex: 1 }} />
               </Field>
@@ -356,8 +341,6 @@ export function DimensionGroupPropertiesDialog({
             Save
           </button>
         </div>
-      </div>
-    </div>,
-    document.body,
+    </DialogShell>
   );
 }
