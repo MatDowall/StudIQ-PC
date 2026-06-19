@@ -13,6 +13,9 @@ use std::sync::Arc;
 use tauri::{Manager, State};
 use tokio::sync::mpsc;
 
+mod bridge;
+use bridge::{BridgeState, SharedBridge};
+
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
@@ -23,6 +26,7 @@ pub struct AppState {
     pub pdfium_lib_path: String,
     pub tile_cache_dir: String,
     pub renderer_path: String,
+    pub startup_file: Option<String>,
     pub open_document: Arc<Mutex<Option<DocumentMeta>>>,
     pub tile_manager: Arc<TileManager>,
     pub render_context: Arc<Mutex<Option<(u32, u8)>>>,
@@ -32,6 +36,14 @@ pub struct AppState {
     pub renderer: Arc<Mutex<Option<RendererService>>>,
     pub tile_render_tx: mpsc::UnboundedSender<TileRenderJob>,
     pub next_tile_batch: AtomicU64,
+    pub bridge: SharedBridge,
+}
+
+/// Delivers a frontend reply back to the awaiting Excel-bridge HTTP request.
+/// See desktop/src/bridge.rs and desktop/src-frontend/src/lib/bridge.ts.
+#[tauri::command]
+fn bridge_respond(id: u64, result: serde_json::Value, state: State<'_, AppState>) {
+    state.bridge.resolve(id, result);
 }
 
 #[derive(Clone)]
@@ -204,6 +216,10 @@ pub struct TreeNodeDto {
     /// Measurement type from dimension_group_props for dimension_group nodes; `None` for all
     /// other node types. Surfaced here so icons can be shown without loading full props.
     pub measurement_type: Option<String>,
+    /// Default display mode from dimension_group_props (e.g. "length", "area", "count").
+    /// `None` for non-dimension-group nodes. Surfaced so the Excel task pane can pre-select
+    /// the correct display type without loading full group props.
+    pub default_display: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
@@ -230,6 +246,24 @@ pub struct PageScaleDto {
     pub page_index: i64,
     pub mm_per_point: f64,
     pub unit: String,
+}
+
+/// A rate from the project rate library. `code` is the short reference code (e.g. "CONC"),
+/// `description` is the human label, `rate` is the unit rate, `unit` is the unit of measure.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct RateDto {
+    pub id: i64,
+    pub code: String,
+    pub description: String,
+    pub rate: f64,
+    pub unit: String,
+}
+
+/// A named project constant (a scalar value the estimator names for reuse, e.g. "GFA" = 450.0).
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct ConstantDto {
+    pub name: String,
+    pub value: f64,
 }
 
 /// CostX-style dimension-group properties. Width/height/offset are in metres (the unit
@@ -270,6 +304,7 @@ pub struct WorkbookRevisionDto {
     pub name: String,
     pub created_at: String,
     pub sort_order: i64,
+    pub project_total: Option<f64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -446,6 +481,11 @@ async fn open_project(
 }
 
 #[tauri::command]
+async fn get_startup_file(state: State<'_, AppState>) -> Result<Option<String>, String> {
+    Ok(state.startup_file.clone())
+}
+
+#[tauri::command]
 async fn close_project(state: State<'_, AppState>) -> Result<(), String> {
     {
         let mut renderer_guard = state.renderer.lock();
@@ -479,8 +519,281 @@ async fn export_project(dest_path: String, state: State<'_, AppState>) -> Result
         let guard = state.active_project.lock();
         guard.as_ref().ok_or("No project open")?.meta.file_path.clone()
     };
-    std::fs::copy(&src_path, &dest_path).map_err(|e| format!("Failed to export project: {e}"))?;
+
+    let src_canonical = std::fs::canonicalize(&src_path)
+        .map_err(|e| format!("Failed to resolve project file path: {e}"))?;
+    if let Ok(dest_canonical) = std::fs::canonicalize(&dest_path) {
+        if dest_canonical == src_canonical {
+            return Err(
+                "Cannot export over the currently open project file. Choose a different file name or location."
+                    .to_string(),
+            );
+        }
+    }
+
+    // Copy to a temp file alongside the destination first, then rename into place, so a
+    // failed or partial copy never leaves a corrupted file at dest_path.
+    let dest_path_obj = Path::new(&dest_path);
+    let dest_dir = dest_path_obj.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    let temp_file_name = format!(
+        ".{}.export-tmp",
+        dest_path_obj.file_name().and_then(|n| n.to_str()).unwrap_or("project.tcop")
+    );
+    let temp_path = dest_dir.join(temp_file_name);
+
+    std::fs::copy(&src_path, &temp_path).map_err(|e| format!("Failed to export project: {e}"))?;
+    std::fs::rename(&temp_path, &dest_path).map_err(|e| {
+        let _ = std::fs::remove_file(&temp_path);
+        format!("Failed to export project: {e}")
+    })?;
     Ok(())
+}
+
+/// Export the currently open project plus all its referenced PDFs into a single
+/// portable ZIP archive (`.tcopkg`). Inside the archive:
+///   - `project.db`  — a copy of the project database with `file_path` values
+///     replaced by relative `pdfs/<id>_<basename>.pdf` entries.
+///   - `pdfs/<id>_<basename>.pdf` — every PDF referenced by a drawing node.
+#[tauri::command]
+async fn export_package(dest_path: String, state: State<'_, AppState>) -> Result<(), String> {
+    use std::io::Write as _;
+    use zip::write::SimpleFileOptions;
+
+    let src_tcop_path = {
+        let guard = state.active_project.lock();
+        guard.as_ref().ok_or("No project open")?.meta.file_path.clone()
+    };
+
+    let db = active_project_db(&state)?;
+
+    // Collect all drawing nodes that have a file_path.
+    let rows = sqlx::query(
+        "SELECT id, file_path FROM tree_nodes WHERE node_type = 'drawing' AND file_path IS NOT NULL",
+    )
+    .fetch_all(&db)
+    .await
+    .map_err(|e| format!("Failed to query drawings: {e}"))?;
+
+    // Build (drawing_id, zip_relative_path, abs_path) entries.
+    let mut entries: Vec<(i64, String, String)> = Vec::new();
+    for row in &rows {
+        let id: i64 = row.try_get("id").map_err(|e| format!("Row error: {e}"))?;
+        let abs_path: String = row.try_get("file_path").map_err(|e| format!("Row error: {e}"))?;
+        let basename = Path::new(&abs_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("drawing.pdf");
+        let relative = format!("pdfs/{}_{}", id, basename);
+        entries.push((id, relative, abs_path));
+    }
+
+    // Verify every PDF exists before starting to write.
+    for (_, _, abs_path) in &entries {
+        if !Path::new(abs_path).exists() {
+            return Err(format!("PDF not found on disk: {abs_path}. Cannot create package."));
+        }
+    }
+
+    // Copy the live .tcop to a temp file alongside the destination, then open and
+    // rewrite file_path values in the copy so the archive contains relative paths.
+    let dest_path_obj = Path::new(&dest_path);
+    let dest_dir = dest_path_obj
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let temp_db_path = dest_dir.join(format!(
+        ".pkg-export-tmp-{}.db",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    ));
+
+    std::fs::copy(&src_tcop_path, &temp_db_path)
+        .map_err(|e| format!("Failed to copy project for packaging: {e}"))?;
+
+    let result: Result<(), String> = async {
+        let temp_db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&temp_db_path)
+                    .create_if_missing(false),
+            )
+            .await
+            .map_err(|e| format!("Failed to open temp project copy: {e}"))?;
+
+        for (id, relative, _) in &entries {
+            sqlx::query("UPDATE tree_nodes SET file_path = ? WHERE id = ?")
+                .bind(relative)
+                .bind(id)
+                .execute(&temp_db)
+                .await
+                .map_err(|e| format!("Failed to update path in package: {e}"))?;
+        }
+        temp_db.close().await;
+        Ok(())
+    }
+    .await;
+
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&temp_db_path);
+        return Err(e);
+    }
+
+    let db_bytes = std::fs::read(&temp_db_path)
+        .map_err(|e| format!("Failed to read packaged project: {e}"))?;
+    let _ = std::fs::remove_file(&temp_db_path);
+
+    // Write the ZIP archive.
+    let zip_file = std::fs::File::create(&dest_path)
+        .map_err(|e| format!("Failed to create package file: {e}"))?;
+    let mut zip = zip::ZipWriter::new(zip_file);
+    let opts = SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+
+    zip.start_file("project.db", opts)
+        .map_err(|e| format!("Failed to add project.db to package: {e}"))?;
+    zip.write_all(&db_bytes)
+        .map_err(|e| format!("Failed to write project.db: {e}"))?;
+
+    for (_, relative, abs_path) in &entries {
+        let pdf_bytes = std::fs::read(abs_path)
+            .map_err(|e| format!("Failed to read PDF {abs_path}: {e}"))?;
+        zip.start_file(relative, opts)
+            .map_err(|e| format!("Failed to add {relative} to package: {e}"))?;
+        zip.write_all(&pdf_bytes)
+            .map_err(|e| format!("Failed to write {relative}: {e}"))?;
+    }
+
+    zip.finish()
+        .map_err(|e| format!("Failed to finalise package: {e}"))?;
+
+    Ok(())
+}
+
+/// Extract a `.tcopkg` archive into a new `.tcop` project file.
+/// `pkg_path`      — path to the `.tcopkg` file to import.
+/// `dest_tcop_path`— where to write the extracted `.tcop` project file.
+///                   PDFs are placed in a `pdfs/` sub-folder next to it.
+/// Returns the opened `ProjectMeta` (the project is set as the active project).
+#[tauri::command]
+async fn import_package(
+    pkg_path: String,
+    dest_tcop_path: String,
+    state: State<'_, AppState>,
+) -> Result<ProjectMeta, String> {
+    use std::io::Read as _;
+
+    let dest_tcop = Path::new(&dest_tcop_path);
+    let dest_dir = dest_tcop
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let pdfs_dir = dest_dir.join("pdfs");
+
+    std::fs::create_dir_all(&pdfs_dir)
+        .map_err(|e| format!("Failed to create pdfs directory: {e}"))?;
+
+    // Open and read the ZIP on a blocking thread.
+    let pkg_path_clone = pkg_path.clone();
+    let (db_bytes, pdf_entries) =
+        tauri::async_runtime::spawn_blocking(move || -> Result<(Vec<u8>, Vec<(String, Vec<u8>)>), String> {
+            let pkg_file = std::fs::File::open(&pkg_path_clone)
+                .map_err(|e| format!("Failed to open package: {e}"))?;
+            let mut archive = zip::ZipArchive::new(pkg_file)
+                .map_err(|e| format!("Failed to read package (is it a valid .tcopkg?): {e}"))?;
+
+            // Extract project.db
+            let db_bytes = {
+                let mut entry = archive
+                    .by_name("project.db")
+                    .map_err(|_| "Package is missing project.db — file may be corrupt.".to_string())?;
+                let mut buf = Vec::new();
+                entry
+                    .read_to_end(&mut buf)
+                    .map_err(|e| format!("Failed to read project.db from package: {e}"))?;
+                buf
+            };
+
+            // Collect PDF entries.
+            let names: Vec<String> = archive.file_names().map(|s| s.to_string()).collect();
+            let mut pdf_entries: Vec<(String, Vec<u8>)> = Vec::new();
+            for name in names {
+                if !name.starts_with("pdfs/") {
+                    continue;
+                }
+                let mut entry = archive
+                    .by_name(&name)
+                    .map_err(|e| format!("Failed to read {name} from package: {e}"))?;
+                let mut buf = Vec::new();
+                entry
+                    .read_to_end(&mut buf)
+                    .map_err(|e| format!("Failed to extract {name}: {e}"))?;
+                pdf_entries.push((name, buf));
+            }
+
+            Ok((db_bytes, pdf_entries))
+        })
+        .await
+        .map_err(|e| format!("Package read task failed: {e}"))?
+        ?;
+
+    // Write project.db.
+    std::fs::write(&dest_tcop_path, &db_bytes)
+        .map_err(|e| format!("Failed to write project file: {e}"))?;
+
+    // Write PDFs and build relative→absolute path map.
+    let mut path_map: Vec<(String, String)> = Vec::new();
+    for (relative, pdf_bytes) in &pdf_entries {
+        let basename = Path::new(relative)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("drawing.pdf");
+        let abs_dest = pdfs_dir.join(basename);
+        std::fs::write(&abs_dest, pdf_bytes)
+            .map_err(|e| format!("Failed to write PDF {}: {e}", abs_dest.display()))?;
+        path_map.push((relative.clone(), abs_dest.to_string_lossy().into_owned()));
+    }
+
+    // Open the extracted DB, rewrite relative file_path values to absolute.
+    let db = init_database(dest_tcop).await?;
+
+    let rows = sqlx::query(
+        "SELECT id, file_path FROM tree_nodes WHERE node_type = 'drawing' AND file_path IS NOT NULL",
+    )
+    .fetch_all(&db)
+    .await
+    .map_err(|e| format!("Failed to query drawings: {e}"))?;
+
+    for row in &rows {
+        let id: i64 = row.try_get("id").map_err(|e| format!("Row error: {e}"))?;
+        let rel_path: String = row.try_get("file_path").map_err(|e| format!("Row error: {e}"))?;
+        if let Some((_, abs_path)) = path_map.iter().find(|(rel, _)| rel == &rel_path) {
+            sqlx::query("UPDATE tree_nodes SET file_path = ? WHERE id = ?")
+                .bind(abs_path)
+                .bind(id)
+                .execute(&db)
+                .await
+                .map_err(|e| format!("Failed to restore PDF path: {e}"))?;
+        }
+    }
+
+    sqlx::query("UPDATE project_meta SET last_opened_at = datetime('now') WHERE id = 1")
+        .execute(&db)
+        .await
+        .map_err(|e| format!("Failed to update last opened time: {e}"))?;
+
+    let meta = read_project_meta(&db, &dest_tcop_path).await?;
+    upsert_recent_project(&state.registry_db, &meta).await?;
+
+    {
+        let mut guard = state.active_project.lock();
+        *guard = Some(ActiveProject { db, meta: meta.clone() });
+    }
+
+    refresh_recent_projects(state.inner()).await?;
+    Ok(meta)
 }
 
 #[tauri::command]
@@ -1864,6 +2177,26 @@ async fn load_workbook_sheet_exclusions(
     Ok(row.unwrap_or_else(|| "{}".to_string()))
 }
 
+/// Cache the revision's "PROJECT_TOTAL" value (the live result of its
+/// designated L1/H:Total named cell) so the workbook sidebar can show a
+/// project total without re-evaluating formulas. `value` is `None` if the
+/// cell doesn't currently resolve to a number.
+#[tauri::command]
+async fn save_workbook_project_total(
+    state: State<'_, AppState>,
+    revision_id: i64,
+    value: Option<f64>,
+) -> Result<(), String> {
+    let db = active_project_db(state.inner())?;
+    sqlx::query("UPDATE workbook_revisions SET project_total = ? WHERE id = ?")
+        .bind(value)
+        .bind(revision_id)
+        .execute(&db)
+        .await
+        .map_err(|e| format!("Failed to save project total: {e}"))?;
+    Ok(())
+}
+
 /// Create or update a named cell — a workbook-wide name bound to a single cell
 /// (identified by sheet path + row/col) that can be referenced from formulas at
 /// any level. Names are unique per revision; saving an existing name moves it.
@@ -2035,7 +2368,7 @@ async fn list_workbooks(state: State<'_, AppState>) -> Result<Vec<WorkbookDto>, 
         let wb_name: String = wb_row.try_get("name").map_err(|e| e.to_string())?;
 
         let rev_rows = sqlx::query(
-            "SELECT id, workbook_id, name, created_at, sort_order \
+            "SELECT id, workbook_id, name, created_at, sort_order, project_total \
              FROM workbook_revisions WHERE workbook_id = ? ORDER BY sort_order, id",
         )
         .bind(wb_id)
@@ -2057,6 +2390,9 @@ async fn list_workbooks(state: State<'_, AppState>) -> Result<Vec<WorkbookDto>, 
                         .map_err(|e: sqlx::Error| e.to_string())?,
                     sort_order: row
                         .try_get("sort_order")
+                        .map_err(|e: sqlx::Error| e.to_string())?,
+                    project_total: row
+                        .try_get("project_total")
                         .map_err(|e: sqlx::Error| e.to_string())?,
                 })
             })
@@ -2127,6 +2463,7 @@ async fn create_workbook_revision(
         name,
         created_at,
         sort_order,
+        project_total: None,
     })
 }
 
@@ -2300,6 +2637,7 @@ async fn create_workbook_revision_from_template(
         name,
         created_at,
         sort_order,
+        project_total: None,
     })
 }
 
@@ -3326,6 +3664,13 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), String> {
         .execute(pool)
         .await;
 
+    // Additive: cached value of the revision's designated "PROJECT_TOTAL" named
+    // cell (L1/H:Total), refreshed by the frontend whenever it changes. Lets the
+    // workbook sidebar show a project total without re-evaluating formulas.
+    let _ = sqlx::query("ALTER TABLE workbook_revisions ADD COLUMN project_total REAL")
+        .execute(pool)
+        .await;
+
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS templates (
@@ -3340,6 +3685,35 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), String> {
     .execute(pool)
     .await
     .map_err(|e| format!("Failed to create templates: {e}"))?;
+
+    // Rate library (Excel add-in M4): user-maintained unit rates, live-linked via STUDIQ.RATE().
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS rate_library (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            code        TEXT    NOT NULL,
+            description TEXT    NOT NULL DEFAULT '',
+            rate        REAL    NOT NULL DEFAULT 0.0,
+            unit        TEXT    NOT NULL DEFAULT ''
+        );
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| format!("Failed to create rate_library: {e}"))?;
+
+    // Project constants (Excel add-in M4): named scalar values, live-linked via STUDIQ.CONST().
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS project_constants (
+            name  TEXT PRIMARY KEY,
+            value REAL NOT NULL DEFAULT 0.0
+        );
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| format!("Failed to create project_constants: {e}"))?;
 
     // Seed a default workbook + revision for projects that have none yet.
     sqlx::query(
@@ -3356,6 +3730,126 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), String> {
     .await
     .map_err(|e| format!("Failed to seed default workbook revision: {e}"))?;
 
+    Ok(())
+}
+
+// ─── Rate library commands ─────────────────────────────────────────────────────
+
+#[tauri::command]
+async fn list_rates(state: State<'_, AppState>) -> Result<Vec<RateDto>, String> {
+    let db = active_project_db(&state)?;
+    let rows = sqlx::query("SELECT id, code, description, rate, unit FROM rate_library ORDER BY code")
+        .fetch_all(&db)
+        .await
+        .map_err(|e| format!("list_rates: {e}"))?;
+    rows.into_iter()
+        .map(|r| Ok(RateDto {
+            id: r.try_get("id").map_err(|e: sqlx::Error| e.to_string())?,
+            code: r.try_get("code").map_err(|e: sqlx::Error| e.to_string())?,
+            description: r.try_get("description").map_err(|e: sqlx::Error| e.to_string())?,
+            rate: r.try_get("rate").map_err(|e: sqlx::Error| e.to_string())?,
+            unit: r.try_get("unit").map_err(|e: sqlx::Error| e.to_string())?,
+        }))
+        .collect()
+}
+
+#[tauri::command]
+async fn create_rate(
+    code: String,
+    description: String,
+    rate: f64,
+    unit: String,
+    state: State<'_, AppState>,
+) -> Result<RateDto, String> {
+    let db = active_project_db(&state)?;
+    let code = code.trim().to_string();
+    if code.is_empty() { return Err("code is required".to_string()); }
+    let res = sqlx::query(
+        "INSERT INTO rate_library (code, description, rate, unit) VALUES (?, ?, ?, ?)",
+    )
+    .bind(&code).bind(&description).bind(rate).bind(&unit)
+    .execute(&db).await.map_err(|e| format!("create_rate: {e}"))?;
+    Ok(RateDto { id: res.last_insert_rowid(), code, description, rate, unit })
+}
+
+#[tauri::command]
+async fn update_rate(
+    id: i64,
+    code: String,
+    description: String,
+    rate: f64,
+    unit: String,
+    state: State<'_, AppState>,
+) -> Result<RateDto, String> {
+    let db = active_project_db(&state)?;
+    let code = code.trim().to_string();
+    if code.is_empty() { return Err("code is required".to_string()); }
+    let rows = sqlx::query(
+        "UPDATE rate_library SET code=?, description=?, rate=?, unit=? WHERE id=?",
+    )
+    .bind(&code).bind(&description).bind(rate).bind(&unit).bind(id)
+    .execute(&db).await.map_err(|e| format!("update_rate: {e}"))?.rows_affected();
+    if rows == 0 { return Err(format!("rate {id} not found")); }
+    Ok(RateDto { id, code, description, rate, unit })
+}
+
+#[tauri::command]
+async fn delete_rate(id: i64, state: State<'_, AppState>) -> Result<(), String> {
+    let db = active_project_db(&state)?;
+    sqlx::query("DELETE FROM rate_library WHERE id=?")
+        .bind(id).execute(&db).await.map_err(|e| format!("delete_rate: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_rate(id: i64, state: State<'_, AppState>) -> Result<Option<RateDto>, String> {
+    let db = active_project_db(&state)?;
+    let row = sqlx::query(
+        "SELECT id, code, description, rate, unit FROM rate_library WHERE id=?",
+    )
+    .bind(id).fetch_optional(&db).await.map_err(|e| format!("get_rate: {e}"))?;
+    row.map(|r| Ok(RateDto {
+        id: r.try_get("id").map_err(|e: sqlx::Error| e.to_string())?,
+        code: r.try_get("code").map_err(|e: sqlx::Error| e.to_string())?,
+        description: r.try_get("description").map_err(|e: sqlx::Error| e.to_string())?,
+        rate: r.try_get("rate").map_err(|e: sqlx::Error| e.to_string())?,
+        unit: r.try_get("unit").map_err(|e: sqlx::Error| e.to_string())?,
+    })).transpose()
+}
+
+// ─── Project constants commands ───────────────────────────────────────────────
+
+#[tauri::command]
+async fn list_constants(state: State<'_, AppState>) -> Result<Vec<ConstantDto>, String> {
+    let db = active_project_db(&state)?;
+    let rows = sqlx::query("SELECT name, value FROM project_constants ORDER BY name")
+        .fetch_all(&db).await.map_err(|e| format!("list_constants: {e}"))?;
+    rows.into_iter()
+        .map(|r| Ok(ConstantDto {
+            name: r.try_get("name").map_err(|e: sqlx::Error| e.to_string())?,
+            value: r.try_get("value").map_err(|e: sqlx::Error| e.to_string())?,
+        }))
+        .collect()
+}
+
+#[tauri::command]
+async fn set_constant(name: String, value: f64, state: State<'_, AppState>) -> Result<ConstantDto, String> {
+    let db = active_project_db(&state)?;
+    let name = name.trim().to_string();
+    if name.is_empty() { return Err("name is required".to_string()); }
+    sqlx::query(
+        "INSERT INTO project_constants (name, value) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET value=excluded.value",
+    )
+    .bind(&name).bind(value)
+    .execute(&db).await.map_err(|e| format!("set_constant: {e}"))?;
+    Ok(ConstantDto { name, value })
+}
+
+#[tauri::command]
+async fn delete_constant(name: String, state: State<'_, AppState>) -> Result<(), String> {
+    let db = active_project_db(&state)?;
+    sqlx::query("DELETE FROM project_constants WHERE name=?")
+        .bind(&name).execute(&db).await.map_err(|e| format!("delete_constant: {e}"))?;
     Ok(())
 }
 
@@ -3381,6 +3875,7 @@ async fn query_tree_nodes(
                     n.uom,
                     n.colour,
                     p.measurement_type,
+                    p.default_display,
                     CASE WHEN p.measurement_type = 'timber_framing'
                          THEN json_extract(p.framing_props_json, '$.framingSize') END AS framing_size
                 FROM tree_nodes n
@@ -3409,6 +3904,7 @@ async fn query_tree_nodes(
                     n.uom,
                     n.colour,
                     p.measurement_type,
+                    p.default_display,
                     CASE WHEN p.measurement_type = 'timber_framing'
                          THEN json_extract(p.framing_props_json, '$.framingSize') END AS framing_size
                 FROM tree_nodes n
@@ -3444,6 +3940,7 @@ async fn query_tree_nodes(
                 colour: row.try_get("colour").map_err(|e| e.to_string())?,
                 framing_size: row.try_get("framing_size").map_err(|e| e.to_string())?,
                 measurement_type: row.try_get("measurement_type").map_err(|e| e.to_string())?,
+                default_display: row.try_get("default_display").map_err(|e| e.to_string())?,
             })
         })
         .collect()
@@ -3674,6 +4171,7 @@ async fn get_tree_node(pool: &SqlitePool, node_id: i64) -> Result<TreeNodeDto, S
             n.uom,
             n.colour,
             p.measurement_type,
+            p.default_display,
             CASE WHEN p.measurement_type = 'timber_framing'
                  THEN json_extract(p.framing_props_json, '$.framingSize') END AS framing_size
         FROM tree_nodes n
@@ -3703,6 +4201,7 @@ async fn get_tree_node(pool: &SqlitePool, node_id: i64) -> Result<TreeNodeDto, S
         colour: row.try_get("colour").map_err(|e| e.to_string())?,
         framing_size: row.try_get("framing_size").map_err(|e| e.to_string())?,
         measurement_type: row.try_get("measurement_type").map_err(|e| e.to_string())?,
+        default_display: row.try_get("default_display").map_err(|e| e.to_string())?,
     })
 }
 
@@ -3754,6 +4253,11 @@ pub fn run() {
                 tauri::async_runtime::block_on(init_registry_database(&registry_path))
                     .expect("Recent projects registry initialisation failed");
 
+            let startup_file = std::env::args().skip(1).find(|arg| {
+                let lower = arg.to_lowercase();
+                lower.ends_with(".tcop") || lower.ends_with(".tcopkg") || lower.ends_with(".sqtemplate")
+            });
+
             tracing::info!("pdfium path: {}", pdfium_lib_path);
 
             let worker_count = 1;
@@ -3769,10 +4273,17 @@ pub fn run() {
                 Arc::clone(&tile_manager),
             ));
 
+            // Excel bridge: HTTPS server that proxies takeoff queries to the frontend.
+            let bridge: SharedBridge = Arc::new(BridgeState::new());
+            bridge.set_app(app.handle().clone());
+            let bridge_cert_dir = app_data_dir.join("bridge");
+            bridge::spawn(Arc::clone(&bridge), bridge_cert_dir);
+
             app.manage(AppState {
                 pdfium_lib_path,
                 tile_cache_dir,
                 renderer_path,
+                startup_file,
                 open_document: Arc::new(Mutex::new(None)),
                 tile_manager,
                 render_context: Arc::new(Mutex::new(None)),
@@ -3782,18 +4293,22 @@ pub fn run() {
                 renderer,
                 tile_render_tx,
                 next_tile_batch: AtomicU64::new(1),
+                bridge,
             });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             close_splashscreen,
             get_active_project,
+            get_startup_file,
             get_recent_projects,
             remove_recent_project,
             create_project,
             open_project,
             close_project,
             export_project,
+            export_package,
+            import_package,
             update_project_meta,
             open_document,
             get_page_vectors,
@@ -3832,6 +4347,7 @@ pub fn run() {
             save_workbook_named_cell,
             delete_workbook_named_cell,
             load_workbook_named_cells,
+            save_workbook_project_total,
             delete_workbook_sheet_subtree,
             clear_workbook_revision_data,
             list_workbooks,
@@ -3848,7 +4364,16 @@ pub fn run() {
             import_template,
             write_text_file,
             read_text_file,
-            rename_workbook_sheet_subtree
+            rename_workbook_sheet_subtree,
+            bridge_respond,
+            list_rates,
+            create_rate,
+            update_rate,
+            delete_rate,
+            get_rate,
+            list_constants,
+            set_constant,
+            delete_constant
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

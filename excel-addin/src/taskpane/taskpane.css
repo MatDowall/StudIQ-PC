@@ -1,0 +1,328 @@
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: "Segoe UI", Arial, sans-serif;
+  font-size: 13px;
+  color: #1a1a1a;
+  background: #ffffff;
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* ── Header ── */
+header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  background: #1a3a6b;
+  color: white;
+  flex-shrink: 0;
+}
+
+.logo {
+  height: 22px;
+  width: auto;
+  flex-shrink: 0;
+  object-fit: contain;
+  filter: brightness(0) invert(1);
+}
+
+.header-title {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+header h1 {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.build-time {
+  font-size: 9px;
+  color: rgba(255,255,255,0.45);
+  font-family: monospace;
+  letter-spacing: 0.02em;
+}
+
+#refresh-btn {
+  background: none;
+  border: none;
+  color: rgba(255,255,255,0.8);
+  cursor: pointer;
+  font-size: 18px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  line-height: 1;
+}
+#refresh-btn:hover { color: white; background: rgba(255,255,255,0.15); }
+
+/* ── Cell bar (Show on plan) ── */
+.cell-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 12px;
+  background: #eef3fb;
+  border-bottom: 1px solid #c8d8f0;
+  font-size: 11px;
+  flex-shrink: 0;
+}
+.cell-bar.hidden { display: none; }
+.cell-formula {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #1a3a6b;
+  font-family: monospace;
+}
+.show-plan-btn {
+  flex-shrink: 0;
+  padding: 3px 8px;
+  font-size: 11px;
+  font-family: inherit;
+  background: #1a3a6b;
+  color: white;
+  border: none;
+  border-radius: 3px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.show-plan-btn:hover { background: #245090; }
+
+/* ── Arm bar (drag-to-insert active state) ── */
+.arm-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  background: #1a3a6b;
+  color: white;
+  font-size: 12px;
+  border-bottom: 2px solid #0d2050;
+  flex-shrink: 0;
+}
+.arm-bar.hidden { display: none; }
+
+.arm-icon {
+  font-size: 13px;
+  opacity: 0.8;
+  flex-shrink: 0;
+}
+
+.arm-label {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.arm-cancel {
+  background: none;
+  border: none;
+  color: rgba(255,255,255,0.7);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 0 4px;
+  line-height: 1;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+.arm-cancel:hover { color: white; background: rgba(255,255,255,0.15); }
+
+/* ── Refresh bar ── */
+.refresh-bar {
+  display: flex;
+  justify-content: flex-end;
+  padding: 4px 12px;
+  border-bottom: 1px solid #e8ecf3;
+  background: #f5f7fb;
+  flex-shrink: 0;
+}
+.refresh-all-btn {
+  padding: 3px 10px;
+  font-size: 11px;
+  font-family: inherit;
+  background: transparent;
+  color: #1a3a6b;
+  border: 1px solid #c8d8f0;
+  border-radius: 3px;
+  cursor: pointer;
+}
+.refresh-all-btn:hover { background: #e8edf8; }
+
+/* ── Status ── */
+.status {
+  padding: 6px 12px;
+  font-size: 12px;
+  color: #555;
+  min-height: 24px;
+  flex-shrink: 0;
+}
+.status.error { color: #c0392b; }
+
+/* ── Groups section (scrollable) ── */
+#tab-dimensions {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+  padding: 4px 0;
+}
+
+/* ── Group item (header + expandable sub-rows) ── */
+.group-item {
+  border-bottom: 1px solid #f0f0f0;
+}
+
+/* Grabbing cursor applied to entire body during a drag so it shows over all elements */
+body.is-dragging, body.is-dragging * { cursor: grabbing !important; }
+
+.group-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px 6px 8px;
+  cursor: grab;
+}
+.group-header:hover { background: #f7f9fc; }
+.group-header.dragging { opacity: 0.45; background: #edf0f8; }
+
+.expand-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 11px;
+  color: #666;
+  padding: 2px 4px;
+  border-radius: 3px;
+  flex-shrink: 0;
+  line-height: 1;
+}
+.expand-btn:hover { background: #e8edf5; color: #1a3a6b; }
+
+.group-info {
+  flex: 1;
+  min-width: 0;
+}
+.group-name {
+  display: block;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.group-type {
+  display: block;
+  font-size: 11px;
+  color: #888;
+  margin-top: 1px;
+}
+
+/* ── Drag handle ── */
+.drag-handle {
+  font-size: 18px;
+  color: #ccc;
+  cursor: grab;
+  flex-shrink: 0;
+  line-height: 1;
+  user-select: none;
+  -webkit-user-select: none;
+  padding: 0 1px;
+  font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 20;
+}
+.drag-handle:hover { color: #888; }
+.drag-handle:active { cursor: grabbing; color: #1a3a6b; }
+
+/* ── Sub-rows (measurements / framing sizes) ── */
+.sub-rows {
+  display: none;
+  background: #f9fafc;
+  border-top: 1px solid #edf0f5;
+}
+.sub-rows.visible { display: block; }
+
+.sub-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px 5px 20px;
+  border-bottom: 1px solid #edf0f5;
+  cursor: grab;
+}
+.sub-row:last-child { border-bottom: none; }
+.sub-row:hover { background: #edf0f8; }
+.sub-row.dragging { opacity: 0.45; background: #edf0f8; }
+
+.sub-info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.sub-label {
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: #333;
+}
+.sub-value {
+  font-size: 11px;
+  color: #777;
+  white-space: nowrap;
+}
+
+/* ── Display type selector (shown inside expanded non-framing groups) ── */
+.display-selector-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px 5px 28px;
+  border-bottom: 1px solid #edf0f5;
+  background: #f3f5fb;
+}
+
+.display-selector-label {
+  font-size: 11px;
+  color: #666;
+  white-space: nowrap;
+}
+
+.display-selector {
+  font-size: 11px;
+  font-family: inherit;
+  color: #1a3a6b;
+  background: white;
+  border: 1px solid #c8d8f0;
+  border-radius: 3px;
+  padding: 2px 4px;
+  cursor: pointer;
+}
+.display-selector:focus { outline: none; border-color: #1a3a6b; }
+
+.sub-loading, .sub-error, .sub-empty {
+  padding: 6px 12px 6px 28px;
+  font-size: 12px;
+  color: #888;
+  font-style: italic;
+}
+.sub-error { color: #c0392b; }
+
+.empty {
+  padding: 16px 12px;
+  color: #888;
+  font-style: italic;
+}

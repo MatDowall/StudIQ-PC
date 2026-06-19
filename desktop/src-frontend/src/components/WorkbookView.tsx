@@ -10,21 +10,21 @@ import "handsontable/styles/ht-theme-classic.css";
 import type Handsontable from "handsontable";
 import { HyperFormula } from "hyperformula";
 import { useAppStore, DEFAULT_WORKBOOK_FORMAT } from "../store/appStore";
-import type { WorkbookFormatApi, WorkbookGridApi, MeasurementDto, DimensionGroupPropsDto, PageScaleDto } from "../store/appStore";
+import type { WorkbookFormatApi, WorkbookGridApi } from "../store/appStore";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { TemplateManagerDialog } from "./TemplateManagerDialog";
 import { ContextMenu } from "./ContextMenu";
 import { TextInputDialog } from "./TextInputDialog";
 import { NamedCellsManagerDialog, type NamedCellEntry } from "./NamedCellsManagerDialog";
 import { ImportDimensionDialog, type ImportDisplayOption } from "./ImportDimensionDialog";
-import { groupNetQuantity, quantityValueText, type GroupProps, type PagePoint, type Quantity } from "../lib/quantity";
+import { quantityValueText, type Quantity } from "../lib/quantity";
+import type { FramingGroupBreakdown } from "../lib/framing";
 import {
-  aggregateFramingGroup,
-  parseFramingSettings,
-  parseWallFraming,
-  type FramingGroupBreakdown,
-  type FramingWallInput,
-} from "../lib/framing";
+  loadGroupImportContext,
+  buildImportOptions,
+  deriveLinkedQuantity,
+  type GroupImportContext,
+} from "../lib/groupImport";
 
 registerAllModules();
 
@@ -90,6 +90,10 @@ const COL_SUM_TOTAL = 15;              // P  = O×C
 const COL_CODE     = 0;                // A – used to detect "empty" / cleared line items
 const COL_DESC     = 1;                // B – used to detect "empty" / cleared line items
 const COL_UNIT     = 3;                // D – populated alongside C on dimension-group import
+// Reserved named-cell name: the single L1/H:Total cell a workbook author
+// designates as the project grand total (its resolved value is cached on the
+// revision via setWorkbookRevisionProjectTotal for the workbook sidebar).
+const PROJECT_TOTAL_NAME = "PROJECT_TOTAL";
 // Must match hotSettings.rowHeaderWidth so breadcrumb boxes align with grid columns.
 const ROW_HDR_W = 50;
 
@@ -195,110 +199,10 @@ function namedExprFromValue(value: unknown): string {
 const LINK_FONT_COLOUR = "#489c35";
 const DIMENSION_DRAG_MIME = "application/x-studiq-dimension-group";
 
-const IMPORT_DISPLAY_LABELS: Record<string, string> = {
-  count: "Count",
-  length: "Length",
-  area: "Area",
-  perimeter: "Perimeter",
-  wall_area: "Wall surface area",
-  volume: "Volume",
-};
-
-/**
- * All derived displays a dimension group's geometry can possibly be brought into the
- * workbook as, given its measurement type and default width/height settings — mirrors
- * the derivation matrix in lib/quantity.ts (`deriveQuantity`). E.g. a length measure
- * with a default height can come in as Length or Wall surface area; with both width
- * and height it can also come in as Volume.
- */
-function possibleImportDisplays(props: GroupProps): string[] {
-  switch (props.measurement_type) {
-    case "count":
-      return ["count"];
-    case "length": {
-      const out = ["length"];
-      if (props.default_width > 0) out.push("area");
-      if (props.default_height > 0) out.push("wall_area");
-      if (props.default_width > 0 && props.default_height > 0) out.push("volume");
-      return out;
-    }
-    case "area": {
-      const out = ["area", "perimeter"];
-      if (props.default_height > 0) out.push("wall_area", "volume");
-      return out;
-    }
-    default:
-      return [];
-  }
-}
-
-interface GroupImportContext {
-  props: GroupProps;
-  measurements: MeasurementDto[];
-  scaleFor: (drawingId: number, pageIndex: number) => number | null;
-  framingBreakdown: FramingGroupBreakdown | null;
-}
-
-/** Loads everything needed to derive a dimension group's quantity outside of the
- *  Dimensions sidebar (which only keeps this in memory for the selected groups). */
-async function loadGroupImportContext(groupId: number): Promise<GroupImportContext> {
-  const [measurements, props] = await Promise.all([
-    invoke<MeasurementDto[]>("get_measurements_for_group", { groupId }),
-    invoke<DimensionGroupPropsDto>("get_dimension_group_props", { nodeId: groupId }),
-  ]);
-
-  const pageKeys = Array.from(new Set(measurements.map((m) => `${m.drawing_id}:${m.page_index}`)));
-  const scaleEntries = await Promise.all(
-    pageKeys.map(async (key) => {
-      const [drawingId, pageIndex] = key.split(":").map(Number);
-      const scale = await invoke<PageScaleDto | null>("get_page_scale", { drawingId, pageIndex });
-      return [key, scale?.mm_per_point ?? null] as const;
-    }),
-  );
-  const scaleMap = new Map(scaleEntries);
-  const scaleFor = (drawingId: number, pageIndex: number) => scaleMap.get(`${drawingId}:${pageIndex}`) ?? null;
-
-  let framingBreakdown: FramingGroupBreakdown | null = null;
-  if (props.measurement_type === "timber_framing") {
-    const walls: FramingWallInput[] = measurements.map((m) => {
-      let points: PagePoint[] = [];
-      try {
-        const parsed = JSON.parse(m.geometry_json);
-        if (Array.isArray(parsed)) points = parsed;
-      } catch { /* ignore malformed geometry */ }
-      return {
-        id: m.id,
-        points,
-        mmPerPoint: scaleFor(m.drawing_id, m.page_index),
-        framing: parseWallFraming(m.framing_json),
-      };
-    });
-    framingBreakdown = aggregateFramingGroup(walls, parseFramingSettings(props.framing_props_json));
-  }
-
-  return { props, measurements, scaleFor, framingBreakdown };
-}
-
-/** Builds the dialog's option list — one entry per possible derived display that
- *  actually yields a quantity for this group's current measurements. */
-function buildImportOptions(ctx: GroupImportContext): ImportDisplayOption[] {
-  const out: ImportDisplayOption[] = [];
-  for (const display of possibleImportDisplays(ctx.props)) {
-    const quantity = groupNetQuantity(ctx.measurements, { ...ctx.props, default_display: display }, ctx.scaleFor);
-    if (!quantity) continue;
-    out.push({ key: display, label: IMPORT_DISPLAY_LABELS[display] ?? display, quantity });
-  }
-  return out;
-}
-
-/** Re-derives a linked cell's current quantity, for the chosen display. */
-function deriveLinkedQuantity(ctx: GroupImportContext, display: string): Quantity | null {
-  if (ctx.props.measurement_type === "timber_framing") {
-    const value = ctx.framingBreakdown?.matchingTotalM ?? 0;
-    return value > 0 ? { value, uom: "m" } : null;
-  }
-  return groupNetQuantity(ctx.measurements, { ...ctx.props, default_display: display }, ctx.scaleFor);
-}
+// Dimension-group import/derivation helpers (loadGroupImportContext,
+// buildImportOptions, deriveLinkedQuantity, possibleImportDisplays,
+// IMPORT_DISPLAY_LABELS) live in lib/groupImport.ts so the Excel bridge derives
+// quantities through the same code path. Imported at the top of this file.
 
 function formatNumericDisplay(raw: unknown, decimals: number): string | null {
   if (typeof raw === "string" && raw.trim().startsWith("=")) return null;
@@ -832,6 +736,8 @@ export function WorkbookView() {
   const revIdRef = useRef<number | null>(null);
   revIdRef.current = activeRevisionId;
 
+  const setWorkbookRevisionProjectTotal = useAppStore(s => s.setWorkbookRevisionProjectTotal);
+
   // Format toolbar bridge (ribbon ⇄ grid) — see appStore.ts
   const setWorkbookFormat    = useAppStore(s => s.setWorkbookFormat);
   const setWorkbookFormatApi = useAppStore(s => s.setWorkbookFormatApi);
@@ -1082,10 +988,18 @@ export function WorkbookView() {
       try { hf.addNamedExpression(nc.name, formula); registeredNamedExprRef.current.add(nc.name); }
       catch { /* invalid expression text — leave the name unregistered */ }
     }
+    const resolved = (() => { try { return hf.getNamedExpressionValue(nc.name); } catch { return "ERR"; } })();
     // eslint-disable-next-line no-console
-    console.log("[NC] reg", nc.name, "bound=", nc.path, "cur=", curSheetPath(),
-      "formula=", formula, "->",
-      (() => { try { return hf.getNamedExpressionValue(nc.name); } catch { return "ERR"; } })());
+    console.log("[NC] reg", nc.name, "bound=", nc.path, "cur=", curSheetPath(), "formula=", formula, "->", resolved);
+
+    // Cache PROJECT_TOTAL's resolved value on the revision so the workbook
+    // sidebar can show it without re-evaluating formulas itself.
+    if (nc.name === PROJECT_TOTAL_NAME) {
+      const revId = revIdRef.current;
+      if (revId != null) {
+        void setWorkbookRevisionProjectTotal(revId, typeof resolved === "number" ? resolved : null);
+      }
+    }
   }
 
   /** Re-registers *every* named cell against the now-active sheet — called after any
@@ -1097,6 +1011,23 @@ export function WorkbookView() {
   function refreshNamedCellsForPath(_path: string) {
     if (namedCellMap.current.size === 0) return;
     for (const nc of namedCellMap.current.values()) registerNamedExpression(nc);
+  }
+
+  /** Re-reads PROJECT_TOTAL's live value and re-caches it on the revision —
+   *  called after edits on L1 so the workbook sidebar total updates as the
+   *  user types, not just on load/navigation. */
+  function refreshProjectTotal() {
+    const pt = namedCellMap.current.get(PROJECT_TOTAL_NAME);
+    if (!pt || pt.path !== "L1" || curSheetPath() !== "L1") return;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const hf = (hotRef.current?.hotInstance?.getPlugin('formulas') as any)?.engine;
+    if (!hf) return;
+    let value: unknown;
+    try { value = hf.getNamedExpressionValue(PROJECT_TOTAL_NAME); } catch { return; }
+    const revId = revIdRef.current;
+    if (revId != null) {
+      void setWorkbookRevisionProjectTotal(revId, typeof value === "number" ? value : null);
+    }
   }
 
   /** Binds `name` to (path,row,col): persists it, replaces any prior binding for
@@ -1112,6 +1043,9 @@ export function WorkbookView() {
         revisionId: revId, name, sheetPath: path, row, col,
       });
     } catch { /* non-fatal — local binding still works for this session */ }
+    // Re-render so cell renderers that key off namedCellMap (e.g. the
+    // PROJECT_TOTAL highlight) pick up the new binding immediately.
+    hotRef.current?.hotInstance?.render();
   }
 
   /** Removes `name`'s binding entirely: persisted row, HyperFormula named expression,
@@ -1404,9 +1338,8 @@ export function WorkbookView() {
 
   /** Inserts plain `Description`/`Quantity`/`Unit` line items directly below `afterRow` on
    *  the current (Level 2) sheet — used for the framing group's "<size> Lintel to last" rows.
-   *  These are independent sub-quantities (a different framing size to the group's own — see
-   *  CLAUDE.md "Timber framing: one quantity per framing size"), so they're placed as plain
-   *  takeoff-level values rather than Quantity Build-up drilldowns or dimension-group links.
+   *  Lintels are always independent line items (never folded into the Quantity Build-up),
+   *  placed as plain takeoff-level values since there's nothing to drill into.
    *
    *  If existing line items already occupy the rows directly below, shifts them down first
    *  (formula-safely — see `shiftStandardRowsDown`) rather than overwriting them. */
@@ -1444,28 +1377,25 @@ export function WorkbookView() {
   }
 
   /** On dropping a timber-framing group: seeds the row's Quantity Build-up sub-sheet
-   *  (`<path>/Q<row>`) with one Description/Length row per matching-size component (so
-   *  drilling into C:Quantity immediately shows the framing makeup, no manual entry needed),
-   *  and inserts a plain "<size> Lintel to last" line item directly below the group's row
-   *  for every distinct lintel-size override present.
+   *  (`<path>/Q<row>`) with one Description/Length row per non-lintel component (plates,
+   *  studs, dwangs, jacks, etc.), and inserts a plain "<size> Lintel to last" line item
+   *  directly below the group's row for every distinct lintel size present.
    *
-   *  Lintels of a different size are deliberately NOT folded into the Quantity Build-up —
-   *  they're a separate sub-quantity that must not roll into the group's own matchingTotalM
-   *  (see CLAUDE.md "Timber framing: one quantity per framing size"); a plain takeoff-level
-   *  value is all that's needed since there's nothing to drill into. */
+   *  Lintels are deliberately NOT folded into the Quantity Build-up — they're always a
+   *  separate sub-quantity that must not roll into the group's own matchingTotalM. */
   function populateFramingRollup(row: number, breakdown: FramingGroupBreakdown): void {
     const hot = hotRef.current?.hotInstance;
     const revId = revIdRef.current;
     if (!hot || revId == null) return;
     const path = curSheetPath();
 
-    const matching  = breakdown.components.filter(c => !c.sizeOverride);
-    const overrides = breakdown.components.filter(c => !!c.sizeOverride);
+    const nonLintels = breakdown.components.filter(c => !c.sizeOverride);
+    const lintels    = breakdown.components.filter(c => !!c.sizeOverride);
 
-    if (matching.length > 0) {
+    if (nonLintels.length > 0) {
       const qtyPath = `${path}/Q${row}`;
       const qtyData = createEmptyData();
-      matching.forEach((c, i) => {
+      nonLintels.forEach((c, i) => {
         if (i >= NUM_ROWS) return;
         qtyData[i][COL_DESC]   = c.label;
         qtyData[i][COL_LENGTH] = c.totalM.toFixed(3);
@@ -1474,10 +1404,10 @@ export function WorkbookView() {
       persistSheet(revId, qtyPath, qtyData);
     }
 
-    if (overrides.length > 0) {
-      // aggregateFramingGroup already groups lintels by size (framingComponentKey
-      // includes sizeOverride), so each entry here is one distinct override size.
-      const items = overrides.map(c => ({
+    if (lintels.length > 0) {
+      // aggregateFramingGroup groups lintels by size (framingComponentKey includes
+      // sizeOverride), so each entry here is one distinct lintel size.
+      const items = lintels.map(c => ({
         desc: `${c.sizeOverride} Lintel to last`,
         qty: c.totalM.toFixed(3),
       }));
@@ -1563,6 +1493,18 @@ export function WorkbookView() {
       label: "New Named Cell…",
       action: () => setNamedCellDialog({ row: coords.row, col: coords.col }),
     });
+
+    // L1's H:Total column is where a workbook author designates the single cell
+    // that holds the project grand total. Bound via the reserved "PROJECT_TOTAL"
+    // named cell so it can be read back without the workbook being open.
+    if (curSheetPath() === "L1" && coords.col === COL_TOTAL) {
+      const pt = namedCellMap.current.get(PROJECT_TOTAL_NAME);
+      const isCurrent = pt?.row === coords.row && pt?.col === coords.col;
+      items.push({
+        label: isCurrent ? "Project Total ✓" : "Set as Project Total",
+        action: () => { void defineNamedCell(PROJECT_TOTAL_NAME, "L1", coords.row, coords.col); },
+      });
+    }
 
     // "Exclude/re-enable auto-calculation" — operates on the live selection (falls
     // back to the right-clicked cell when nothing is selected). Lets a template
@@ -2723,6 +2665,12 @@ export function WorkbookView() {
     // Cells excluded from auto-calc carry a faint dashed top border so the user can
     // see at a glance which F/G/H cells are hand-built and won't be auto-derived.
     td.style.borderTop = excluded ? `1px dashed ${EXCLUDED_BORDER_COLOUR}` : "";
+
+    // Highlight the designated "PROJECT_TOTAL" cell on L1 — a class (not
+    // td.style) so its !important CSS rule can win over ht-yellow-cell's.
+    const pt = namedCellMap.current.get(PROJECT_TOTAL_NAME);
+    const isProjectTotal = curSheetPath() === "L1" && pt?.row === row && pt?.col === col;
+    td.classList.toggle("ht-project-total-cell", isProjectTotal);
   }
 
   // ── Handsontable settings (created once; hooks read from refs) ─────────
@@ -2808,6 +2756,30 @@ export function WorkbookView() {
       // Skipped when isAutoUpdatingRef is true — i.e. for the nested afterChange
       // calls fired by our own setDataAtCell writes below (prevents recursion).
       if (!isAutoUpdatingRef.current) {
+        // Remove stale cell links when a linked C:Quantity cell is cleared by the user.
+        // Without this, refreshLinkedCells on next sheet load re-populates the cleared cell.
+        const path = curSheetPath();
+        for (const ch of changes) {
+          const row = ch[0];
+          const col = typeof ch[1] === "number" ? ch[1] : -1;
+          if (col !== COL_QTY) continue;
+          const newVal = ch[3];
+          if (newVal != null && newVal !== "") continue;
+          const linkKey = styleKey(row, COL_QTY);
+          const links = cellLinkMap.current.get(path);
+          if (links?.has(linkKey)) {
+            links.delete(linkKey);
+            const revId = revIdRef.current;
+            if (revId != null) {
+              invoke("save_workbook_sheet_links", {
+                revisionId: revId,
+                sheetPath: path,
+                linksJson: JSON.stringify(Object.fromEntries(links)),
+              }).catch(() => {/* non-fatal */});
+            }
+          }
+        }
+
         const kind = sheetKindForPath(curSheetPath());
         const excludedSet = cellExclusionMap.current.get(curSheetPath());
         const isExcluded = (r: number, c: number) => excludedSet != null && excludedSet.has(styleKey(r, c));
@@ -2936,6 +2908,9 @@ export function WorkbookView() {
         if (levelRef.current >= 2) {
           propagateLiveRollupRef.current();
         }
+
+        // Keep the workbook sidebar's cached project total live as the user types.
+        refreshProjectTotal();
       }
     },
 
@@ -3234,6 +3209,7 @@ export function WorkbookView() {
       <style>{`
         .ht-yellow-cell { background: #fffff0 !important; }
         .handsontable .ht-yellow-cell { background: #fffff0 !important; }
+        .handsontable .ht-project-total-cell { background: #ffe27a !important; }
         .handsontable th { white-space: nowrap; overflow: hidden; }
         .handsontable td { font-size: 12px; }
         .handsontable th { font-size: 12px; }

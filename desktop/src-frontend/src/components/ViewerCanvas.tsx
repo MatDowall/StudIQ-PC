@@ -13,21 +13,18 @@ import {
   projectOntoPath,
   serializeWallFraming,
   STUD_THICKNESS_MM,
+  wallStudPositions,
   type Opening,
   type OpeningTemplate,
   type WallFraming,
 } from "../lib/framing";
-import { computeWall3D } from "../lib/framing3d";
-import { ContextMenu } from "./ContextMenu";
+import { computeWall3D, offsetMembers } from "../lib/framing3d";
+import { ContextMenu, type ContextMenuItem } from "./ContextMenu";
 import { OpeningDialog } from "./OpeningDialog";
 import { RakingDialog } from "./RakingDialog";
 import { Framing3DView } from "./Framing3DView";
 
-interface ViewerMenuItem {
-  label: string;
-  action: () => void;
-  danger?: boolean;
-}
+type ViewerMenuItem = ContextMenuItem;
 
 const TILE_SIZE = 512;
 
@@ -1046,16 +1043,16 @@ function CalibrationDialog({
         style={{
           width: 300,
           padding: 16,
-          background: "#23262b",
-          color: "#e8e8e8",
-          border: "1px solid #3c4048",
+          background: "var(--bg-pane)",
+          color: "var(--text-primary)",
+          border: "1px solid var(--border-divider)",
           borderRadius: 4,
           fontFamily: "Segoe UI, sans-serif",
           fontSize: 12,
         }}
       >
         <div style={{ fontSize: 13, marginBottom: 10 }}>Set page scale</div>
-        <div style={{ color: "#9aa0aa", marginBottom: 12 }}>
+        <div style={{ color: "var(--text-secondary)", marginBottom: 12 }}>
           Enter the real-world length of the line you drew ({pixelLength.toFixed(1)} pt).
         </div>
         <div style={{ display: "flex", gap: 6, marginBottom: 14 }}>
@@ -1073,9 +1070,9 @@ function CalibrationDialog({
               flex: 1,
               height: 28,
               padding: "0 8px",
-              background: "#15171a",
-              color: "#e8e8e8",
-              border: "1px solid #3c4048",
+              background: "var(--bg-input)",
+              color: "var(--text-primary)",
+              border: "1px solid var(--border-divider)",
               borderRadius: 3,
             }}
           />
@@ -1085,9 +1082,9 @@ function CalibrationDialog({
             style={{
               height: 28,
               padding: "0 6px",
-              background: "#15171a",
-              color: "#e8e8e8",
-              border: "1px solid #3c4048",
+              background: "var(--bg-input)",
+              color: "var(--text-primary)",
+              border: "1px solid var(--border-divider)",
               borderRadius: 3,
             }}
           >
@@ -1099,13 +1096,13 @@ function CalibrationDialog({
         <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
           <button
             onClick={onCancel}
-            style={{ height: 26, padding: "0 12px", background: "#2b2d31", color: "#e8e8e8", border: "1px solid #3c4048", borderRadius: 3, cursor: "pointer" }}
+            style={{ height: 26, padding: "0 12px", background: "var(--bg-input)", color: "var(--text-primary)", border: "1px solid var(--border-divider)", borderRadius: 3, cursor: "pointer" }}
           >
             Cancel
           </button>
           <button
             onClick={confirm}
-            style={{ height: 26, padding: "0 12px", background: "#4A9EFF", color: "#fff", border: "none", borderRadius: 3, cursor: "pointer" }}
+            style={{ height: 26, padding: "0 12px", background: "var(--color-accent)", color: "#fff", border: "none", borderRadius: 3, cursor: "pointer" }}
           >
             Set Scale
           </button>
@@ -1146,6 +1143,12 @@ export function ViewerCanvas({
   const [pendingRake, setPendingRake] = useState<{ measurementId: number; segmentIndex: number; start: number; end: number; gable: boolean; middle?: number } | null>(null);
   // Ctrl-hover (select mode): ghost position for a manually-placed extra stud.
   const [studGhost, setStudGhost] = useState<{ measurementId: number; segmentIndex: number; centreMm: number } | null>(null);
+  // Right-click → Double studs → Select studs: interactive stud-pick mode.
+  const [doubleStudSelect, setDoubleStudSelect] = useState<{
+    measurementId: number;
+    pending: { segmentIndex: number; centreMm: number }[];
+    hoverPos: { segmentIndex: number; centreMm: number } | null;
+  } | null>(null);
   // Right-click → View wall in 3D: the wall shown in the isolated 3D modal.
   const [wall3dId, setWall3dId] = useState<number | null>(null);
   // Marquee rubber-band selection
@@ -1192,6 +1195,7 @@ export function ViewerCanvas({
   const snapFrameRef = useRef<number | null>(null);
   const latestSnapPointerRef = useRef<{ clientX: number; clientY: number } | null>(null);
 
+  const lightMode = useAppStore((state) => state.lightMode);
   const snapPoint = useAppStore((state) => state.snapPoint);
   const snapType = useAppStore((state) => state.snapType);
   const drawingType = useAppStore((state) => state.drawingType);
@@ -1608,11 +1612,11 @@ export function ViewerCanvas({
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.imageSmoothingEnabled = true;
     ctx.clearRect(0, 0, width, height);
-    ctx.fillStyle = "#15171a";
+    ctx.fillStyle = lightMode ? "#D0D5DE" : "#15171a";
     ctx.fillRect(0, 0, width, height);
 
     if (!doc || !page) {
-      ctx.fillStyle = "#6f7682";
+      ctx.fillStyle = lightMode ? "#555555" : "#6f7682";
       ctx.font = "14px Segoe UI, sans-serif";
       ctx.textAlign = "center";
       ctx.fillText("Open a PDF to begin", width / 2, height / 2);
@@ -1623,7 +1627,7 @@ export function ViewerCanvas({
     const pageTop = -pan.y;
     ctx.fillStyle = "#f7f7f7";
     ctx.fillRect(pageLeft, pageTop, pageSize.width, pageSize.height);
-    ctx.strokeStyle = "#3c4048";
+    ctx.strokeStyle = lightMode ? "#AAAAAA" : "#3c4048";
     ctx.strokeRect(pageLeft, pageTop, pageSize.width, pageSize.height);
 
     ctx.save();
@@ -1811,6 +1815,51 @@ export function ViewerCanvas({
         }
       }
     }
+    // Select-studs-to-double overlay: pending (selected) studs drawn in gold; hovered stud in
+    // lighter gold. Both are drawn as the stud rect + cross so they read as timber members.
+    if (doubleStudSelect && page) {
+      const measurement = overlayMeasurements.find((m) => m.id === doubleStudSelect.measurementId);
+      if (measurement) {
+        let pts: PagePoint[] | null = null;
+        try { pts = JSON.parse(measurement.geometry_json); } catch { pts = null; }
+        if (Array.isArray(pts) && pts.length >= 2) {
+          const settings = parseFramingSettings(groupProps[measurement.dimension_group_id]?.framing_props_json ?? null);
+          const mmpp = pageScale?.mm_per_point ?? null;
+          const positions = mmpp ? wallStudPositions(pts, settings, mmpp) : [];
+          const drawStudHighlight = (pos: { segmentIndex: number; centreMm: number }, fill: string, stroke: string) => {
+            if (!mmpp) return;
+            const rect = extraStudRect(pts!, settings, mmpp, pos.segmentIndex, pos.centreMm);
+            if (!rect) return;
+            const c = rect.map((p) => pageToScreen(p.x, p.y, page.height_pts, pan, zoom));
+            ctx.save();
+            ctx.beginPath();
+            ctx.moveTo(c[0].x, c[0].y);
+            for (const s of c.slice(1)) ctx.lineTo(s.x, s.y);
+            ctx.closePath();
+            ctx.fillStyle = fill;
+            ctx.fill();
+            ctx.strokeStyle = stroke;
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.moveTo(c[0].x, c[0].y); ctx.lineTo(c[2].x, c[2].y);
+            ctx.moveTo(c[1].x, c[1].y); ctx.lineTo(c[3].x, c[3].y);
+            ctx.stroke();
+            ctx.restore();
+          };
+          // Pending (selected) studs.
+          for (const pos of positions) {
+            const selected = doubleStudSelect.pending.some((d) => d.segmentIndex === pos.segmentIndex && Math.abs(d.centreMm - pos.centreMm) < 0.5);
+            if (selected) drawStudHighlight(pos, "#FFD70055", "#FFD700");
+          }
+          // Hover ghost.
+          if (doubleStudSelect.hoverPos) {
+            const isSelected = doubleStudSelect.pending.some((d) => d.segmentIndex === doubleStudSelect.hoverPos!.segmentIndex && Math.abs(d.centreMm - doubleStudSelect.hoverPos!.centreMm) < 0.5);
+            if (!isSelected) drawStudHighlight(doubleStudSelect.hoverPos, "#FFD70022", "#FFD70099");
+          }
+        }
+      }
+    }
     // Move ghost: selected measurements rendered semi-transparent at the offset position.
     if (moveMode && cursorPagePoint) {
       const dx = cursorPagePoint.x - moveMode.anchorPage.x;
@@ -1910,7 +1959,7 @@ export function ViewerCanvas({
         }
       }
     }
-  }, [activeProps, activeDimensionGroupId, arrayDirection, arrayExtraMembers, arraySpacingPts, arrayTrimDraft, arrayTrimKeepPt, arrayTrimMode, arrayTrimType, calibDialog, calibPoints, calibrating, clipboard, cursorPagePoint, doc, draftColour, draftPoints, draftStyle, drawingArea, drawingArray, drawingFraming, drawingType, editPreview, groupColours, groupProps, lineSnapResult, marqueeState, measuring, moveMode, openingGhost, openingPlacement, overlayColour, overlayMeasurements, page, pageIndex, pageScale, pageSize.height, pageSize.width, pan, pasteMode, selectedSet, shiftHeld, snapPoint, snapType, studGhost, viewportSize.height, viewportSize.width, zoom]);
+  }, [activeProps, activeDimensionGroupId, arrayDirection, arrayExtraMembers, arraySpacingPts, arrayTrimDraft, arrayTrimKeepPt, arrayTrimMode, arrayTrimType, calibDialog, calibPoints, calibrating, clipboard, cursorPagePoint, doc, doubleStudSelect, draftColour, draftPoints, draftStyle, drawingArea, drawingArray, drawingFraming, drawingType, editPreview, groupColours, groupProps, lightMode, lineSnapResult, marqueeState, measuring, moveMode, openingGhost, openingPlacement, overlayColour, overlayMeasurements, page, pageIndex, pageScale, pageSize.height, pageSize.width, pan, pasteMode, selectedSet, shiftHeld, snapPoint, snapType, studGhost, viewportSize.height, viewportSize.width, zoom]);
 
   function clampPan(nextPan: { x: number; y: number }, nextZoom = zoom) {
     if (!page) return nextPan;
@@ -2041,6 +2090,19 @@ export function ViewerCanvas({
     }
 
     if (selectMode && page) {
+      // Select-studs-to-double mode: click toggles the hovered stud.
+      if (doubleStudSelect) {
+        setDoubleStudSelect((prev) => {
+          if (!prev?.hoverPos) return prev;
+          const { segmentIndex, centreMm } = prev.hoverPos;
+          const alreadyIn = prev.pending.some((d) => d.segmentIndex === segmentIndex && Math.abs(d.centreMm - centreMm) < 0.5);
+          const next = alreadyIn
+            ? prev.pending.filter((d) => !(d.segmentIndex === segmentIndex && Math.abs(d.centreMm - centreMm) < 0.5))
+            : [...prev.pending, { segmentIndex, centreMm }];
+          return { ...prev, pending: next };
+        });
+        return;
+      }
       // Move mode: left-click commits the move at the current cursor position.
       if (moveMode && cursorPagePoint) {
         void commitMove(cursorPagePoint);
@@ -2107,6 +2169,12 @@ export function ViewerCanvas({
       } else {
         resolveOpeningGhost(clientToPagePoint(event.clientX, event.clientY));
       }
+      return;
+    }
+
+    // Select-studs-to-double mode: update hover stud position.
+    if (doubleStudSelect) {
+      resolveDoubleStudHover(event.clientX, event.clientY);
       return;
     }
 
@@ -2361,6 +2429,32 @@ export function ViewerCanvas({
             });
             if (existingRake) items.push({ label: "Clear raking frame", danger: true, action: () => clearRake(id, seg.segmentIndex) });
           }
+          // Double studs submenu.
+          items.push({
+            label: "Double studs",
+            submenu: [
+              {
+                label: "Apply to entire wall",
+                action: () => {
+                  const wf = parseWallFraming(measurement.framing_json);
+                  void updateMeasurementFraming(id, serializeWallFraming({ ...wf, doubleAllStuds: true, doubledStuds: undefined })).catch((e) => onStatusChange(`ERROR: ${e}`));
+                },
+              },
+              {
+                label: "Select studs…",
+                action: () => {
+                  const wf = parseWallFraming(measurement.framing_json);
+                  setDoubleStudSelect({ measurementId: id, pending: wf.doubledStuds ?? [], hoverPos: null });
+                },
+              },
+              ...(parseWallFraming(measurement.framing_json).doubleAllStuds || (parseWallFraming(measurement.framing_json).doubledStuds?.length ?? 0) > 0
+                ? [{ label: "Clear doubled studs", danger: true as const, action: () => {
+                    const wf = parseWallFraming(measurement.framing_json);
+                    void updateMeasurementFraming(id, serializeWallFraming({ ...wf, doubleAllStuds: undefined, doubledStuds: undefined })).catch((e) => onStatusChange(`ERROR: ${e}`));
+                  } }]
+                : []),
+            ],
+          });
         }
       }
 
@@ -2554,6 +2648,41 @@ export function ViewerCanvas({
       }
     }
     setStudGhost(best ? { measurementId: best.measurementId, segmentIndex: best.segmentIndex, centreMm: best.centreMm } : null);
+  }
+
+  function resolveDoubleStudHover(clientX: number, clientY: number) {
+    if (!doubleStudSelect || !page) return;
+    const element = viewportRef.current;
+    const mmpp = pageScale?.mm_per_point ?? null;
+    if (!element || !mmpp) return;
+    const measurement = overlayMeasurements.find((m) => m.id === doubleStudSelect.measurementId);
+    if (!measurement) return;
+    let pts: PagePoint[] | null = null;
+    try { pts = JSON.parse(measurement.geometry_json); } catch { pts = null; }
+    if (!Array.isArray(pts) || pts.length < 2) return;
+    const settings = parseFramingSettings(groupProps[measurement.dimension_group_id]?.framing_props_json ?? null);
+    const positions = wallStudPositions(pts, settings, mmpp);
+    const domRect = element.getBoundingClientRect();
+    const sx = clientX - domRect.left;
+    const sy = clientY - domRect.top;
+    const RADIUS_PX = 20;
+    let best: { segmentIndex: number; centreMm: number; distSq: number } | null = null;
+    for (const pos of positions) {
+      const a = pts[pos.segmentIndex];
+      const b = pts[pos.segmentIndex + 1];
+      if (!a || !b) continue;
+      const dx = b.x - a.x; const dy = b.y - a.y;
+      const len = Math.hypot(dx, dy);
+      if (len < 1e-9) continue;
+      const dir = { x: dx / len, y: dy / len };
+      const sPts = pos.centreMm / mmpp;
+      const centre = pageToScreen(a.x + dir.x * sPts, a.y + dir.y * sPts, page.height_pts, pan, zoom);
+      const distSq = (centre.x - sx) ** 2 + (centre.y - sy) ** 2;
+      if (distSq <= RADIUS_PX ** 2 && (!best || distSq < best.distSq)) {
+        best = { segmentIndex: pos.segmentIndex, centreMm: pos.centreMm, distSq };
+      }
+    }
+    setDoubleStudSelect((prev) => prev ? { ...prev, hoverPos: best ? { segmentIndex: best.segmentIndex, centreMm: best.centreMm } : null } : null);
   }
 
   function commitExtraStud() {
@@ -3018,6 +3147,8 @@ export function ViewerCanvas({
   useEffect(() => {
     if (!measuring) return;
     function onKeyDown(event: KeyboardEvent) {
+      const active = document.activeElement;
+      if (active && (active.tagName === "INPUT" || active.tagName === "TEXTAREA" || (active as HTMLElement).isContentEditable)) return;
       if (event.key === "Escape") {
         applyDraft([]);
         arrayExtraMembersRef.current = 0;
@@ -3111,6 +3242,29 @@ export function ViewerCanvas({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [arrayTrimMode, arrayTrimType, arrayTrimKeepPt, commitArrayTrim]);
 
+  // Select-studs-to-double mode: Enter commits, Escape cancels.
+  useEffect(() => {
+    if (!doubleStudSelect) return;
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        setDoubleStudSelect(null);
+      } else if (event.key === "Enter") {
+        setDoubleStudSelect((prev) => {
+          if (!prev) return null;
+          const measurement = overlayMeasurements.find((m) => m.id === prev.measurementId);
+          if (measurement) {
+            const wf = parseWallFraming(measurement.framing_json);
+            void updateMeasurementFraming(prev.measurementId, serializeWallFraming({ ...wf, doubleAllStuds: undefined, doubledStuds: prev.pending.length > 0 ? prev.pending : undefined })).catch((e) => onStatusChange(`ERROR: ${e}`));
+          }
+          return null;
+        });
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [doubleStudSelect, overlayMeasurements]);
+
   // Releasing Ctrl (or leaving select mode) clears the extra-stud ghost.
   useEffect(() => {
     if (!selectMode) {
@@ -3151,6 +3305,8 @@ export function ViewerCanvas({
   useEffect(() => {
     if (!selectMode) return;
     function onKeyDown(event: KeyboardEvent) {
+      const active = document.activeElement;
+      if (active && (active.tagName === "INPUT" || active.tagName === "TEXTAREA" || (active as HTMLElement).isContentEditable)) return;
       // Esc cancels move or paste ghost mode.
       if (event.key === "Escape") {
         if (moveModeRef.current) { moveModeRef.current = null; setMoveMode(null); }
@@ -3266,7 +3422,7 @@ export function ViewerCanvas({
                   ? "grabbing"
                   : "grab"
           : "default",
-        background: "#15171a",
+        background: "var(--bg-canvas)",
         touchAction: "none",
       }}
     >
@@ -3319,6 +3475,28 @@ export function ViewerCanvas({
           }}
         >
           {hoverInfo.text}
+        </div>
+      ) : null}
+      {doubleStudSelect ? (
+        <div
+          style={{
+            position: "absolute",
+            bottom: 12,
+            left: "50%",
+            transform: "translateX(-50%)",
+            padding: "6px 16px",
+            background: "rgba(20,22,26,0.92)",
+            color: "#FFD700",
+            border: "1px solid #FFD700",
+            borderRadius: 4,
+            fontSize: 12,
+            fontFamily: "Segoe UI, sans-serif",
+            pointerEvents: "none",
+            whiteSpace: "nowrap",
+            zIndex: 10,
+          }}
+        >
+          Click studs to toggle doubled — Enter to confirm · Esc to cancel ({doubleStudSelect.pending.length} selected)
         </div>
       ) : null}
       {calibDialog ? (
@@ -3374,10 +3552,10 @@ export function ViewerCanvas({
     ) : null}
     {wall3dId !== null ? (
       <div style={{ position: "fixed", inset: 0, zIndex: 1300, display: "grid", placeItems: "center", background: "rgba(0,0,0,0.55)" }} onClick={() => setWall3dId(null)}>
-        <div onClick={(e) => e.stopPropagation()} style={{ width: "82vw", height: "82vh", background: "#dfe4ea", border: `1px solid ${"#3c4048"}`, boxShadow: "0 18px 48px rgba(0,0,0,0.5)", display: "flex", flexDirection: "column", overflow: "hidden" }}>
-          <div style={{ height: 34, display: "flex", alignItems: "center", padding: "0 12px", background: "#2b2d31", color: "#e8e8e8", fontSize: 13, fontWeight: 600 }}>
+        <div onClick={(e) => e.stopPropagation()} style={{ width: "82vw", height: "82vh", background: "#dfe4ea", border: "1px solid var(--border-divider)", boxShadow: "0 18px 48px rgba(0,0,0,0.5)", display: "flex", flexDirection: "column", overflow: "hidden" }}>
+          <div style={{ height: 34, display: "flex", alignItems: "center", padding: "0 12px", background: "var(--bg-ribbon)", color: "var(--text-primary)", fontSize: 13, fontWeight: 600 }}>
             Wall in 3D
-            <button onClick={() => setWall3dId(null)} style={{ marginLeft: "auto", width: 24, height: 24, background: "transparent", color: "#e8e8e8", border: "none", cursor: "pointer", fontSize: 16 }}>×</button>
+            <button onClick={() => setWall3dId(null)} style={{ marginLeft: "auto", width: 24, height: 24, background: "transparent", color: "var(--text-primary)", border: "none", cursor: "pointer", fontSize: 16 }}>×</button>
           </div>
           <div style={{ flex: 1, minHeight: 0 }}>
             {(() => {
@@ -3391,7 +3569,8 @@ export function ViewerCanvas({
               if (!m || !Array.isArray(pts)) return null;
               const settings = parseFramingSettings(groupProps[m.dimension_group_id]?.framing_props_json ?? null);
               const mmpp = pageScale?.mm_per_point ?? null;
-              const members = computeWall3D(pts, settings, mmpp, parseWallFraming(m.framing_json));
+              const offsetM = groupProps[m.dimension_group_id]?.default_offset ?? 0;
+              const members = offsetMembers(computeWall3D(pts, settings, mmpp, parseWallFraming(m.framing_json)), offsetM);
               const page3d = doc?.pages[m.page_index] ?? null;
               const S = mmpp ? mmpp / 1000 : null;
               const pageWidthM = S && page3d ? page3d.width_pts * S : undefined;

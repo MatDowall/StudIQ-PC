@@ -24,6 +24,8 @@ export interface TreeNodeDto {
   framing_size: string | null;
   // measurement_type from dimension_group_props; null for non-dimension-group nodes.
   measurement_type: string | null;
+  // default_display from dimension_group_props (e.g. "length", "area", "count"); null for non-group nodes.
+  default_display?: string | null;
 }
 
 export interface MeasurementDto {
@@ -60,6 +62,7 @@ export interface MultiPage3DGroupEntry {
   name: string;
   included: boolean;
   framingPropsJson: string | null;
+  defaultOffsetM: number;
   measurements: MeasurementDto[];
 }
 
@@ -115,6 +118,7 @@ export interface WorkbookRevisionDto {
   name: string;
   created_at: string;
   sort_order: number;
+  project_total: number | null;
 }
 
 export interface WorkbookDto {
@@ -243,6 +247,11 @@ interface IndexedPrimitive {
 interface AppStore {
   activeProject: ProjectMeta | null;
   recentProjects: RecentProject[];
+  pendingImportPath: string | null;
+  setPendingImportPath: (path: string | null) => void;
+
+  lightMode: boolean;
+  setLightMode: (on: boolean) => void;
 
   /** Which top-level workflow tab is active. */
   activeTab: "dimensions" | "workbook";
@@ -355,6 +364,8 @@ interface AppStore {
   openProject: (filePath: string) => Promise<void>;
   closeProject: () => Promise<void>;
   exportProject: (destPath: string) => Promise<void>;
+  exportPackage: (destPath: string) => Promise<void>;
+  importPackage: (pkgPath: string, destTcopPath: string) => Promise<void>;
   /** Debug/QA: export the current page's timber-framing walls as a 2D elevation PDF. Returns the
    *  saved file path, or null if there's nothing to export or the user cancelled the dialog. */
   exportFramingElevations: () => Promise<string | null>;
@@ -399,6 +410,7 @@ interface AppStore {
   createWorkbookRevisionFromTemplate: (workbookId: number, name: string, templateId: number) => Promise<void>;
   deleteWorkbookRevision: (revisionId: number) => Promise<void>;
   renameWorkbookRevision: (revisionId: number, name: string) => Promise<void>;
+  setWorkbookRevisionProjectTotal: (revisionId: number, total: number | null) => Promise<void>;
 
   openNamedCellsManager: () => void;
   closeNamedCellsManager: () => void;
@@ -673,9 +685,25 @@ function infiniteLineSegmentT(S: LineSegment, Q: LineSegment): number | null {
   return t;
 }
 
+function applyTheme(lightMode: boolean) {
+  document.documentElement.setAttribute("data-theme", lightMode ? "light" : "dark");
+}
+
+// Apply persisted theme before first render to avoid flash.
+applyTheme(localStorage.getItem("studiq-theme") === "light");
+
 export const useAppStore = create<AppStore>((set, get) => ({
   activeProject: null,
   recentProjects: [],
+  pendingImportPath: null,
+  setPendingImportPath: (path) => set({ pendingImportPath: path }),
+
+  lightMode: localStorage.getItem("studiq-theme") === "light",
+  setLightMode: (on) => {
+    localStorage.setItem("studiq-theme", on ? "light" : "dark");
+    applyTheme(on);
+    set({ lightMode: on });
+  },
 
   activeTab: "dimensions",
   setActiveTab: (tab) => set({ activeTab: tab }),
@@ -836,6 +864,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
         return {
           node,
           framingPropsJson: props.framing_props_json ?? null,
+          defaultOffsetM: props.default_offset ?? 0,
           measurements: measurements.filter(
             (m) => m.drawing_id === activeDrawingId && m.measurement_type === "timber_framing",
           ),
@@ -844,7 +873,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
     );
 
     const pageGroups = new Map<number, MultiPage3DGroupEntry[]>();
-    for (const { node, measurements, framingPropsJson } of groupData) {
+    for (const { node, measurements, framingPropsJson, defaultOffsetM } of groupData) {
       const byPage = new Map<number, MeasurementDto[]>();
       for (const m of measurements) {
         const arr = byPage.get(m.page_index) ?? [];
@@ -853,7 +882,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
       }
       for (const [pageIndex, ms] of byPage) {
         const arr = pageGroups.get(pageIndex) ?? [];
-        arr.push({ groupId: node.id, name: node.name, included: true, framingPropsJson, measurements: ms });
+        arr.push({ groupId: node.id, name: node.name, included: true, framingPropsJson, defaultOffsetM, measurements: ms });
         pageGroups.set(pageIndex, arr);
       }
     }
@@ -983,6 +1012,17 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   exportProject: async (destPath) => {
     await invoke<void>("export_project", { destPath });
+  },
+
+  exportPackage: async (destPath) => {
+    await invoke<void>("export_package", { destPath });
+  },
+
+  importPackage: async (pkgPath, destTcopPath) => {
+    const project = await invoke<ProjectMeta>("import_package", { pkgPath, destTcopPath });
+    set({ activeProject: project, workbooks: [], activeRevisionId: null });
+    await get().loadRecentProjects();
+    await get().loadWorkbooks();
   },
 
   exportFramingElevations: async () => {
@@ -1229,6 +1269,25 @@ export const useAppStore = create<AppStore>((set, get) => ({
     const followsActiveDrawing =
       firstMeasurement && state.currentDocument && state.activeDrawingId === firstMeasurement.drawing_id;
 
+    // If the group's measurements live on a different drawing set than the one currently
+    // open, switch the viewer to that drawing's document before updating the active page.
+    let documentUpdate: Partial<AppStore> = {};
+    if (firstMeasurement && !followsActiveDrawing) {
+      const drawingNode = findNode(state.drawingRoots, state.childCache, firstMeasurement.drawing_id);
+      if (drawingNode?.file_path) {
+        const document = await invoke<DocumentMeta>("open_document", { path: drawingNode.file_path });
+        documentUpdate = {
+          activeDrawingId: firstMeasurement.drawing_id,
+          currentDocument: document,
+          vectorCache: {},
+          vectorIndex: {},
+          snapPoint: null,
+          snapType: null,
+          lineSnapResult: null,
+        };
+      }
+    }
+
     set({
       activeDimensionGroupId: activeId,
       selectedGroupIds: selectedIds,
@@ -1239,11 +1298,16 @@ export const useAppStore = create<AppStore>((set, get) => ({
       activeBreadcrumb: breadcrumb,
       overlayMeasurements: measurements,
       overlayColour: (activeId !== null ? groupColours[activeId] : activeNode?.colour) ?? "#4A9EFF",
-      activePageIndex: followsActiveDrawing ? firstMeasurement!.page_index : state.activePageIndex,
-      activePageNodeId: followsActiveDrawing
-        ? drawingPageNodeId(firstMeasurement!.drawing_id, firstMeasurement!.page_index)
+      activePageIndex: firstMeasurement ? firstMeasurement.page_index : state.activePageIndex,
+      activePageNodeId: firstMeasurement
+        ? drawingPageNodeId(firstMeasurement.drawing_id, firstMeasurement.page_index)
         : state.activePageNodeId,
+      ...documentUpdate,
     });
+
+    if (firstMeasurement && !followsActiveDrawing && documentUpdate.currentDocument) {
+      await get().loadVectors(firstMeasurement.page_index);
+    }
   },
 
   goToDimensionGroup: async (groupId) => {
@@ -1603,6 +1667,24 @@ export const useAppStore = create<AppStore>((set, get) => ({
   renameWorkbookRevision: async (revisionId, name) => {
     await invoke("rename_workbook_revision", { revisionId, name });
     await get().loadWorkbooks();
+  },
+
+  // Caches the revision's "PROJECT_TOTAL" value (see WorkbookView.tsx) so the
+  // workbook sidebar can display it without re-evaluating formulas. Updates
+  // local state immediately for a live-feeling sidebar, persisted in the
+  // background.
+  setWorkbookRevisionProjectTotal: async (revisionId, total) => {
+    set((state) => ({
+      workbooks: state.workbooks.map((wb) => ({
+        ...wb,
+        revisions: wb.revisions.map((rev) =>
+          rev.id === revisionId ? { ...rev, project_total: total } : rev,
+        ),
+      })),
+    }));
+    try {
+      await invoke("save_workbook_project_total", { revisionId, value: total });
+    } catch { /* non-fatal — local value still reflects the latest edit */ }
   },
 
   loadTemplates: async () => {

@@ -1,0 +1,68 @@
+{
+  "functions": [
+    {
+      "id": "QTY",
+      "name": "QTY",
+      "description": "Returns the live quantity for a StudIQ dimension group.",
+      "parameters": [
+        { "name": "groupId", "description": "Dimension group ID", "type": "number" },
+        { "name": "display", "description": "length, area, wall_area, volume, count, or perimeter", "type": "string", "optional": true }
+      ],
+      "result": { "type": "number", "dimensionality": "scalar" },
+      "options": { "volatile": true }
+    },
+    {
+      "id": "MEASUREMENT",
+      "name": "MEASUREMENT",
+      "description": "Returns the live quantity for a single StudIQ measurement.",
+      "parameters": [
+        { "name": "groupId", "description": "Dimension group ID", "type": "number" },
+        { "name": "measurementId", "description": "Measurement ID", "type": "number" },
+        { "name": "display", "description": "length, area, wall_area, volume, count", "type": "string", "optional": true }
+      ],
+      "result": { "type": "number", "dimensionality": "scalar" },
+      "options": { "volatile": true }
+    },
+    {
+      "id": "FRAMING",
+      "name": "FRAMING",
+      "description": "Returns the matching-timber lineal metres for a framing group (excludes lintels).",
+      "parameters": [
+        { "name": "groupId", "description": "Timber-framing dimension group ID", "type": "number" }
+      ],
+      "result": { "type": "number", "dimensionality": "scalar" },
+      "options": { "volatile": true }
+    },
+    {
+      "id": "LINTEL",
+      "name": "LINTEL",
+      "description": "Returns the total lineal metres for a specific lintel size in a framing group.",
+      "parameters": [
+        { "name": "groupId", "description": "Timber-framing dimension group ID", "type": "number" },
+        { "name": "size", "description": "Lintel size, e.g. \"140x45\"", "type": "string" }
+      ],
+      "result": { "type": "number", "dimensionality": "scalar" },
+      "options": { "volatile": true }
+    },
+    {
+      "id": "RATE",
+      "name": "RATE",
+      "description": "Returns the unit rate for a StudIQ rate library entry.",
+      "parameters": [
+        { "name": "id", "description": "Rate ID (shown in the StudIQ task pane)", "type": "number" }
+      ],
+      "result": { "type": "number", "dimensionality": "scalar" },
+      "options": { "volatile": true }
+    },
+    {
+      "id": "CONST",
+      "name": "CONST",
+      "description": "Returns the value of a named project constant.",
+      "parameters": [
+        { "name": "name", "description": "Constant name, e.g. \"GFA\"", "type": "string" }
+      ],
+      "result": { "type": "number", "dimensionality": "scalar" },
+      "options": { "volatile": true }
+    }
+  ]
+}

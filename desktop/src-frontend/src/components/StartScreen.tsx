@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import { useAppStore } from "../store/appStore";
 import { theme } from "../theme";
 import { ConfirmDialog } from "./ConfirmDialog";
@@ -11,6 +11,9 @@ export function StartScreen() {
   const loadRecentProjects = useAppStore((state) => state.loadRecentProjects);
   const createProject = useAppStore((state) => state.createProject);
   const openProject = useAppStore((state) => state.openProject);
+  const importPackage = useAppStore((state) => state.importPackage);
+  const pendingImportPath = useAppStore((state) => state.pendingImportPath);
+  const setPendingImportPath = useAppStore((state) => state.setPendingImportPath);
   const removeRecentProject = useAppStore((state) => state.removeRecentProject);
   const [showNewProject, setShowNewProject] = useState(false);
   const [pendingRemove, setPendingRemove] = useState<string | null>(null);
@@ -46,6 +49,37 @@ export function StartScreen() {
       setStatus(`ERROR: ${error}`);
     }
   }
+
+  async function runImportFlow(preselectedPkgPath?: string) {
+    let pkgPath = preselectedPkgPath ?? null;
+    if (!pkgPath) {
+      const selected = await open({
+        filters: [{ name: "Take-it-Off Package", extensions: ["tcopkg"] }],
+        multiple: false,
+      });
+      if (!selected || typeof selected !== "string") return;
+      pkgPath = selected;
+    }
+    const destTcopPath = await save({
+      defaultPath: pkgPath.replace(/\.tcopkg$/i, ".tcop"),
+      filters: [{ name: "Take-it-Off Project", extensions: ["tcop"] }],
+    });
+    if (!destTcopPath || typeof destTcopPath !== "string") return;
+    setStatus("Importing package…");
+    try {
+      const path = destTcopPath.toLowerCase().endsWith(".tcop") ? destTcopPath : destTcopPath + ".tcop";
+      await importPackage(pkgPath, path);
+    } catch (error) {
+      setStatus(`ERROR: ${error}`);
+    }
+  }
+
+  useEffect(() => {
+    if (!pendingImportPath) return;
+    setPendingImportPath(null);
+    void runImportFlow(pendingImportPath);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingImportPath]);
 
   async function confirmRemove() {
     if (!pendingRemove) return;
@@ -128,6 +162,22 @@ export function StartScreen() {
             }}
           >
             Open Project
+          </button>
+          <button
+            type="button"
+            onClick={() => { void runImportFlow(); }}
+            style={{
+              height: 48,
+              minWidth: 180,
+              padding: "0 18px",
+              background: theme.bg.input,
+              color: theme.text.primary,
+              border: `1px solid ${theme.border.divider}`,
+              fontSize: 14,
+              cursor: "pointer",
+            }}
+          >
+            Open Package…
           </button>
         </div>
 

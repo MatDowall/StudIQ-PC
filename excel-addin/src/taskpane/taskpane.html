@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta http-equiv="X-UA-Compatible" content="IE=Edge"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>StudIQ</title>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200"/>
+  <!-- Office.js must load before our script -->
+  <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+</head>
+<body>
+  <div id="app">
+    <header>
+      <span class="logo">S</span>
+      <h1>StudIQ</h1>
+      <button id="refresh-btn" title="Refresh groups from StudIQ">&#8635;</button>
+    </header>
+
+    <div id="cell-bar" class="cell-bar hidden">
+      <span id="cell-formula" class="cell-formula"></span>
+      <button id="show-on-plan-btn" class="show-plan-btn">Show on plan</button>
+    </div>
+
+    <div id="arm-bar" class="arm-bar hidden">
+      <span class="arm-icon">&#9655;</span>
+      <span id="arm-label" class="arm-label">Click a cell to insert</span>
+      <button id="arm-cancel" class="arm-cancel" title="Cancel (Esc)">&#x2715;</button>
+    </div>
+
+    <div id="status" class="status"></div>
+
+    <div class="refresh-bar">
+      <button id="refresh-all-btn" class="refresh-all-btn">Recalc all</button>
+    </div>
+
+    <section id="groups-section">
+      <div id="group-list"></div>
+    </section>
+  </div>
+
+  <script type="module" src="/src/taskpane/taskpane.ts"></script>
+</body>
+</html>

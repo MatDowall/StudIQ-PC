@@ -102,11 +102,22 @@ export interface ExtraStud {
   centreMm: number;
 }
 
+/** A stud that has been doubled up (a sister stud nailed alongside it). Identified by the
+ *  arc-length of the primary stud's centre along its segment. */
+export interface DoubledStud {
+  segmentIndex: number;
+  centreMm: number;
+}
+
 /** Per-wall framing extras (measurements.framing_json). */
 export interface WallFraming {
   openings: Opening[];
   rakes: Rake[];
   extraStuds: ExtraStud[];
+  /** Individual studs selected for doubling. */
+  doubledStuds?: DoubledStud[];
+  /** When true every regular stud in the wall is doubled (supersedes doubledStuds). */
+  doubleAllStuds?: boolean;
 }
 
 /** The configurable part of an opening (everything except where it sits) — what the Add Door /
@@ -144,10 +155,41 @@ export function parseWallFraming(json: string | null | undefined): WallFraming {
       openings: Array.isArray(parsed.openings) ? parsed.openings : [],
       rakes: Array.isArray(parsed.rakes) ? parsed.rakes : [],
       extraStuds: Array.isArray(parsed.extraStuds) ? parsed.extraStuds : [],
+      doubledStuds: Array.isArray(parsed.doubledStuds) ? parsed.doubledStuds : undefined,
+      doubleAllStuds: parsed.doubleAllStuds ?? undefined,
     };
   } catch {
     return { openings: [], rakes: [], extraStuds: [] };
   }
+}
+
+/** Returns true when the stud at (segmentIndex, centreMm) should be doubled. */
+export function isStudDoubled(framing: WallFraming | undefined, segmentIndex: number, centreMm: number): boolean {
+  if (!framing) return false;
+  if (framing.doubleAllStuds) return true;
+  if (!framing.doubledStuds?.length) return false;
+  return framing.doubledStuds.some((d) => d.segmentIndex === segmentIndex && Math.abs(d.centreMm - centreMm) < 0.5);
+}
+
+/** Enumerates every anchor + regular stud centre (segmentIndex, centreMm) for a wall path.
+ *  Used by the "select studs to double" interaction to hit-test which stud the cursor is on. */
+export function wallStudPositions(
+  path: PagePoint[],
+  settings: FramingSettings,
+  mmPerPoint: number,
+): { segmentIndex: number; centreMm: number }[] {
+  const depthPts = framingDepthMm(settings.framingSize) / mmPerPoint;
+  const studThkPts = STUD_THICKNESS_MM / mmPerPoint;
+  const spacingPts = Math.max(settings.studSpacingMm, 1) / mmPerPoint;
+  const gapPts = cornerGapMm(settings.framingSize) / mmPerPoint;
+  const layout = studLayout(path, depthPts, studThkPts, spacingPts, gapPts);
+  const positions: { segmentIndex: number; centreMm: number }[] = [];
+  layout.forEach((seg, segIndex) => {
+    for (const s of [...seg.anchors, ...seg.regular]) {
+      positions.push({ segmentIndex: segIndex, centreMm: s * mmPerPoint });
+    }
+  });
+  return positions;
 }
 
 export function serializeWallFraming(framing: WallFraming): string {
@@ -248,13 +290,17 @@ export function cornerGapMm(size: FramingSize): number {
 
 /** Per-segment stud set-out: `a`/`dir`/`segLen` plus the arc-length centres of the `anchor` studs
  *  (flush ends + the NZ 3-stud corner makeup, always present) and the `regular` infill studs
- *  (subject to being cut by openings). Shared by geometry and the quantity calc so they agree. */
+ *  (subject to being cut by openings). Shared by geometry and the quantity calc so they agree.
+ *  `startCorner`/`endCorner` indicate that the respective end connects to an adjacent segment at a
+ *  real angle (not collinear), so plates need to extend by halfDepth to fill the corner. */
 export interface SegLayout {
   a: PagePoint;
   dir: PagePoint;
   segLen: number;
   anchors: number[];
   regular: number[];
+  startCorner: boolean;
+  endCorner: boolean;
 }
 
 /**
@@ -314,7 +360,7 @@ export function studLayout(
     const regularTo = endStuds[0];
     for (let s = regularFrom + spacingPts; s < regularTo - GEOM_EPS; s += spacingPts) regular.push(s);
 
-    out.push({ a, dir, segLen, anchors: [...startStuds, ...endStuds], regular });
+    out.push({ a, dir, segLen, anchors: [...startStuds, ...endStuds], regular, startCorner: !isFirst && !startStraight, endCorner: !isLast && !endStraight });
   }
 
   return out;
@@ -427,8 +473,15 @@ export function computeFramingGeometry(
     const cut = (s: number) =>
       segOpenings.some((o) => Math.abs(s - o.centreMm / mmPerPoint) <= o.daylightWidthMm / mmPerPoint / 2 + 2 * studThkPts) ||
       nearAnyOpening(pointAt(seg, s));
+    // Sister stud offset: toward wall interior — positive in the first half, negative in the second.
+    const sisterOffset = (s: number) => (s < seg.segLen / 2 ? studThkPts : -studThkPts);
     for (const s of [...seg.anchors, ...seg.regular]) {
-      if (!cut(s)) studs.push(makeStudRect(pointAt(seg, s), seg.dir, halfThk, halfDepth));
+      if (!cut(s)) {
+        studs.push(makeStudRect(pointAt(seg, s), seg.dir, halfThk, halfDepth));
+        if (isStudDoubled(framing, segIndex, s * mmPerPoint)) {
+          studs.push(makeStudRect(pointAt(seg, s + sisterOffset(s)), seg.dir, halfThk, halfDepth));
+        }
+      }
     }
 
     for (const o of segOpenings) {
@@ -446,7 +499,12 @@ export function computeFramingGeometry(
     if (rake?.gable && rake.middleMm !== undefined) {
       const midS = seg.segLen / 2;
       for (const s of [midS - halfThk, midS + halfThk]) {
-        if (!cut(s)) studs.push(makeStudRect(pointAt(seg, s), seg.dir, halfThk, halfDepth));
+        if (!cut(s)) {
+          studs.push(makeStudRect(pointAt(seg, s), seg.dir, halfThk, halfDepth));
+          if (isStudDoubled(framing, segIndex, s * mmPerPoint)) {
+            studs.push(makeStudRect(pointAt(seg, s + sisterOffset(s)), seg.dir, halfThk, halfDepth));
+          }
+        }
       }
     }
   });
@@ -550,10 +608,10 @@ const KIND_LABEL: Record<FramingComponentKind, string> = {
 
 /** One line of a wall's framing makeup. `count`/`eachM` are the human-readable factors; the
  *  quantity that rolls up is `totalM` (lineal metres). `detail` is the intermediate math.
- *  `sizeOverride` is present when this is a lintel whose size differs from the group's framingSize. */
+ *  `sizeOverride` is always present on lintel rows (the lintel's own framing size). */
 export interface FramingComponent {
   kind: FramingComponentKind;
-  /** Present when this lintel row uses a size other than the group's framingSize. */
+  /** Always present on lintel rows — the lintel's framing size. Absent for all other member kinds. */
   sizeOverride?: FramingSize;
   label: string;
   count: number;
@@ -588,7 +646,7 @@ export function topLayerCount(s: FramingSettings): number {
  *  `framingSize` (e.g. a 140×45 lintel in a 90×45 group). */
 export interface WallMember {
   kind: FramingComponentKind;
-  /** Lintel-only: the lintel's FramingSize when it differs from the group's framingSize. */
+  /** Lintel-only: the lintel's FramingSize (always set for lintels, absent for all other kinds). */
   sizeOverride?: FramingSize;
   lengthM: number;
   position: [number, number, number];
@@ -700,6 +758,8 @@ export function wallMembers(
     // `rakeCut` is set on a raked segment, the top is cut to the underside of the sloped top
     // plate instead of being flat (a wedge in place of a box).
     const verticals: { x: number; yB: number; yT: number }[] = [];
+    // Sister stud offset: always toward wall interior so end studs double inward, not outside plates.
+    const sisterOffset = (s: number) => (s < seg.segLen / 2 ? studThkPts : -studThkPts);
     const addV = (kind: FramingComponentKind, s: number, yB: number, yT: number, rakeCut = false) => {
       if (yT - yB <= 0) return;
       verticals.push({ x: s, yB, yT });
@@ -724,6 +784,19 @@ export function wallMembers(
           pitch: 0,
           wedge: { quad, depthM },
         });
+        // Sister doubled stud — pushed to verticals so dwangs space from it, not the primary.
+        if (kind === "stud" && isStudDoubled(framing, segIndex, s * mmPerPoint)) {
+          const sD = s + sisterOffset(s);
+          verticals.push({ x: sD, yB, yT });
+          const sLeftD = sD - studThkPts / 2;
+          const sRightD = sD + studThkPts / 2;
+          const yTL = heightAt(segIndex, Math.max(0, Math.min(1, sLeftD / seg.segLen))) - topMakeup;
+          const yTR = heightAt(segIndex, Math.max(0, Math.min(1, sRightD / seg.segLen))) - topMakeup;
+          if (Math.min(yTL, yTR) - yB > 0) {
+            const quadD: [number, number][] = [[0, M(yB)], [thkM, M(yB)], [thkM, M(yTR)], [0, M(yTL)]];
+            members.push({ kind: "stud", lengthM: M((yTL + yTR) / 2 - yB), position: [fx(sLeftD), 0, fz(sLeftD)], size: [thkM, M(Math.max(yTL, yTR) - yB), depthM], yaw, pitch: 0, wedge: { quad: quadD, depthM } });
+          }
+        }
         return;
       }
       // Cap a plain (non-rake-cut) member's top to whichever segment's roofline is lowest at its
@@ -732,11 +805,27 @@ export function wallMembers(
       const cappedYT = Math.min(yT, ceilingMmAt(pointAt(seg, s)));
       if (cappedYT - yB <= 0) return;
       members.push({ kind, lengthM: M(cappedYT - yB), position: [fx(s), M((yB + cappedYT) / 2), fz(s)], size: [thkM, M(cappedYT - yB), depthM], yaw, pitch: 0 });
+      // Sister doubled stud — pushed to verticals so dwangs space from it, not the primary.
+      if (kind === "stud" && isStudDoubled(framing, segIndex, s * mmPerPoint)) {
+        const sD = s + sisterOffset(s);
+        verticals.push({ x: sD, yB, yT });
+        const cappedYTD = Math.min(yT, ceilingMmAt(pointAt(seg, sD)));
+        if (cappedYTD - yB > 0) {
+          members.push({ kind: "stud", lengthM: M(cappedYTD - yB), position: [fx(sD), M((yB + cappedYTD) / 2), fz(sD)], size: [thkM, M(cappedYTD - yB), depthM], yaw, pitch: 0 });
+        }
+      }
     };
 
     // Plates (bottom flat; top sloped + pitched on a rake).
+    // Extend plates by halfDepth at each corner end so they cover the corner-makeup area of the
+    // adjacent segment — without this, the corner makeup studs poke out beyond the plate face.
+    const plateStartExtPts = seg.startCorner ? halfDepthPts : 0;
+    const plateEndExtPts = seg.endCorner ? halfDepthPts : 0;
+    const plateTotalPts = seg.segLen + plateStartExtPts + plateEndExtPts;
+    const plateMidS = (plateEndExtPts - plateStartExtPts) / 2 + midS;
+    const plateLenM = plateTotalPts * S;
     for (let l = 0; l < bottomLayers; l += 1) {
-      members.push({ kind: "plate", lengthM: segLenM, position: [fx(midS), M(l * STUD_THICKNESS_MM + STUD_THICKNESS_MM / 2), fz(midS)], size: [segLenM, thkM, depthM], yaw, pitch: 0 });
+      members.push({ kind: "plate", lengthM: plateLenM, position: [fx(plateMidS), M(l * STUD_THICKNESS_MM + STUD_THICKNESS_MM / 2), fz(plateMidS)], size: [plateLenM, thkM, depthM], yaw, pitch: 0 });
     }
     // Top plate(s): one sloped piece spanning the segment, or (for a gable) two pieces meeting at
     // the apex (`middleMm`) at the segment midpoint.
@@ -776,13 +865,12 @@ export function wallMembers(
           });
         }
       } else {
-        const midPieceS = (piece.s0 + piece.s1) / 2;
         for (let l = 0; l < topLayers; l += 1) {
           members.push({
             kind: "plate",
-            lengthM: segLenM,
-            position: [fx(midPieceS), M(settings.wallHeightMm - topMakeup + l * STUD_THICKNESS_MM + STUD_THICKNESS_MM / 2), fz(midPieceS)],
-            size: [segLenM, thkM, depthM],
+            lengthM: plateLenM,
+            position: [fx(plateMidS), M(settings.wallHeightMm - topMakeup + l * STUD_THICKNESS_MM + STUD_THICKNESS_MM / 2), fz(plateMidS)],
+            size: [plateLenM, thkM, depthM],
             yaw,
             pitch: 0,
           });
@@ -823,10 +911,14 @@ export function wallMembers(
       for (const k of jambs.kings) addV("king", k, bottomMakeup, heightAt(segIndex, k / seg.segLen) - topMakeup, true); // full, follows rake
       for (const t of jambs.trimmers) addV("trimmer", t, bottomMakeup, head); // full: bottom plate → underside of lintel
       const lintelLenM = M(o.daylightWidthMm + 2 * STUD_THICKNESS_MM);
-      const lintelSizeOverride = o.lintelSize !== settings.framingSize ? o.lintelSize : undefined;
+      const lintelSizeOverride = o.lintelSize;
       // Lintel ply rendered as `ply` stacked beams across the depth (for legibility); length counts ×ply.
+      // Each ply is offset along the wall-depth direction (perpendicular to the wall in the XZ plane)
+      // so they appear as distinct side-by-side beams rather than coincident volumes.
+      const plyDepthM = depthM / Math.max(1, o.lintelPly);
       for (let p = 0; p < o.lintelPly; p += 1) {
-        members.push({ kind: "lintel", sizeOverride: lintelSizeOverride, lengthM: lintelLenM, position: [fx(centrePts), M(head + lintelDepth / 2), fz(centrePts)], size: [lintelLenM, M(lintelDepth), depthM / Math.max(1, o.lintelPly)], yaw, pitch: 0 });
+        const plyOffset = (p - (o.lintelPly - 1) / 2) * plyDepthM;
+        members.push({ kind: "lintel", sizeOverride: lintelSizeOverride, lengthM: lintelLenM, position: [fx(centrePts) + Math.sin(yaw) * plyOffset, M(head + lintelDepth / 2), fz(centrePts) + Math.cos(yaw) * plyOffset], size: [lintelLenM, M(lintelDepth), plyDepthM], yaw, pitch: 0 });
       }
       const jackPositions = [...seg.regular, ...cutCandidates].filter((s) => Math.abs(s - centrePts) < dwHalf);
       for (const s of jackPositions) addV("jack", s, head + lintelDepth, heightAt(segIndex, s / seg.segLen) - topMakeup, true);
@@ -951,7 +1043,7 @@ export interface FramingWallInput {
 }
 
 /** An aggregated component line across a group's walls.
- *  `sizeOverride` is present when this lintel row uses a size other than the group's framingSize. */
+ *  `sizeOverride` is always present on lintel rows — the lintel's framing size. */
 export interface FramingComponentTotal {
   kind: FramingComponentKind;
   sizeOverride?: FramingSize;

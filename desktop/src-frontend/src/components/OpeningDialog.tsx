@@ -1,7 +1,7 @@
 import { useState } from "react";
-import { createPortal } from "react-dom";
 import { theme } from "../theme";
 import { FRAMING_SIZES, type FramingSize, type OpeningTemplate } from "../lib/framing";
+import { DialogShell } from "./DialogShell";
 
 const inputStyle: React.CSSProperties = {
   boxSizing: "border-box",
@@ -45,13 +45,11 @@ export function OpeningDialog({
   const [sill, setSill] = useState(initial.sillHeightMm ?? 900);
   const [daylight, setDaylight] = useState(initial.daylightHeightMm);
   const [head, setHead] = useState((isWindow ? initial.sillHeightMm ?? 0 : 0) + initial.daylightHeightMm);
-  // The held value while the other two adjust to keep head = sill + daylight.
   const [locked, setLocked] = useState<HeightField>("head");
   const [daylightWidth, setDaylightWidth] = useState(String(initial.daylightWidthMm));
   const [lintelSize, setLintelSize] = useState<FramingSize>(initial.lintelSize);
   const [lintelPly, setLintelPly] = useState(String(initial.lintelPly));
 
-  // Edit an (unlocked) height; keep `locked` fixed and recompute the third via head = sill + daylight.
   function editHeight(field: HeightField, raw: number) {
     const v = Math.max(0, raw);
     let s = sill;
@@ -67,7 +65,6 @@ export function OpeningDialog({
       if (field === "daylight") h = s + d;
       else if (field === "head") d = h - s;
     } else {
-      // daylight locked
       if (field === "sill") h = s + d;
       else if (field === "head") s = h - d;
     }
@@ -134,61 +131,51 @@ export function OpeningDialog({
     );
   }
 
-  return createPortal(
-    <div style={{ position: "fixed", inset: 0, zIndex: 1250, display: "grid", placeItems: "center", background: "rgba(0,0,0,0.45)" }}>
-      <div
-        role="dialog"
-        aria-modal="true"
-        style={{ width: 400, background: theme.bg.pane, border: `1px solid ${theme.border.divider}`, boxShadow: "0 18px 48px rgba(0,0,0,0.45)", color: theme.text.primary, fontFamily: "Segoe UI, sans-serif" }}
-      >
-        <div style={{ height: 38, display: "flex", alignItems: "center", padding: "0 12px", background: theme.bg.ribbon, borderBottom: `1px solid ${theme.border.subtle}`, fontSize: 13, fontWeight: 600 }}>
-          {title}
-        </div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 8, padding: 14 }}>
-          {isWindow ? (
-            <>
-              {heightRow("Sill height", "sill", sill, "FFL to top of sill")}
-              {heightRow("Daylight opening height", "daylight", daylight, "Glass height (head − sill)")}
-              {heightRow("Head height", "head", head, "FFL to underside of lintel")}
-            </>
-          ) : (
-            <Row label="Daylight opening height">
-              <input
-                type="number"
-                value={String(daylight)}
-                onChange={(e) => setDaylight(Math.max(0, Number.parseFloat(e.target.value) || 0))}
-                style={{ ...inputStyle, flex: 1 }}
-                title="FFL to underside of lintel"
-              />
-              <span style={{ color: theme.text.secondary, fontSize: 12 }}>mm</span>
-            </Row>
-          )}
-          <Row label="Daylight opening width">
-            <input type="number" value={daylightWidth} onChange={(e) => setDaylightWidth(e.target.value)} style={{ ...inputStyle, flex: 1 }} title="Trimmer to trimmer" />
+  return (
+    <DialogShell title={title} width={400} zIndex={1250} onClose={onCancel}>
+      <div style={{ display: "flex", flexDirection: "column", gap: 8, padding: 14 }}>
+        {isWindow ? (
+          <>
+            {heightRow("Sill height", "sill", sill, "FFL to top of sill")}
+            {heightRow("Daylight opening height", "daylight", daylight, "Glass height (head − sill)")}
+            {heightRow("Head height", "head", head, "FFL to underside of lintel")}
+          </>
+        ) : (
+          <Row label="Daylight opening height">
+            <input
+              type="number"
+              value={String(daylight)}
+              onChange={(e) => setDaylight(Math.max(0, Number.parseFloat(e.target.value) || 0))}
+              style={{ ...inputStyle, flex: 1 }}
+              title="FFL to underside of lintel"
+            />
             <span style={{ color: theme.text.secondary, fontSize: 12 }}>mm</span>
           </Row>
-          <Row label="Lintel">
-            <select value={lintelSize} onChange={(e) => setLintelSize(e.target.value as FramingSize)} style={{ ...inputStyle, flex: 1 }}>
-              {FRAMING_SIZES.filter((s) => s !== "45x45").map((s) => (
-                <option key={s} value={s}>
-                  {s.replace("x", " × ")}
-                </option>
-              ))}
-            </select>
-            <input type="number" value={lintelPly} onChange={(e) => setLintelPly(e.target.value)} style={{ ...inputStyle, width: 56 }} title="Number of plies" />
-            <span style={{ color: theme.text.secondary, fontSize: 12 }}>ply</span>
-          </Row>
-        </div>
-        <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, padding: "10px 12px", borderTop: `1px solid ${theme.border.subtle}` }}>
-          <button onClick={onCancel} style={{ height: 28, padding: "0 12px", background: theme.bg.input, color: theme.text.primary, border: `1px solid ${theme.border.divider}`, cursor: "pointer" }}>
-            Cancel
-          </button>
-          <button onClick={confirm} style={{ height: 28, padding: "0 12px", background: theme.bg.active, color: "#FFFFFF", border: `1px solid ${theme.accent}`, cursor: "pointer" }}>
-            {confirmLabel}
-          </button>
-        </div>
+        )}
+        <Row label="Daylight opening width">
+          <input type="number" value={daylightWidth} onChange={(e) => setDaylightWidth(e.target.value)} style={{ ...inputStyle, flex: 1 }} title="Trimmer to trimmer" />
+          <span style={{ color: theme.text.secondary, fontSize: 12 }}>mm</span>
+        </Row>
+        <Row label="Lintel">
+          <select value={lintelSize} onChange={(e) => setLintelSize(e.target.value as FramingSize)} style={{ ...inputStyle, flex: 1 }}>
+            {FRAMING_SIZES.filter((s) => s !== "45x45").map((s) => (
+              <option key={s} value={s}>
+                {s.replace("x", " × ")}
+              </option>
+            ))}
+          </select>
+          <input type="number" value={lintelPly} onChange={(e) => setLintelPly(e.target.value)} style={{ ...inputStyle, width: 56 }} title="Number of plies" />
+          <span style={{ color: theme.text.secondary, fontSize: 12 }}>ply</span>
+        </Row>
       </div>
-    </div>,
-    document.body,
+      <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, padding: "10px 12px", borderTop: `1px solid ${theme.border.subtle}` }}>
+        <button onClick={onCancel} style={{ height: 28, padding: "0 12px", background: theme.bg.input, color: theme.text.primary, border: `1px solid ${theme.border.divider}`, cursor: "pointer" }}>
+          Cancel
+        </button>
+        <button onClick={confirm} style={{ height: 28, padding: "0 12px", background: theme.bg.active, color: "#FFFFFF", border: `1px solid ${theme.accent}`, cursor: "pointer" }}>
+          {confirmLabel}
+        </button>
+      </div>
+    </DialogShell>
   );
 }

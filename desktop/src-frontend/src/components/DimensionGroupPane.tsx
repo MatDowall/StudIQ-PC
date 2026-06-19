@@ -136,7 +136,7 @@ function DimensionTreeRow({
   // selected/loaded.
   const displayName = node.framing_size ? `${node.name} - ${node.framing_size.replace("x", " × ")}` : node.name;
   // Itemised framing components shown as read-only child rows beneath a loaded framing group.
-  // Split into matching-size components (normal rows) and override-size lintels (sub-quantity rows).
+  // Lintels (always sizeOverride) are split into separate sub-quantity rows below the main build-up.
   const framingBreakdown = node.node_type === "dimension_group" ? groupFramingBreakdowns[node.id] : undefined;
   const framingComponentRows = framingBreakdown
     ? framingBreakdown.components
@@ -147,7 +147,7 @@ function DimensionTreeRow({
           total: c.totalM,
         }))
     : [];
-  // Non-matching lintel sizes — each is a separate orderable timber size (future worksheet rows).
+  // Lintels — always separate rows, each showing their size (e.g. "Lintels - 90 × 45").
   const framingOverrideRows = framingBreakdown
     ? framingBreakdown.components
         .filter((c) => !!c.sizeOverride)

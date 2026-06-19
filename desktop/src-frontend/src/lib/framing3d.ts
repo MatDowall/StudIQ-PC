@@ -42,3 +42,13 @@ export function computeWall3D(
     wedge: m.wedge,
   }));
 }
+
+/** Shifts members up by `offsetM` along world Y — applies a dimension group's
+ *  `default_offset` (height above datum) in the 3D view. */
+export function offsetMembers(members: Member3D[], offsetM: number): Member3D[] {
+  if (!offsetM) return members;
+  return members.map((m) => ({
+    ...m,
+    position: [m.position[0], m.position[1] + offsetM, m.position[2]],
+  }));
+}

@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useAppStore } from "../store/appStore";
 import { theme } from "../theme";
+import { DialogShell } from "./DialogShell";
 
 const STATUS_OPTIONS = ["Tendering", "Closed"];
 
@@ -53,57 +54,19 @@ export function ProjectInfoDialog({ initial, onCancel, onConfirm }: Props) {
   };
 
   return (
-    <div
-      style={{
-        position: "fixed",
-        inset: 0,
-        background: "rgba(0,0,0,0.55)",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        zIndex: 9000,
-      }}
-      onClick={(e) => { if (e.target === e.currentTarget) onCancel(); }}
-    >
-      <div
-        style={{
-          background: theme.bg.pane,
-          border: `1px solid ${theme.border.divider}`,
-          padding: 24,
-          width: 400,
-          display: "flex",
-          flexDirection: "column",
-          gap: 16,
-          fontFamily: "Segoe UI, sans-serif",
-          color: theme.text.primary,
-        }}
-      >
-        <h2 style={{ margin: 0, fontSize: 16, fontWeight: 500 }}>Project Information</h2>
-
+    <DialogShell title="Project Information" width={400} zIndex={9000} onClose={onCancel}>
+      <div style={{ display: "flex", flexDirection: "column", gap: 16, padding: 16 }}>
         <div>
           <label style={labelStyle}>Project Name</label>
-          <input
-            style={inputStyle}
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            autoFocus
-          />
+          <input style={inputStyle} value={name} onChange={(e) => setName(e.target.value)} autoFocus />
         </div>
         <div>
           <label style={labelStyle}>Client</label>
-          <input
-            style={inputStyle}
-            value={client}
-            onChange={(e) => setClient(e.target.value)}
-          />
+          <input style={inputStyle} value={client} onChange={(e) => setClient(e.target.value)} />
         </div>
         <div>
           <label style={labelStyle}>Contract Number</label>
-          <input
-            style={inputStyle}
-            value={contractNumber}
-            onChange={(e) => setContractNumber(e.target.value)}
-          />
+          <input style={inputStyle} value={contractNumber} onChange={(e) => setContractNumber(e.target.value)} />
         </div>
         <div>
           <label style={labelStyle}>Status</label>
@@ -154,6 +117,6 @@ export function ProjectInfoDialog({ initial, onCancel, onConfirm }: Props) {
           </button>
         </div>
       </div>
-    </div>
+    </DialogShell>
   );
 }

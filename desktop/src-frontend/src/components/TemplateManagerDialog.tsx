@@ -1,9 +1,9 @@
 import { useEffect, useState } from "react";
-import { createPortal } from "react-dom";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { useAppStore } from "../store/appStore";
 import { theme } from "../theme";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { DialogShell } from "./DialogShell";
 import { NewTemplateDialog } from "./NewTemplateDialog";
 import { TextInputDialog } from "./TextInputDialog";
 
@@ -74,252 +74,214 @@ export function TemplateManagerDialog() {
     }
   }
 
-  return createPortal(
+  return (
     <>
-      <div
-        style={{
-          position: "fixed",
-          inset: 0,
-          zIndex: 1240,
-          display: "grid",
-          placeItems: "center",
-          background: "rgba(0, 0, 0, 0.45)",
-        }}
-      >
-        <div
-          role="dialog"
-          aria-modal="true"
-          style={{
-            width: 560,
-            maxWidth: "calc(100vw - 40px)",
-            background: theme.bg.pane,
-            border: `1px solid ${theme.border.divider}`,
-            boxShadow: "0 18px 48px rgba(0, 0, 0, 0.45)",
-            color: theme.text.primary,
-            fontFamily: "Segoe UI, sans-serif",
-          }}
-        >
-          <div
-            style={{
-              height: 38,
-              display: "flex",
-              alignItems: "center",
-              padding: "0 12px",
-              background: theme.bg.ribbon,
-              borderBottom: `1px solid ${theme.border.subtle}`,
-              fontSize: 13,
-              fontWeight: 600,
-            }}
-          >
-            Template Manager
-          </div>
-
-          <div style={{ padding: 12, display: "flex", gap: 12 }}>
-            {/* Template list */}
-            <div style={{ width: 200, flexShrink: 0 }}>
-              <div
-                style={{
-                  height: 220,
-                  overflow: "auto",
-                  border: `1px solid ${theme.border.subtle}`,
-                  background: theme.bg.shell,
-                  marginBottom: 8,
-                }}
-              >
-                {templates.length === 0 ? (
-                  <div style={{ padding: 8, color: theme.text.secondary, fontSize: 12 }}>No templates yet</div>
-                ) : (
-                  templates.map((t) => (
-                    <button
-                      key={t.id}
-                      onClick={() => setSelectedId(t.id)}
-                      style={{
-                        display: "block",
-                        width: "100%",
-                        height: 26,
-                        padding: "0 8px",
-                        border: "none",
-                        background: t.id === selectedId ? theme.bg.active : "transparent",
-                        color: t.id === selectedId ? "#FFFFFF" : theme.text.primary,
-                        textAlign: "left",
-                        cursor: "pointer",
-                        fontSize: 12,
-                        overflow: "hidden",
-                        textOverflow: "ellipsis",
-                        whiteSpace: "nowrap",
-                      }}
-                    >
-                      {t.name}
-                    </button>
-                  ))
-                )}
-              </div>
-              <button
-                onClick={() => setCreating(true)}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  gap: 4,
-                  width: "100%",
-                  height: 28,
-                  padding: "0 12px",
-                  background: theme.bg.input,
-                  color: theme.text.primary,
-                  border: `1px solid ${theme.border.divider}`,
-                  cursor: "pointer",
-                  fontSize: 12,
-                  marginBottom: 6,
-                }}
-              >
-                <span className="material-symbols-outlined" style={{ fontSize: 16 }}>add</span>
-                New Template
-              </button>
-              <button
-                onClick={() => void handleImport()}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  gap: 4,
-                  width: "100%",
-                  height: 28,
-                  padding: "0 12px",
-                  background: theme.bg.input,
-                  color: theme.text.primary,
-                  border: `1px solid ${theme.border.divider}`,
-                  cursor: "pointer",
-                  fontSize: 12,
-                }}
-              >
-                <span className="material-symbols-outlined" style={{ fontSize: 16 }}>upload</span>
-                Import...
-              </button>
-            </div>
-
-            {/* Detail panel */}
-            <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
-              {selected ? (
-                <>
-                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
-                    <div style={{ flex: 1, fontSize: 14, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                      {selected.name}
-                    </div>
-                    <button
-                      title="Export"
-                      onClick={() => void handleExport()}
-                      style={{
-                        display: "flex", alignItems: "center", justifyContent: "center",
-                        width: 28, height: 28, padding: 0,
-                        background: theme.bg.input, color: theme.text.primary,
-                        border: `1px solid ${theme.border.divider}`, cursor: "pointer",
-                      }}
-                    >
-                      <span className="material-symbols-outlined" style={{ fontSize: 16 }}>download</span>
-                    </button>
-                    <button
-                      title="Rename"
-                      onClick={() => setRenaming(true)}
-                      style={{
-                        display: "flex", alignItems: "center", justifyContent: "center",
-                        width: 28, height: 28, padding: 0,
-                        background: theme.bg.input, color: theme.text.primary,
-                        border: `1px solid ${theme.border.divider}`, cursor: "pointer",
-                      }}
-                    >
-                      <span className="material-symbols-outlined" style={{ fontSize: 16 }}>edit</span>
-                    </button>
-                    <button
-                      title="Delete"
-                      onClick={() => setConfirmDeleteId(selected.id)}
-                      style={{
-                        display: "flex", alignItems: "center", justifyContent: "center",
-                        width: 28, height: 28, padding: 0,
-                        background: theme.bg.input, color: theme.text.primary,
-                        border: `1px solid ${theme.border.divider}`, cursor: "pointer",
-                      }}
-                    >
-                      <span className="material-symbols-outlined" style={{ fontSize: 16 }}>delete</span>
-                    </button>
-                  </div>
-
-                  <div style={{ fontSize: 11, color: theme.text.secondary, marginBottom: 8 }}>
-                    Created {selected.created_at}
-                  </div>
-
-                  <label style={{ display: "block", marginBottom: 4, color: theme.text.secondary, fontSize: 12 }}>Description</label>
-                  <textarea
-                    value={description}
-                    onChange={(event) => setDescription(event.target.value)}
-                    onBlur={handleSaveDescription}
-                    rows={4}
-                    style={{
-                      boxSizing: "border-box",
-                      width: "100%",
-                      padding: "6px 8px",
-                      background: theme.bg.input,
-                      color: theme.text.primary,
-                      border: `1px solid ${theme.border.divider}`,
-                      outline: "none",
-                      fontSize: 13,
-                      fontFamily: "inherit",
-                      resize: "vertical",
-                      marginBottom: 12,
-                    }}
-                  />
-
+      <DialogShell title="Template Manager" width={560} zIndex={1240} onClose={closeTemplateManager}>
+        <div style={{ padding: 12, display: "flex", gap: 12 }}>
+          {/* Template list */}
+          <div style={{ width: 200, flexShrink: 0 }}>
+            <div
+              style={{
+                height: 220,
+                overflow: "auto",
+                border: `1px solid ${theme.border.subtle}`,
+                background: theme.bg.shell,
+                marginBottom: 8,
+              }}
+            >
+              {templates.length === 0 ? (
+                <div style={{ padding: 8, color: theme.text.secondary, fontSize: 12 }}>No templates yet</div>
+              ) : (
+                templates.map((t) => (
                   <button
-                    onClick={() => enterTemplateEdit(selected)}
+                    key={t.id}
+                    onClick={() => setSelectedId(t.id)}
                     style={{
-                      display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
-                      height: 30, padding: "0 12px",
-                      background: theme.bg.active, color: "#FFFFFF",
-                      border: `1px solid ${theme.accent}`, cursor: "pointer", fontSize: 12,
+                      display: "block",
+                      width: "100%",
+                      height: 26,
+                      padding: "0 8px",
+                      border: "none",
+                      background: t.id === selectedId ? theme.bg.active : "transparent",
+                      color: t.id === selectedId ? "#FFFFFF" : theme.text.primary,
+                      textAlign: "left",
+                      cursor: "pointer",
+                      fontSize: 12,
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
                     }}
                   >
-                    <span className="material-symbols-outlined" style={{ fontSize: 16 }}>edit_document</span>
-                    Edit Template
+                    {t.name}
                   </button>
-                </>
-              ) : (
-                <div style={{ color: theme.text.secondary, fontSize: 12, padding: 8 }}>
-                  Select a template to view or edit its details, or create a new one.
-                </div>
+                ))
               )}
             </div>
-          </div>
-
-          {error && (
-            <div style={{ padding: "0 12px 8px", color: theme.danger, fontSize: 12 }}>
-              {error}
-            </div>
-          )}
-
-          <div
-            style={{
-              display: "flex",
-              justifyContent: "flex-end",
-              gap: 8,
-              padding: "10px 12px",
-              borderTop: `1px solid ${theme.border.subtle}`,
-            }}
-          >
             <button
-              onClick={closeTemplateManager}
+              onClick={() => setCreating(true)}
               style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                gap: 4,
+                width: "100%",
                 height: 28,
                 padding: "0 12px",
                 background: theme.bg.input,
                 color: theme.text.primary,
                 border: `1px solid ${theme.border.divider}`,
                 cursor: "pointer",
+                fontSize: 12,
+                marginBottom: 6,
               }}
             >
-              Close
+              <span className="material-symbols-outlined" style={{ fontSize: 16 }}>add</span>
+              New Template
+            </button>
+            <button
+              onClick={() => void handleImport()}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                gap: 4,
+                width: "100%",
+                height: 28,
+                padding: "0 12px",
+                background: theme.bg.input,
+                color: theme.text.primary,
+                border: `1px solid ${theme.border.divider}`,
+                cursor: "pointer",
+                fontSize: 12,
+              }}
+            >
+              <span className="material-symbols-outlined" style={{ fontSize: 16 }}>upload</span>
+              Import...
             </button>
           </div>
+
+          {/* Detail panel */}
+          <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
+            {selected ? (
+              <>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                  <div style={{ flex: 1, fontSize: 14, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {selected.name}
+                  </div>
+                  <button
+                    title="Export"
+                    onClick={() => void handleExport()}
+                    style={{
+                      display: "flex", alignItems: "center", justifyContent: "center",
+                      width: 28, height: 28, padding: 0,
+                      background: theme.bg.input, color: theme.text.primary,
+                      border: `1px solid ${theme.border.divider}`, cursor: "pointer",
+                    }}
+                  >
+                    <span className="material-symbols-outlined" style={{ fontSize: 16 }}>download</span>
+                  </button>
+                  <button
+                    title="Rename"
+                    onClick={() => setRenaming(true)}
+                    style={{
+                      display: "flex", alignItems: "center", justifyContent: "center",
+                      width: 28, height: 28, padding: 0,
+                      background: theme.bg.input, color: theme.text.primary,
+                      border: `1px solid ${theme.border.divider}`, cursor: "pointer",
+                    }}
+                  >
+                    <span className="material-symbols-outlined" style={{ fontSize: 16 }}>edit</span>
+                  </button>
+                  <button
+                    title="Delete"
+                    onClick={() => setConfirmDeleteId(selected.id)}
+                    style={{
+                      display: "flex", alignItems: "center", justifyContent: "center",
+                      width: 28, height: 28, padding: 0,
+                      background: theme.bg.input, color: theme.text.primary,
+                      border: `1px solid ${theme.border.divider}`, cursor: "pointer",
+                    }}
+                  >
+                    <span className="material-symbols-outlined" style={{ fontSize: 16 }}>delete</span>
+                  </button>
+                </div>
+
+                <div style={{ fontSize: 11, color: theme.text.secondary, marginBottom: 8 }}>
+                  Created {selected.created_at}
+                </div>
+
+                <label style={{ display: "block", marginBottom: 4, color: theme.text.secondary, fontSize: 12 }}>Description</label>
+                <textarea
+                  value={description}
+                  onChange={(event) => setDescription(event.target.value)}
+                  onBlur={handleSaveDescription}
+                  rows={4}
+                  style={{
+                    boxSizing: "border-box",
+                    width: "100%",
+                    padding: "6px 8px",
+                    background: theme.bg.input,
+                    color: theme.text.primary,
+                    border: `1px solid ${theme.border.divider}`,
+                    outline: "none",
+                    fontSize: 13,
+                    fontFamily: "inherit",
+                    resize: "vertical",
+                    marginBottom: 12,
+                  }}
+                />
+
+                <button
+                  onClick={() => enterTemplateEdit(selected)}
+                  style={{
+                    display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
+                    height: 30, padding: "0 12px",
+                    background: theme.bg.active, color: "#FFFFFF",
+                    border: `1px solid ${theme.accent}`, cursor: "pointer", fontSize: 12,
+                  }}
+                >
+                  <span className="material-symbols-outlined" style={{ fontSize: 16 }}>edit_document</span>
+                  Edit Template
+                </button>
+              </>
+            ) : (
+              <div style={{ color: theme.text.secondary, fontSize: 12, padding: 8 }}>
+                Select a template to view or edit its details, or create a new one.
+              </div>
+            )}
+          </div>
         </div>
-      </div>
+
+        {error && (
+          <div style={{ padding: "0 12px 8px", color: theme.danger, fontSize: 12 }}>
+            {error}
+          </div>
+        )}
+
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "flex-end",
+            gap: 8,
+            padding: "10px 12px",
+            borderTop: `1px solid ${theme.border.subtle}`,
+          }}
+        >
+          <button
+            onClick={closeTemplateManager}
+            style={{
+              height: 28,
+              padding: "0 12px",
+              background: theme.bg.input,
+              color: theme.text.primary,
+              border: `1px solid ${theme.border.divider}`,
+              cursor: "pointer",
+            }}
+          >
+            Close
+          </button>
+        </div>
+      </DialogShell>
 
       {creating && (
         <NewTemplateDialog
@@ -359,7 +321,6 @@ export function TemplateManagerDialog() {
           }}
         />
       )}
-    </>,
-    document.body,
+    </>
   );
 }

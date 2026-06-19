@@ -7,7 +7,7 @@ import { FramingBreakdownPanel } from "./FramingBreakdownPanel";
 import { OpeningDialog } from "./OpeningDialog";
 import { Framing3DView, type Framing3DPage } from "./Framing3DView";
 import { DEFAULT_DOOR, DEFAULT_WINDOW, parseFramingSettings, parseWallFraming, type OpeningTemplate } from "../lib/framing";
-import { computeWall3D, type Member3D } from "../lib/framing3d";
+import { computeWall3D, offsetMembers, type Member3D } from "../lib/framing3d";
 
 export function Viewer() {
   const [doc, setDoc] = useState<DocumentMeta | null>(null);
@@ -74,7 +74,8 @@ export function Viewer() {
       }
       if (!Array.isArray(pts) || pts.length < 2) continue;
       const settings = parseFramingSettings(groupProps[mz.dimension_group_id]?.framing_props_json ?? null);
-      out.push(...computeWall3D(pts, settings, mmpp, parseWallFraming(mz.framing_json)));
+      const offsetM = groupProps[mz.dimension_group_id]?.default_offset ?? 0;
+      out.push(...offsetMembers(computeWall3D(pts, settings, mmpp, parseWallFraming(mz.framing_json)), offsetM));
     }
     return out;
   }, [view3d, overlayMeasurements, groupProps, pageScale, pageIndex]);
@@ -126,7 +127,7 @@ export function Viewer() {
               continue;
             }
             if (!Array.isArray(pts) || pts.length < 2) continue;
-            out.push(...computeWall3D(pts, settings, p.mmPerPoint, parseWallFraming(mz.framing_json)));
+            out.push(...offsetMembers(computeWall3D(pts, settings, p.mmPerPoint, parseWallFraming(mz.framing_json)), g.defaultOffsetM));
           }
         }
         const S = p.mmPerPoint ? p.mmPerPoint / 1000 : null;
@@ -190,11 +191,11 @@ export function Viewer() {
         style={{
           height: 42,
           padding: "0 10px",
-          background: "#2b2d31",
+          background: theme.bg.ribbon,
           display: "flex",
           gap: 12,
           alignItems: "center",
-          borderBottom: "1px solid #3c4048",
+          borderBottom: `1px solid ${theme.border.subtle}`,
           flexShrink: 0,
         }}
       >

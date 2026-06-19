@@ -112,22 +112,23 @@ snap settings UI, perpendicular/nearest-edge/arc snap, dimension cutouts.
 ### Timber framing: one quantity per framing size
 
 A framing dimension group has a single `framingSize` (e.g. 90×45). Its **canonical quantity is
-`matchingTotalM`** — the sum of all components whose `sizeOverride` is absent (i.e. timber that
-matches the group's own size). This is what the group header displays.
+`matchingTotalM`** — the sum of all non-lintel components (plates, studs, dwangs, kings,
+trimmers, jacks, sills, sill jacks). This is what the group header displays.
 
-Lintels with a *different* size (e.g. a 140×45 lintel in a 90×45 group) are excluded from
-`matchingTotalM` and shown as **virtual sub-quantity rows** below the component breakdown — visually
-distinct, with their own total.
+**Lintels are always their own separate quantity**, regardless of whether their size matches
+the group's `framingSize`. They are excluded from `matchingTotalM` and shown as **virtual
+sub-quantity rows** below the component breakdown — visually distinct, with their own total per
+lintel size.
 
-**Worksheet implication (not yet built):** when a framing group is dragged onto a takeoff
-worksheet it must emit **one row per distinct framing size present**:
-- One row for `!sizeOverride` components → quantity = `matchingTotalM`, size = group's `framingSize`
-- One row per unique `sizeOverride` value → quantity = sum of that override's `totalM`
+**Worksheet implication:** when a framing group is dragged onto a takeoff worksheet it emits:
+- One row for non-lintel components → quantity = `matchingTotalM`, size = group's `framingSize`
+- One row per distinct lintel size present → quantity = sum of that size's lintel `totalM`
 
 Never use `FramingGroupBreakdown.totalM` as the worksheet quantity — it combines all sizes.
 
-The `sizeOverride` field on `FramingComponent` / `FramingComponentTotal` drives all of this: it
-is set only when a lintel's size differs from the group's `framingSize`.
+The `sizeOverride` field on `FramingComponent` / `FramingComponentTotal` is **always set on
+lintel members** (to the lintel's own `FramingSize`) and absent on all other member kinds. This
+is the key that excludes lintels from `matchingTotalM` and marks them for separate worksheet rows.
 
 ## Docs & process
 
