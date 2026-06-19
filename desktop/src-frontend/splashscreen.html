@@ -35,12 +35,25 @@
         font-size: 13px;
         letter-spacing: 0.04em;
       }
+      .splash .version {
+        margin-top: 4px;
+        color: #555555;
+        font-size: 11px;
+        letter-spacing: 0.04em;
+      }
     </style>
   </head>
   <body>
     <div class="splash">
       <img src="/studiq-logo.png" alt="StudIQ" />
       <p>Loading...</p>
+      <div class="version" id="version"></div>
     </div>
+    <script type="module">
+      import { getVersion } from "@tauri-apps/api/app";
+      getVersion().then((v) => {
+        document.getElementById("version").textContent = "v" + v;
+      });
+    </script>
   </body>
 </html>

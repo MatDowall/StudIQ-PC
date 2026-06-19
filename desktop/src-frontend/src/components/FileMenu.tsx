@@ -6,6 +6,7 @@ import { useAppStore } from "../store/appStore";
 import { ProjectInfoDialog } from "./ProjectInfoDialog";
 import { ErrorDialog } from "./ErrorDialog";
 import { RateConstantsDialog } from "./RateConstantsDialog";
+import { AboutDialog } from "./AboutDialog";
 
 function Icon({ name, size = 16 }: { name: string; size?: number }) {
   return (
@@ -104,6 +105,7 @@ export function FileMenu() {
   const [menuPos, setMenuPos] = useState<{ top: number; left: number } | null>(null);
   const [showProjectInfo, setShowProjectInfo] = useState(false);
   const [showRateLibrary, setShowRateLibrary] = useState(false);
+  const [showAbout, setShowAbout] = useState(false);
   const [status, setStatus] = useState("");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const wrapperRef = useRef<HTMLDivElement>(null);
@@ -198,6 +200,8 @@ export function FileMenu() {
     { divider: true, label: "", enabled: false },
     { label: lightMode ? "Dark Mode" : "Light Mode", icon: lightMode ? "dark_mode" : "light_mode", enabled: true, onClick: () => setLightMode(!lightMode) },
     { divider: true, label: "", enabled: false },
+    { label: "About StudIQ", icon: "info", enabled: true, onClick: () => setShowAbout(true) },
+    { divider: true, label: "", enabled: false },
     { label: "Close Project", enabled: !!activeProject, onClick: () => { void closeProject(); } },
   ];
 
@@ -265,6 +269,7 @@ export function FileMenu() {
         <ErrorDialog title="Error" body={errorMessage} onDismiss={() => setErrorMessage(null)} />
       ) : null}
       {showRateLibrary && <RateConstantsDialog onClose={() => setShowRateLibrary(false)} />}
+      {showAbout && <AboutDialog onClose={() => setShowAbout(false)} />}
     </div>
   );
 }

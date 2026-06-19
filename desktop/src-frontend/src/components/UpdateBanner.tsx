@@ -1,56 +1,17 @@
 import { useEffect, useState } from "react";
-import { check, type Update } from "@tauri-apps/plugin-updater";
-import { relaunch } from "@tauri-apps/plugin-process";
 import { theme } from "../theme";
-
-type UpdateState = "idle" | "available" | "downloading" | "ready" | "error";
+import { useUpdateChecker } from "../lib/updater";
 
 export function UpdateBanner() {
-  const [update, setUpdate] = useState<Update | null>(null);
-  const [state, setState] = useState<UpdateState>("idle");
-  const [progress, setProgress] = useState(0);
+  const { update, state, progress, checkForUpdate, installUpdate } = useUpdateChecker();
   const [dismissed, setDismissed] = useState(false);
 
   useEffect(() => {
-    check()
-      .then((result) => {
-        if (result) {
-          setUpdate(result);
-          setState("available");
-        }
-      })
-      .catch((error) => {
-        console.error("Update check failed", error);
-      });
-  }, []);
+    void checkForUpdate();
+  }, [checkForUpdate]);
 
-  if (!update || state === "idle" || dismissed) return null;
-
-  async function install() {
-    if (!update) return;
-    setState("downloading");
-    let downloaded = 0;
-    let total = 0;
-    try {
-      await update.downloadAndInstall((event) => {
-        switch (event.event) {
-          case "Started":
-            total = event.data.contentLength ?? 0;
-            break;
-          case "Progress":
-            downloaded += event.data.chunkLength;
-            setProgress(total > 0 ? Math.round((downloaded / total) * 100) : 0);
-            break;
-          case "Finished":
-            setState("ready");
-            break;
-        }
-      });
-      await relaunch();
-    } catch (error) {
-      console.error("Update install failed", error);
-      setState("error");
-    }
+  if (!update || state === "idle" || state === "checking" || state === "up-to-date" || dismissed) {
+    return null;
   }
 
   return (
@@ -93,7 +54,7 @@ export function UpdateBanner() {
               Later
             </button>
             <button
-              onClick={install}
+              onClick={() => void installUpdate()}
               style={{
                 background: theme.accent,
                 border: "none",
@@ -109,11 +70,7 @@ export function UpdateBanner() {
           </div>
         </>
       )}
-      {state === "downloading" && (
-        <div>
-          Downloading update… {progress}%
-        </div>
-      )}
+      {state === "downloading" && <div>Downloading update… {progress}%</div>}
       {state === "ready" && <div>Update ready — restarting…</div>}
       {state === "error" && (
         <div style={{ color: theme.danger }}>Update failed. Try again later.</div>
