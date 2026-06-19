@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "StudIQ",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "identifier": "com.takeitoff.app",
   "build": {
     "frontendDist": "src-frontend/dist",
@@ -88,5 +88,13 @@
         "description": "StudIQ Workbook Template"
       }
     ]
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/MatDowall/StudIQ-PC/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDVDNjBGRTEyQzUxMEM0NEIKUldSTHhCREZFdjVnWEg0ekV3RkNET1VUT2RsLzQrbUVwSGI3cnlHdDN3WjJneW0xZHhWTk1MNjYK"
+    }
   }
 }

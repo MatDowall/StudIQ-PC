@@ -7,6 +7,7 @@ import { Viewer } from "./components/Viewer";
 import { WorkbookView } from "./components/WorkbookView";
 import { ProjectMeta, useAppStore } from "./store/appStore";
 import { TitleBar } from "./components/TitleBar";
+import { UpdateBanner } from "./components/UpdateBanner";
 import { startBridgeListener } from "./lib/bridge";
 import { theme } from "./theme";
 
@@ -63,6 +64,7 @@ export default function App() {
         <div style={{ flex: 1, minHeight: 0, overflow: "hidden" }}>
           <StartScreen />
         </div>
+        <UpdateBanner />
       </div>
     );
   }
@@ -174,6 +176,7 @@ export default function App() {
         )}
       </div>
     </div>
+    <UpdateBanner />
     </div>
   );
 }
