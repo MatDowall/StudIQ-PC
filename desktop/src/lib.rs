@@ -4206,6 +4206,12 @@ async fn get_tree_node(pool: &SqlitePool, node_id: i64) -> Result<TreeNodeDto, S
 }
 
 pub fn run() {
+    // Two TLS-using dependency chains (the bridge's tokio-rustls server and the
+    // updater's reqwest client) pull in both the "ring" and "aws-lc-rs" crypto
+    // backends, leaving rustls unable to pick a default automatically. Install
+    // one explicitly before either is used.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     tracing_subscriber::fmt::init();
 
     tauri::Builder::default()

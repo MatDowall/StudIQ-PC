@@ -974,6 +974,7 @@ dependencies = [
  "hyper-util",
  "parking_lot",
  "rcgen",
+ "rustls",
  "rustls-pemfile",
  "serde",
  "serde_json",
