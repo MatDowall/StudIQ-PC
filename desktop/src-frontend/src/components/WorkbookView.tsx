@@ -565,6 +565,28 @@ function sumComputedCol(computedData: unknown[][], colIndex: number): number | n
   return hasData ? total : null;
 }
 
+/**
+ * Evaluates a sheet's raw source rows (formula strings and all) in a standalone,
+ * throwaway HyperFormula instance — needed to roll up a freshly-cloned Rate
+ * Build-up sheet's Lab/Mat/Sub/Sum columns live, right after the clone is written
+ * in memory (there is no live HotTable instance for that not-yet-displayed sheet
+ * to read evaluated values from). A plain `parseFloat` over the raw strings would
+ * miss any cell entered as a formula (e.g. a rate looked up from the Rates list,
+ * or F/H's own `=E×C`/`=F×G`) — those only resolve to a real number once evaluated,
+ * exactly as they would the moment a live grid loads this sheet.
+ */
+function evaluateClonedRows(data: (string | null)[][]): unknown[][] {
+  let hf: HyperFormula | null = null;
+  try {
+    hf = HyperFormula.buildFromArray(dataForHot(data), { licenseKey: "gpl-v3" });
+    return hf.getSheetValues(0);
+  } catch {
+    return data;
+  } finally {
+    hf?.destroy();
+  }
+}
+
 /** Coerce a cell value (number, numeric string, formula string, null) to a finite number, defaulting to 0. */
 function toNum(v: unknown): number {
   if (typeof v === "number") return isFinite(v) ? v : 0;
@@ -775,6 +797,18 @@ export function WorkbookView() {
   // Last grid cell that had selection focus — used to sync formula bar edits
   // back to the cell even after focus moves to the input element.
   const lastSelectedCellRef = useRef<{ row: number; col: number } | null>(null);
+
+  // Most recent Ctrl+C/copy selection — used by afterPaste to detect "an E:Rate
+  // cell was copied" so the paste can clone that row's Rate Build-up sheet onto
+  // the destination row (see maybeCloneRateBuildupSheet).
+  const lastRateCopyRef = useRef<{
+    path: string;
+    level: Level;
+    startRow: number;
+    startCol: number;
+    rowCount: number;
+    colCount: number;
+  } | null>(null);
 
   // Excel-style status bar stats for the current selection
   const [selectionStats, setSelectionStats] = useState<{ count: number; sum: number; average: number } | null>(null);
@@ -2473,6 +2507,100 @@ export function WorkbookView() {
     }
   }
 
+  /**
+   * Clones a row's child Rate Build-up sheet onto another row's, completely
+   * independent of the original — invoked from afterPaste when a copied E:Rate
+   * value is pasted into a different row's E:Rate cell. Rate Build-up sheets are
+   * leaves (level 3 has no drill columns — see isDrillColumn), so this is a
+   * single-level deep clone of data + styles + links + exclusions; no recursive
+   * descendant walk is needed.
+   *
+   * A no-op if the source row was never drilled into — nothing exists to clone,
+   * so the plain pasted number is left to stand on its own.
+   */
+  async function maybeCloneRateBuildupSheet(srcPath: string, dstPath: string): Promise<void> {
+    if (srcPath === dstPath) return;
+    const revId = revIdRef.current;
+
+    let srcData = sheetDataMap.current.get(srcPath);
+    if (!srcData) {
+      if (revId == null) return;
+      try {
+        const json = await invoke<string>("load_workbook_sheet", { revisionId: revId, sheetPath: srcPath });
+        if (!json || json === "[]") return;
+        srcData = padData(JSON.parse(json) as (string | null)[][]);
+      } catch {
+        return;
+      }
+      await Promise.all([
+        ensureSheetStylesLoaded(revId, srcPath),
+        ensureSheetLinksLoaded(revId, srcPath),
+        ensureSheetExclusionsLoaded(revId, srcPath),
+      ]);
+    }
+
+    // Clean overwrite: drop whatever was already cached/persisted at the destination
+    // first, so the clone is fully independent of any prior content there.
+    purgeCachedSubtree(dstPath);
+    if (revId != null) {
+      invoke("delete_workbook_sheet_subtree", { revisionId: revId, sheetPath: dstPath }).catch(() => {/* non-fatal */});
+    }
+
+    const cloned = cloneSheetData(srcData);
+    sheetDataMap.current.set(dstPath, cloned);
+
+    const clonedStyles = cloneStyleMap(cellStyleMap.current.get(srcPath));
+    if (clonedStyles) cellStyleMap.current.set(dstPath, clonedStyles);
+
+    const srcLinks = cellLinkMap.current.get(srcPath);
+    if (srcLinks && srcLinks.size > 0) cellLinkMap.current.set(dstPath, new Map(srcLinks));
+
+    const srcExcl = cellExclusionMap.current.get(srcPath);
+    if (srcExcl && srcExcl.size > 0) cellExclusionMap.current.set(dstPath, new Set(srcExcl));
+
+    loadedStylePathsRef.current.add(dstPath);
+    loadedLinkPathsRef.current.add(dstPath);
+    loadedExclusionPathsRef.current.add(dstPath);
+
+    if (revId != null) persistSheet(revId, dstPath, cloned);
+
+    // Live-update the parent row's I/K/M/O (Lab/Mat/Sub/Sum) and J/L/N/P (…-Total)
+    // columns right now — the same pull-through rollup drillUp performs on leaving
+    // a Rate Build-up sheet — so the paste shows up immediately instead of only
+    // after the user manually drills into the new row and back out again.
+    const parentPath  = dstPath.slice(0, dstPath.lastIndexOf("/"));
+    const rowInParent  = pathLastRow(dstPath);
+    const hot = hotRef.current?.hotInstance;
+    if (hot && rowInParent != null && curSheetPath() === parentPath) {
+      const computedRows = evaluateClonedRows(cloned);
+      const pullThroughCols: Array<[number, number]> = [
+        [COL_LAB, COL_LAB_TOTAL],
+        [COL_MAT, COL_MAT_TOTAL],
+        [COL_SUB, COL_SUB_TOTAL],
+        [COL_SUM, COL_SUM_TOTAL],
+      ];
+      const pass: Array<[number, number, string | null]> = [];
+      for (const [src, total] of pullThroughCols) {
+        const s = sumComputedCol(computedRows, src);
+        if (!isCellExcluded(parentPath, rowInParent, src)) pass.push([rowInParent, src, s !== null ? String(s) : null]);
+        if (!isCellExcluded(parentPath, rowInParent, total)) {
+          pass.push([rowInParent, total, s !== null ? `=${COLUMNS[src].letter}${rowInParent + 1}*C${rowInParent + 1}` : null]);
+        }
+      }
+      if (pass.length) {
+        isAutoUpdatingRef.current = true;
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          hot.setDataAtCell(pass as any);
+        } finally {
+          isAutoUpdatingRef.current = false;
+        }
+        propagateLiveRollupRef.current();
+        refreshProjectTotal();
+      }
+    }
+  }
+
   /** Reset the whole view back to a blank Level 1 sheet (in-memory only). */
   /**
    * Switches the grid to an arbitrary fixed sheet path at a given level, with no
@@ -2731,6 +2859,55 @@ export function WorkbookView() {
           setSelectionStats({ count: numCount, sum, average: sum / numCount });
         } else {
           setSelectionStats(null);
+        }
+      }
+    },
+
+    // Remembers the copied selection so afterPaste can tell whether an E:Rate
+    // cell was part of it — see lastRateCopyRef / maybeCloneRateBuildupSheet.
+    afterCopy(
+      _data: unknown[][],
+      coords: Array<{ startRow: number; startCol: number; endRow: number; endCol: number }>,
+    ) {
+      const r0 = coords?.[0];
+      if (!r0) return;
+      lastRateCopyRef.current = {
+        path: curSheetPath(),
+        level: levelRef.current,
+        startRow: r0.startRow,
+        startCol: r0.startCol,
+        rowCount: r0.endRow - r0.startRow + 1,
+        colCount: r0.endCol - r0.startCol + 1,
+      };
+    },
+
+    // Pasting a copied E:Rate value into another row's E:Rate cell clones the
+    // source row's Rate Build-up sheet onto the destination row, so the rate
+    // (and its full Lab/Mat/Sub/Sum build-up) comes along independently of the
+    // original — rather than leaving the destination with just a bare number.
+    afterPaste(
+      _data: unknown[][],
+      coords: Array<{ startRow: number; startCol: number; endRow: number; endCol: number }>,
+    ) {
+      const copy = lastRateCopyRef.current;
+      if (!copy || copy.level !== 2 || levelRef.current !== 2) return;
+      const srcColOffset = COL_RATE - copy.startCol;
+      if (srcColOffset < 0 || srcColOffset >= copy.colCount) return;
+
+      const dstPath = curSheetPath();
+      for (const range of coords ?? []) {
+        for (let r = range.startRow; r <= range.endRow; r++) {
+          for (let c = range.startCol; c <= range.endCol; c++) {
+            if (c !== COL_RATE) continue;
+            const colOffsetInRange = ((c - range.startCol) % copy.colCount + copy.colCount) % copy.colCount;
+            if (colOffsetInRange !== srcColOffset) continue;
+            const rowOffsetInRange = ((r - range.startRow) % copy.rowCount + copy.rowCount) % copy.rowCount;
+            const srcRow = copy.startRow + rowOffsetInRange;
+            const srcChildPath = `${copy.path}/R${srcRow}`;
+            const dstChildPath = `${dstPath}/R${r}`;
+            if (srcChildPath === dstChildPath) continue;
+            void maybeCloneRateBuildupSheet(srcChildPath, dstChildPath);
+          }
         }
       }
     },
