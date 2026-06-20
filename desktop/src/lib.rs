@@ -2885,6 +2885,18 @@ async fn read_text_file(path: String) -> Result<String, String> {
     std::fs::read_to_string(&path).map_err(|e| format!("Failed to read file: {e}"))
 }
 
+/// Write a base64-encoded byte payload to disk — used for binary export formats
+/// (e.g. .xlsx) built in the frontend, where transferring raw bytes as a JSON
+/// number array over the Tauri IPC bridge would be far less compact.
+#[tauri::command]
+async fn write_binary_file(path: String, data_base64: String) -> Result<(), String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&data_base64)
+        .map_err(|e| format!("Failed to decode file data: {e}"))?;
+    std::fs::write(&path, bytes).map_err(|e| format!("Failed to write file: {e}"))
+}
+
 /// The sheet paths that make up a template's master sheets — see
 /// `create_workbook_revision_from_template` for why these four are special.
 const TEMPLATE_SHEET_PATHS: [&str; 4] =
@@ -4372,6 +4384,7 @@ pub fn run() {
             import_template,
             write_text_file,
             read_text_file,
+            write_binary_file,
             rename_workbook_sheet_subtree,
             bridge_respond,
             list_rates,

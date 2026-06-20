@@ -10,7 +10,8 @@ import "handsontable/styles/ht-theme-classic.css";
 import type Handsontable from "handsontable";
 import { HyperFormula } from "hyperformula";
 import { useAppStore, DEFAULT_WORKBOOK_FORMAT } from "../store/appStore";
-import type { WorkbookFormatApi, WorkbookGridApi } from "../store/appStore";
+import type { WorkbookFormatApi, WorkbookGridApi, FlattenExportLevels } from "../store/appStore";
+import ExcelJS from "exceljs";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { TemplateManagerDialog } from "./TemplateManagerDialog";
 import { ContextMenu } from "./ContextMenu";
@@ -592,6 +593,66 @@ function toNum(v: unknown): number {
   if (typeof v === "number") return isFinite(v) ? v : 0;
   if (typeof v === "string" && v !== "") { const n = parseFloat(v); if (isFinite(n)) return n; }
   return 0;
+}
+
+/** Coerce an *evaluated* cell value to a number, or `undefined` if the cell is blank —
+ *  used by the Excel flatten-export so empty cells stay empty rather than rendering as 0. */
+function numOrUndefined(v: unknown): number | undefined {
+  if (v == null || v === "") return undefined;
+  const n = typeof v === "number" ? v : parseFloat(String(v));
+  return isFinite(n) ? n : undefined;
+}
+
+/** Coerce an evaluated cell value to display text, or "" if blank. */
+function textOrBlank(v: unknown): string {
+  return v != null && v !== "" ? String(v) : "";
+}
+
+/** Base64-encode an ArrayBuffer in chunks (avoids call-stack limits from spreading huge byte arrays). */
+function arrayBufferToBase64(buf: ArrayBuffer): string {
+  const bytes = new Uint8Array(buf);
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+/** One output row of the flattened Excel export — see WorkbookGridApi.exportExcel. */
+interface FlatExportRow {
+  sectionCode: string;
+  sectionDesc: string;
+  code: string;
+  desc: string;
+  qty?: number;
+  unit: string;
+  rate?: number;
+  subtotal?: number;
+  factor?: number;
+  total?: number;
+  lab?: number;
+  labTotal?: number;
+  mat?: number;
+  matTotal?: number;
+  sub?: number;
+  subTotal?: number;
+  sum?: number;
+  sumTotal?: number;
+}
+
+/** Build one flattened export row from an evaluated sheet row (see `evaluateClonedRows`). */
+function flatExportRowFrom(evaluated: unknown[], sectionCode: string, sectionDesc: string): FlatExportRow {
+  return {
+    sectionCode, sectionDesc,
+    code: textOrBlank(evaluated[COL_CODE]), desc: textOrBlank(evaluated[COL_DESC]),
+    qty: numOrUndefined(evaluated[COL_QTY]), unit: textOrBlank(evaluated[COL_UNIT]), rate: numOrUndefined(evaluated[COL_RATE]),
+    subtotal: numOrUndefined(evaluated[COL_SUBTOTAL]), factor: numOrUndefined(evaluated[COL_FACTOR]), total: numOrUndefined(evaluated[COL_TOTAL]),
+    lab: numOrUndefined(evaluated[COL_LAB]), labTotal: numOrUndefined(evaluated[COL_LAB_TOTAL]),
+    mat: numOrUndefined(evaluated[COL_MAT]), matTotal: numOrUndefined(evaluated[COL_MAT_TOTAL]),
+    sub: numOrUndefined(evaluated[COL_SUB]), subTotal: numOrUndefined(evaluated[COL_SUB_TOTAL]),
+    sum: numOrUndefined(evaluated[COL_SUM]), sumTotal: numOrUndefined(evaluated[COL_SUM_TOTAL]),
+  };
 }
 
 // ─── Breadcrumb toolbar row ───────────────────────────────────────────────
@@ -1648,7 +1709,7 @@ export function WorkbookView() {
     addRow: () => {},
     insertAbove: () => {},
     insertBelow: () => {},
-    exportCsv: async () => {},
+    exportExcel: async (_levels: FlattenExportLevels) => {},
     print: () => {},
   });
 
@@ -1656,7 +1717,7 @@ export function WorkbookView() {
     addRow:       () => gridApiImplRef.current.addRow(),
     insertAbove:  () => gridApiImplRef.current.insertAbove(),
     insertBelow:  () => gridApiImplRef.current.insertBelow(),
-    exportCsv:    () => gridApiImplRef.current.exportCsv(),
+    exportExcel:  (levels) => gridApiImplRef.current.exportExcel(levels),
     print:        () => gridApiImplRef.current.print(),
   });
 
@@ -1892,32 +1953,103 @@ export function WorkbookView() {
       scheduleSaveRef.current();
     },
 
-    async exportCsv() {
+    async exportExcel(levels: FlattenExportLevels) {
       const hot = hotRef.current?.hotInstance;
-      if (!hot) return;
-      const kind = sheetKindForPath(curSheetPath());
-      const cols = kind === "qty" ? QTY_COLUMNS : COLUMNS;
-      const header = cols.map(c => c.label).join(",");
-      const rawData: unknown[][] = hot.getData() as unknown[][];
-      const lines: string[] = rawData
-        .filter(row => row.some(cell => cell != null && cell !== ""))
-        .map(row =>
-          cols.map((_c, i) => {
-            const val = row[i];
-            if (val == null || val === "") return "";
-            const s = String(val);
-            return s.includes(",") || s.includes('"') || s.includes("\n")
-              ? `"${s.replace(/"/g, '""')}"` : s;
-          }).join(",")
-        );
-      const csv = [header, ...lines].join("\r\n");
+      const revId = revIdRef.current;
+      if (!hot || revId == null) return;
+
+      // Persist the currently displayed sheet first so the export reflects its latest
+      // edits, exactly as drillDown/drillUp do before swapping sheets.
+      closeActiveEditor(hot);
+      const curPath = pathStack.current[pathStack.current.length - 1];
+      const curSourceData = captureSourceData(hot);
+      sheetDataMap.current.set(curPath, curSourceData);
+      persistSheet(revId, curPath, curSourceData);
+
+      // Section (L1) + Item (L2) leading columns only make sense together — flattening
+      // L2 items under their parent section. Selecting only one level means the output
+      // rows ARE that level, with no separate grouping columns.
+      const includeSectionCols = levels.l1 && levels.l2;
+
+      const l1Source = await fetchSheetSourceData(revId, "L1");
+      const l1Evaluated = evaluateClonedRows(l1Source);
+
+      const flatRows: FlatExportRow[] = [];
+      for (let row = 0; row < NUM_ROWS; row++) {
+        if (!isLineItemRow(l1Source[row])) continue;
+        const sectionEval = l1Evaluated[row] as unknown[];
+        const sectionCode = textOrBlank(sectionEval[COL_CODE]);
+        const sectionDesc = textOrBlank(sectionEval[COL_DESC]);
+
+        if (!levels.l2) {
+          flatRows.push(flatExportRowFrom(sectionEval, sectionCode, sectionDesc));
+          continue;
+        }
+
+        const childPath = `L1/R${row}`;
+        const childSource = await fetchSheetSourceData(revId, childPath);
+        const childLineRows: number[] = [];
+        for (let cr = 0; cr < NUM_ROWS; cr++) {
+          if (isLineItemRow(childSource[cr])) childLineRows.push(cr);
+        }
+
+        if (childLineRows.length === 0) {
+          // No breakdown sheet — the section row itself is the leaf item.
+          flatRows.push(flatExportRowFrom(sectionEval, sectionCode, sectionDesc));
+          continue;
+        }
+
+        const childEvaluated = evaluateClonedRows(childSource);
+        for (const cr of childLineRows) {
+          flatRows.push(flatExportRowFrom(childEvaluated[cr] as unknown[], sectionCode, sectionDesc));
+        }
+      }
+
+      interface ColDef { key: keyof FlatExportRow; header: string; width: number; numFmt?: string; }
+      const cols: ColDef[] = [];
+      if (includeSectionCols) {
+        cols.push({ key: "sectionCode", header: "Section Code", width: 14 });
+        cols.push({ key: "sectionDesc", header: "Section", width: 32 });
+      }
+      cols.push(
+        { key: "code",      header: "Code",         width: 12 },
+        { key: "desc",      header: "Description",  width: 40 },
+        { key: "qty",       header: "Quantity",     width: 12, numFmt: "#,##0.00" },
+        { key: "unit",      header: "Unit",         width: 10 },
+        { key: "rate",      header: "Rate",         width: 12, numFmt: "#,##0.00" },
+        { key: "subtotal",  header: "Subtotal",     width: 14, numFmt: "#,##0.00" },
+        { key: "factor",    header: "Factor",       width: 10, numFmt: "0.00" },
+        { key: "total",     header: "Total",        width: 14, numFmt: "#,##0.00" },
+        { key: "lab",       header: "Lab",           width: 10, numFmt: "#,##0.00" },
+        { key: "labTotal",  header: "Lab - Total",   width: 14, numFmt: "#,##0.00" },
+        { key: "mat",       header: "Mat",           width: 10, numFmt: "#,##0.00" },
+        { key: "matTotal",  header: "Mat - Total",   width: 14, numFmt: "#,##0.00" },
+        { key: "sub",       header: "Sub",           width: 10, numFmt: "#,##0.00" },
+        { key: "subTotal",  header: "Sub - Total",   width: 14, numFmt: "#,##0.00" },
+        { key: "sum",       header: "Sum",           width: 10, numFmt: "#,##0.00" },
+        { key: "sumTotal",  header: "Sum - Total",   width: 14, numFmt: "#,##0.00" },
+      );
+
+      const workbook = new ExcelJS.Workbook();
+      const sheet = workbook.addWorksheet("Workbook");
+      sheet.columns = cols.map(c => ({ header: c.header, key: c.key, width: c.width }));
+      sheet.getRow(1).font = { bold: true };
+      sheet.getRow(1).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFE0E0E0" } };
+      sheet.views = [{ state: "frozen", ySplit: 1 }];
+      for (const r of flatRows) sheet.addRow(r as unknown as Record<string, unknown>);
+      for (const c of cols) {
+        if (c.numFmt) sheet.getColumn(c.key).numFmt = c.numFmt;
+      }
+
       const filePath = await saveDialog({
-        defaultPath: "workbook.csv",
-        filters: [{ name: "CSV", extensions: ["csv"] }],
+        defaultPath: "workbook.xlsx",
+        filters: [{ name: "Excel Workbook", extensions: ["xlsx"] }],
       });
       if (!filePath) return;
       try {
-        await invoke("write_text_file", { path: filePath, content: csv });
+        const buffer = await workbook.xlsx.writeBuffer();
+        const base64 = arrayBufferToBase64(buffer as ArrayBuffer);
+        await invoke("write_binary_file", { path: filePath, dataBase64: base64 });
       } catch (err) {
         console.error("Export failed:", err);
       }

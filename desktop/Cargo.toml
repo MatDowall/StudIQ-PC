@@ -31,6 +31,7 @@ hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto"] }
 tokio-rustls = "0.26"
 rustls-pemfile = "2"
 rustls = { version = "0.23", features = ["ring"] }
+base64 = "0.22"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"

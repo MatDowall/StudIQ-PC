@@ -140,13 +140,22 @@ export interface WorkbookFormatSnapshot {
   decimals: number;
 }
 
+// Levels to include as output rows when flattening the workbook for export —
+// see WorkbookGridApi.exportExcel. L1 = section sheets, L2 = takeoff line items
+// (drilled into from an L1 row). L3 rate/quantity build-up detail is never
+// flattened into its own rows — it's rolled up into its parent L2 row already.
+export interface FlattenExportLevels {
+  l1: boolean;
+  l2: boolean;
+}
+
 // Imperative bridge: WorkbookView registers these so the ribbon's row/output
 // buttons can operate on the live grid.
 export interface WorkbookGridApi {
   addRow: () => void;
   insertAbove: () => void;
   insertBelow: () => void;
-  exportCsv: () => Promise<void>;
+  exportExcel: (levels: FlattenExportLevels) => Promise<void>;
   print: () => void;
 }
 

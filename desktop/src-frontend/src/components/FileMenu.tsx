@@ -7,6 +7,8 @@ import { ProjectInfoDialog } from "./ProjectInfoDialog";
 import { ErrorDialog } from "./ErrorDialog";
 import { RateConstantsDialog } from "./RateConstantsDialog";
 import { AboutDialog } from "./AboutDialog";
+import { ExportExcelDialog } from "./ExportExcelDialog";
+import type { FlattenExportLevels } from "../store/appStore";
 
 function Icon({ name, size = 16 }: { name: string; size?: number }) {
   return (
@@ -106,6 +108,7 @@ export function FileMenu() {
   const [showProjectInfo, setShowProjectInfo] = useState(false);
   const [showRateLibrary, setShowRateLibrary] = useState(false);
   const [showAbout, setShowAbout] = useState(false);
+  const [showExportExcel, setShowExportExcel] = useState(false);
   const [status, setStatus] = useState("");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const wrapperRef = useRef<HTMLDivElement>(null);
@@ -158,6 +161,15 @@ export function FileMenu() {
     }
   }
 
+  async function handleExportExcel(levels: FlattenExportLevels) {
+    setShowExportExcel(false);
+    try {
+      await gridApi?.exportExcel(levels);
+    } catch (err) {
+      setErrorMessage(`Export failed: ${err}`);
+    }
+  }
+
   async function handleExportPackage() {
     if (!activeProject) return;
     const dest = await save({
@@ -183,7 +195,7 @@ export function FileMenu() {
     { label: "Export Project...", icon: "save_as", enabled: !!activeProject, onClick: () => { void handleExportProject(); } },
     { label: "Export Package...", icon: "inventory_2", enabled: !!activeProject, onClick: () => { void handleExportPackage(); } },
     { divider: true, label: "", enabled: false },
-    { label: "Export CSV", icon: "save_as", enabled: hasGrid, onClick: () => { void gridApi?.exportCsv(); } },
+    { label: "Export to Excel...", icon: "save_as", enabled: hasGrid, onClick: () => setShowExportExcel(true) },
     { label: "Print", icon: "print", enabled: hasGrid, onClick: () => gridApi?.print() },
     {
       label: "Settings",
@@ -270,6 +282,9 @@ export function FileMenu() {
       ) : null}
       {showRateLibrary && <RateConstantsDialog onClose={() => setShowRateLibrary(false)} />}
       {showAbout && <AboutDialog onClose={() => setShowAbout(false)} />}
+      {showExportExcel ? (
+        <ExportExcelDialog onCancel={() => setShowExportExcel(false)} onConfirm={(levels) => { void handleExportExcel(levels); }} />
+      ) : null}
     </div>
   );
 }
