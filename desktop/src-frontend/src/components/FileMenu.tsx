@@ -39,7 +39,7 @@ function MenuRow({ item, onDone }: { item: MenuItem; onDone: () => void }) {
   return (
     <div
       onMouseEnter={() => {
-        if (hasSubmenu) setSubOpen(true);
+        if (hasSubmenu && item.enabled) setSubOpen(true);
       }}
       onMouseLeave={() => {
         if (hasSubmenu) setSubOpen(false);
@@ -119,6 +119,7 @@ export function FileMenu() {
   const exportProject = useAppStore((state) => state.exportProject);
   const exportPackage = useAppStore((state) => state.exportPackage);
   const gridApi = useAppStore((state) => state.workbookGridApi);
+  const activeTab = useAppStore((state) => state.activeTab);
   const openTemplateManager = useAppStore((state) => state.openTemplateManager);
   const openNamedCellsManager = useAppStore((state) => state.openNamedCellsManager);
   const setWorkbookConfirmAction = useAppStore((state) => state.setWorkbookConfirmAction);
@@ -189,6 +190,7 @@ export function FileMenu() {
   }
 
   const hasGrid = gridApi != null;
+  const isWorkbookTabActive = activeTab === "workbook";
 
   const items: MenuItem[] = [
     { label: "Project Info", icon: "edit", enabled: !!activeProject, onClick: () => setShowProjectInfo(true) },
@@ -198,15 +200,15 @@ export function FileMenu() {
     { label: "Export to Excel...", icon: "save_as", enabled: hasGrid, onClick: () => setShowExportExcel(true) },
     { label: "Print", icon: "print", enabled: hasGrid, onClick: () => gridApi?.print() },
     {
-      label: "Settings",
+      label: "Workbook Settings",
       icon: "settings",
-      enabled: true,
+      enabled: isWorkbookTabActive,
       submenu: [
-        { label: "Template Manager", icon: "dashboard_customize", enabled: true, onClick: () => openTemplateManager() },
-        { label: "Named Cells", icon: "sell", enabled: true, onClick: () => openNamedCellsManager() },
-        { label: "Rate Library", icon: "price_change", enabled: !!activeProject, onClick: () => setShowRateLibrary(true) },
-        { label: "Clean orphaned sheets", icon: "cleaning_services", enabled: true, onClick: () => setWorkbookConfirmAction("clean") },
-        { label: "Clear workbook", icon: "delete_sweep", enabled: true, onClick: () => setWorkbookConfirmAction("clear") },
+        { label: "Template Manager", icon: "dashboard_customize", enabled: isWorkbookTabActive, onClick: () => openTemplateManager() },
+        { label: "Named Cells", icon: "sell", enabled: isWorkbookTabActive, onClick: () => openNamedCellsManager() },
+        { label: "Rate Library", icon: "price_change", enabled: isWorkbookTabActive && !!activeProject, onClick: () => setShowRateLibrary(true) },
+        { label: "Clean orphaned sheets", icon: "cleaning_services", enabled: isWorkbookTabActive, onClick: () => setWorkbookConfirmAction("clean") },
+        { label: "Clear workbook", icon: "delete_sweep", enabled: isWorkbookTabActive, onClick: () => setWorkbookConfirmAction("clear") },
       ],
     },
     { divider: true, label: "", enabled: false },

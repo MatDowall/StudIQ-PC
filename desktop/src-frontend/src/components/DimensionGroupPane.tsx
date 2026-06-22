@@ -355,6 +355,7 @@ export function DimensionGroupPane() {
   const [pendingRename, setPendingRename] = useState<TreeNodeDto | null>(null);
   const [pendingColour, setPendingColour] = useState<TreeNodeDto | null>(null);
   const [pendingDelete, setPendingDelete] = useState<TreeNodeDto | null>(null);
+  const [pendingClearMeasures, setPendingClearMeasures] = useState(false);
   const [pendingProps, setPendingProps] = useState<{ node: TreeNodeDto; props: DimensionGroupPropsDto; framingWalls: FramingWallInput[] } | null>(null);
   const [pendingCopy, setPendingCopy] = useState<{ node: TreeNodeDto; folders: FolderOption[]; defaultFolderId: number | null } | null>(null);
   const [status, setStatus] = useState("");
@@ -613,6 +614,7 @@ export function DimensionGroupPane() {
   );
 
   async function handleClearMeasures() {
+    setPendingClearMeasures(false);
     setStatus("Clearing measurements...");
     try {
       for (const measurement of [...activeGroupMeasurements]) {
@@ -713,7 +715,7 @@ export function DimensionGroupPane() {
             </div>
             <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
               <button
-                onClick={() => void handleClearMeasures()}
+                onClick={() => setPendingClearMeasures(true)}
                 disabled={activeGroupMeasurements.length === 0}
                 title="Delete the active group's measurements"
                 style={{
@@ -855,6 +857,17 @@ export function DimensionGroupPane() {
           onCancel={() => setPendingDelete(null)}
           onConfirm={() => {
             void confirmDeleteNode();
+          }}
+        />
+      ) : null}
+      {pendingClearMeasures ? (
+        <ConfirmDialog
+          title="Clear measures"
+          body={`This will permanently delete all ${activeGroupMeasurements.length} measurement(s) in this dimension group.\n\nThis cannot be undone.`}
+          confirmLabel="Clear Measures"
+          onCancel={() => setPendingClearMeasures(false)}
+          onConfirm={() => {
+            void handleClearMeasures();
           }}
         />
       ) : null}

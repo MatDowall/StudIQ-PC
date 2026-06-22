@@ -79,37 +79,10 @@ export function Viewer() {
     }
     return out;
   }, [view3d, overlayMeasurements, groupProps, pageScale, pageIndex]);
-  // Preview images for the multi-page 3D scene's "ground" pages (offset <= 0).
-  const [multiPreviewUrls, setMultiPreviewUrls] = useState<Record<number, string>>({});
-  useEffect(() => {
-    if (!view3d || !view3dMulti || !multiPage3DConfig) { setMultiPreviewUrls({}); return; }
-    let alive = true;
-    const groundPages = multiPage3DConfig.pages.filter((p) => p.included && p.offsetM <= 0);
-    Promise.all(
-      groundPages.map(async (p) => {
-        try {
-          const data = await invoke<{ page: number; width: number; height: number; image_path: string }>(
-            "render_preview", { pageIndex: p.pageIndex }
-          );
-          return [p.pageIndex, convertFileSrc(data.image_path)] as const;
-        } catch {
-          return null;
-        }
-      }),
-    ).then((entries) => {
-      if (!alive) return;
-      const urls: Record<number, string> = {};
-      for (const entry of entries) {
-        if (entry) urls[entry[0]] = entry[1];
-      }
-      setMultiPreviewUrls(urls);
-    });
-    return () => { alive = false; };
-  }, [view3d, view3dMulti, multiPage3DConfig]);
-
-  // 3D scene pages for the multi-page view: each included page's framing members (offset
-  // along world Y by its configured Z-offset), with the PDF page rendered as a ground
-  // plane only for pages at or below Z-0.
+  // 3D scene pages for the multi-page view: each included page's framing members, offset
+  // along world Y by its configured Z-offset. The PDF page is never rendered as a ground
+  // plane here — with no offset specified every page sits at world Y=0, so any ground
+  // plane would Z-fight with every other page's ground plane at that same level.
   const pages3d = useMemo<Framing3DPage[]>(() => {
     if (!view3d || !view3dMulti || !multiPage3DConfig) return [];
     return multiPage3DConfig.pages
@@ -130,17 +103,13 @@ export function Viewer() {
             out.push(...offsetMembers(computeWall3D(pts, settings, p.mmPerPoint, parseWallFraming(mz.framing_json)), g.defaultOffsetM));
           }
         }
-        const S = p.mmPerPoint ? p.mmPerPoint / 1000 : null;
         return {
           members: out,
           offsetM: p.offsetM,
-          pageWidthM: S ? p.pageWidthPts * S : undefined,
-          pageHeightM: S ? p.pageHeightPts * S : undefined,
-          previewUrl: multiPreviewUrls[p.pageIndex],
-          showGround: p.offsetM <= 0,
+          showGround: false,
         };
       });
-  }, [view3d, view3dMulti, multiPage3DConfig, multiPreviewUrls]);
+  }, [view3d, view3dMulti, multiPage3DConfig]);
 
   // Debug/QA: console-only export of the current page's timber-framing walls as a 2D
   // elevation PDF. Run `exportFramingElevations()` in devtools. Same action backs the
