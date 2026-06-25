@@ -30,7 +30,7 @@ export function NewFromTemplateDialog({ defaultName, onCancel, onConfirm }: NewF
   }, [canConfirm, name, onCancel, onConfirm, templateId]);
 
   return (
-    <DialogShell title="New Revision from Template" width={420} zIndex={1250} onClose={onCancel}>
+    <DialogShell title="New Workbook from Template" width={420} zIndex={1250} onClose={onCancel}>
       <div style={{ padding: 12 }}>
         <label style={{ display: "block", marginBottom: 4, color: theme.text.secondary, fontSize: 12 }}>Template</label>
         <div
@@ -70,7 +70,7 @@ export function NewFromTemplateDialog({ defaultName, onCancel, onConfirm }: NewF
             ))
           )}
         </div>
-        <label style={{ display: "block", marginBottom: 4, color: theme.text.secondary, fontSize: 12 }}>Revision name</label>
+        <label style={{ display: "block", marginBottom: 4, color: theme.text.secondary, fontSize: 12 }}>Workbook Name</label>
         <input
           value={name}
           onChange={(event) => setName(event.target.value)}

@@ -186,7 +186,7 @@ export function WorkbookRibbon() {
   const hasWorkbook = workbooks.length > 0;
   const canDelete   = hasWorkbook && activeRevisionId != null;
   const hasGrid     = gridApi != null;
-  const nextRevisionName = hasWorkbook ? `Revision ${workbooks[0].revisions.length + 1}` : "Revision 1";
+  const nextRevisionName = hasWorkbook ? `Workbook ${workbooks[0].revisions.length + 1}` : "Workbook 1";
 
   const groups = [
     { label: "Workbook", tools: ["Blank Workbook", "New from Template", "Delete"] },
@@ -226,8 +226,8 @@ export function WorkbookRibbon() {
       )}
       {confirmDelete && (
         <ConfirmDialog
-          title="Delete revision"
-          body="This permanently deletes the selected workbook revision and all its sheet data. This cannot be undone. Continue?"
+          title="Delete workbook"
+          body="This permanently deletes the selected workbook and all its sheet data. This cannot be undone. Continue?"
           confirmLabel="Delete"
           onCancel={() => setConfirmDelete(false)}
           onConfirm={handleDeleteConfirmed}

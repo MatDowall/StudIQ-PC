@@ -2689,6 +2689,162 @@ async fn rename_workbook_revision(
     Ok(())
 }
 
+#[tauri::command]
+async fn copy_workbook_revision(
+    source_revision_id: i64,
+    name: String,
+    state: State<'_, AppState>,
+) -> Result<WorkbookRevisionDto, String> {
+    let db = active_project_db(state.inner())?;
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("Workbook name cannot be empty".to_string());
+    }
+
+    let workbook_id: i64 = sqlx::query_scalar(
+        "SELECT workbook_id FROM workbook_revisions WHERE id = ?",
+    )
+    .bind(source_revision_id)
+    .fetch_optional(&db)
+    .await
+    .map_err(|e| format!("Failed to look up source workbook: {e}"))?
+    .ok_or_else(|| format!("Workbook {source_revision_id} not found"))?;
+
+    let sort_order: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM workbook_revisions WHERE workbook_id = ?",
+    )
+    .bind(workbook_id)
+    .fetch_one(&db)
+    .await
+    .map_err(|e| format!("Failed to get next sort order: {e}"))?;
+
+    let result = sqlx::query(
+        "INSERT INTO workbook_revisions (workbook_id, name, sort_order) VALUES (?, ?, ?)",
+    )
+    .bind(workbook_id)
+    .bind(&name)
+    .bind(sort_order)
+    .execute(&db)
+    .await
+    .map_err(|e| format!("Failed to create workbook: {e}"))?;
+    let new_revision_id = result.last_insert_rowid();
+
+    // Copy every sheet (not just the template-master set) — a workbook copy must
+    // reproduce the source's full state, including any per-drawing drill-down sheets.
+    let sheet_data: Vec<(String, String)> = sqlx::query_as(
+        "SELECT sheet_path, data_json FROM workbook_sheet_data WHERE revision_id = ?",
+    )
+    .bind(source_revision_id)
+    .fetch_all(&db)
+    .await
+    .map_err(|e| format!("Failed to read source sheet data: {e}"))?;
+    for (sheet_path, data_json) in sheet_data {
+        sqlx::query(
+            "INSERT INTO workbook_sheet_data (revision_id, sheet_path, data_json) VALUES (?, ?, ?)",
+        )
+        .bind(new_revision_id)
+        .bind(&sheet_path)
+        .bind(&data_json)
+        .execute(&db)
+        .await
+        .map_err(|e| format!("Failed to copy sheet data '{sheet_path}': {e}"))?;
+    }
+
+    let sheet_links: Vec<(String, String)> = sqlx::query_as(
+        "SELECT sheet_path, links_json FROM workbook_sheet_links WHERE revision_id = ?",
+    )
+    .bind(source_revision_id)
+    .fetch_all(&db)
+    .await
+    .map_err(|e| format!("Failed to read source sheet links: {e}"))?;
+    for (sheet_path, links_json) in sheet_links {
+        sqlx::query(
+            "INSERT INTO workbook_sheet_links (revision_id, sheet_path, links_json) VALUES (?, ?, ?)",
+        )
+        .bind(new_revision_id)
+        .bind(&sheet_path)
+        .bind(&links_json)
+        .execute(&db)
+        .await
+        .map_err(|e| format!("Failed to copy sheet links '{sheet_path}': {e}"))?;
+    }
+
+    let sheet_styles: Vec<(String, String)> = sqlx::query_as(
+        "SELECT sheet_path, styles_json FROM workbook_sheet_styles WHERE revision_id = ?",
+    )
+    .bind(source_revision_id)
+    .fetch_all(&db)
+    .await
+    .map_err(|e| format!("Failed to read source sheet styles: {e}"))?;
+    for (sheet_path, styles_json) in sheet_styles {
+        sqlx::query(
+            "INSERT INTO workbook_sheet_styles (revision_id, sheet_path, styles_json) VALUES (?, ?, ?)",
+        )
+        .bind(new_revision_id)
+        .bind(&sheet_path)
+        .bind(&styles_json)
+        .execute(&db)
+        .await
+        .map_err(|e| format!("Failed to copy sheet styles '{sheet_path}': {e}"))?;
+    }
+
+    let sheet_exclusions: Vec<(String, String)> = sqlx::query_as(
+        "SELECT sheet_path, exclusions_json FROM workbook_sheet_exclusions WHERE revision_id = ?",
+    )
+    .bind(source_revision_id)
+    .fetch_all(&db)
+    .await
+    .map_err(|e| format!("Failed to read source sheet exclusions: {e}"))?;
+    for (sheet_path, exclusions_json) in sheet_exclusions {
+        sqlx::query(
+            "INSERT INTO workbook_sheet_exclusions (revision_id, sheet_path, exclusions_json) VALUES (?, ?, ?)",
+        )
+        .bind(new_revision_id)
+        .bind(&sheet_path)
+        .bind(&exclusions_json)
+        .execute(&db)
+        .await
+        .map_err(|e| format!("Failed to copy sheet exclusions '{sheet_path}': {e}"))?;
+    }
+
+    let named_cells: Vec<(String, String, i64, i64)> = sqlx::query_as(
+        "SELECT name, sheet_path, row, col FROM workbook_named_cells WHERE revision_id = ?",
+    )
+    .bind(source_revision_id)
+    .fetch_all(&db)
+    .await
+    .map_err(|e| format!("Failed to read source named cells: {e}"))?;
+    for (nc_name, nc_path, nc_row, nc_col) in named_cells {
+        sqlx::query(
+            "INSERT INTO workbook_named_cells (revision_id, name, sheet_path, row, col) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(new_revision_id)
+        .bind(&nc_name)
+        .bind(&nc_path)
+        .bind(nc_row)
+        .bind(nc_col)
+        .execute(&db)
+        .await
+        .map_err(|e| format!("Failed to copy named cell '{nc_name}': {e}"))?;
+    }
+
+    let created_at: String =
+        sqlx::query_scalar("SELECT created_at FROM workbook_revisions WHERE id = ?")
+            .bind(new_revision_id)
+            .fetch_one(&db)
+            .await
+            .map_err(|e| format!("Failed to fetch created_at: {e}"))?;
+
+    Ok(WorkbookRevisionDto {
+        id: new_revision_id,
+        workbook_id,
+        name,
+        created_at,
+        sort_order,
+        project_total: None,
+    })
+}
+
 /// Returns the id of the hidden workbook that owns template revisions, creating it
 /// (with its blank seed revision excluded) if this is the first template in the project.
 async fn ensure_template_workbook(db: &SqlitePool) -> Result<i64, String> {
@@ -4373,6 +4529,7 @@ pub fn run() {
             list_workbooks,
             create_workbook_revision,
             create_workbook_revision_from_template,
+            copy_workbook_revision,
             delete_workbook_revision,
             rename_workbook_revision,
             list_templates,

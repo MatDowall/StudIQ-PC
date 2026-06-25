@@ -417,6 +417,7 @@ interface AppStore {
   setActiveRevisionId: (id: number | null) => void;
   createWorkbookRevision: (workbookId: number, name: string) => Promise<void>;
   createWorkbookRevisionFromTemplate: (workbookId: number, name: string, templateId: number) => Promise<void>;
+  copyWorkbookRevision: (sourceRevisionId: number, name: string) => Promise<void>;
   deleteWorkbookRevision: (revisionId: number) => Promise<void>;
   renameWorkbookRevision: (revisionId: number, name: string) => Promise<void>;
   setWorkbookRevisionProjectTotal: (revisionId: number, total: number | null) => Promise<void>;
@@ -1661,6 +1662,12 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   createWorkbookRevisionFromTemplate: async (workbookId, name, templateId) => {
     const revision = await invoke<WorkbookRevisionDto>("create_workbook_revision_from_template", { workbookId, name, templateId });
+    await get().loadWorkbooks();
+    set({ activeRevisionId: revision.id });
+  },
+
+  copyWorkbookRevision: async (sourceRevisionId, name) => {
+    const revision = await invoke<WorkbookRevisionDto>("copy_workbook_revision", { sourceRevisionId, name });
     await get().loadWorkbooks();
     set({ activeRevisionId: revision.id });
   },

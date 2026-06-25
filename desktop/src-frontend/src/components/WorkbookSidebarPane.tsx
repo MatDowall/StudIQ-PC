@@ -1,14 +1,10 @@
 import { useRef, useState } from "react";
 import { useAppStore } from "../store/appStore";
 import { theme } from "../theme";
-import type { WorkbookDto, WorkbookRevisionDto } from "../store/appStore";
+import { ContextMenu, type ContextMenuItem } from "./ContextMenu";
+import type { WorkbookRevisionDto } from "../store/appStore";
 
 const TOTAL_FORMAT = new Intl.NumberFormat("en-NZ", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-
-const KIND_ICONS = {
-  workbook: "folder_open",
-  revision: "history",
-} as const;
 
 function Icon({ name, size = 14 }: { name: string; size?: number }) {
   return (
@@ -21,21 +17,26 @@ function Icon({ name, size = 14 }: { name: string; size?: number }) {
   );
 }
 
-function RevisionRow({
+function WorkbookRow({
   revision,
   isActive,
+  canDelete,
   onSelect,
   onRename,
   onDelete,
+  onCopy,
 }: {
   revision: WorkbookRevisionDto;
   isActive: boolean;
+  canDelete: boolean;
   onSelect: () => void;
   onRename: (name: string) => void;
   onDelete: () => void;
+  onCopy: () => void;
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(revision.name);
+  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const projectTotal = revision.project_total;
 
@@ -49,15 +50,22 @@ function RevisionRow({
     setEditing(false);
   }
 
+  const menuItems: ContextMenuItem[] = [
+    { label: "Copy Workbook", action: onCopy },
+    { label: "Rename", action: () => { setDraft(revision.name); setEditing(true); setTimeout(() => inputRef.current?.select(), 0); } },
+    ...(canDelete ? [{ label: "Delete", danger: true, action: onDelete }] : []),
+  ];
+
   return (
     <div
       onClick={() => { if (!editing) onSelect(); }}
       onDoubleClick={() => { setDraft(revision.name); setEditing(true); setTimeout(() => inputRef.current?.select(), 0); }}
+      onContextMenu={(e) => { e.preventDefault(); setMenu({ x: e.clientX, y: e.clientY }); }}
       style={{
         display: "flex",
         alignItems: "center",
         height: theme.rowHeight,
-        paddingLeft: theme.treeIndent * 2 + 4,
+        paddingLeft: theme.treeIndent + 4,
         paddingRight: 4,
         gap: 4,
         cursor: "pointer",
@@ -67,10 +75,7 @@ function RevisionRow({
         flexShrink: 0,
       }}
     >
-      {/* indent spacer */}
-      <span style={{ width: 14, flexShrink: 0 }} />
-
-      <Icon name={KIND_ICONS.revision} size={14} />
+      <Icon name="description" size={14} />
 
       {editing ? (
         <input
@@ -115,138 +120,41 @@ function RevisionRow({
         </span>
       )}
 
-      {isActive && !editing && (
-        <button
-          title="Delete revision"
-          onClick={(e) => { e.stopPropagation(); onDelete(); }}
-          style={{
-            background: "none",
-            border: "none",
-            color: theme.text.secondary,
-            cursor: "pointer",
-            padding: 0,
-            display: "flex",
-            alignItems: "center",
-            flexShrink: 0,
-          }}
-        >
-          <Icon name="delete" size={14} />
-        </button>
+      {menu && (
+        <ContextMenu x={menu.x} y={menu.y} items={menuItems} onClose={() => setMenu(null)} />
       )}
     </div>
   );
 }
 
-function WorkbookRow({ workbook }: { workbook: WorkbookDto }) {
-  const [expanded, setExpanded] = useState(true);
+export function WorkbookSidebarPane() {
+  const workbooks = useAppStore((s) => s.workbooks);
   const activeRevisionId = useAppStore((s) => s.activeRevisionId);
   const setActiveRevisionId = useAppStore((s) => s.setActiveRevisionId);
-  const createWorkbookRevision = useAppStore((s) => s.createWorkbookRevision);
-  const deleteWorkbookRevision = useAppStore((s) => s.deleteWorkbookRevision);
   const renameWorkbookRevision = useAppStore((s) => s.renameWorkbookRevision);
-  const [adding, setAdding] = useState(false);
-  const [newName, setNewName] = useState("");
+  const deleteWorkbookRevision = useAppStore((s) => s.deleteWorkbookRevision);
+  const copyWorkbookRevision = useAppStore((s) => s.copyWorkbookRevision);
+  const createWorkbookRevision = useAppStore((s) => s.createWorkbookRevision);
 
-  const hasRevisions = workbook.revisions.length > 0;
+  const allRevisions = workbooks.flatMap((wb) => wb.revisions.map((rev) => ({ rev, workbookId: wb.id })));
+
+  function handleNewWorkbook() {
+    if (workbooks.length > 0) {
+      const wb = workbooks[0];
+      const nextNum = wb.revisions.length + 1;
+      createWorkbookRevision(wb.id, `Workbook ${nextNum}`);
+    }
+  }
 
   async function handleDelete(rev: WorkbookRevisionDto) {
-    if (workbook.revisions.length <= 1) {
-      return; // Don't allow deleting the last revision
+    if (allRevisions.length <= 1) {
+      return; // Don't allow deleting the last workbook
     }
     await deleteWorkbookRevision(rev.id);
   }
 
-  async function commitAdd() {
-    const trimmed = newName.trim();
-    if (trimmed) {
-      await createWorkbookRevision(workbook.id, trimmed);
-    }
-    setNewName("");
-    setAdding(false);
-  }
-
-  return (
-    <>
-      {/* Workbook header row */}
-      <div
-        onClick={() => setExpanded((v) => !v)}
-        style={{
-          display: "flex",
-          alignItems: "center",
-          height: theme.rowHeight,
-          paddingLeft: theme.treeIndent + 4,
-          paddingRight: 4,
-          gap: 4,
-          cursor: "pointer",
-          color: theme.text.primary,
-          userSelect: "none",
-          flexShrink: 0,
-        }}
-      >
-        <span style={{ width: 14, fontSize: 12, lineHeight: 1, color: hasRevisions ? theme.text.secondary : "transparent", textAlign: "center", flexShrink: 0 }}>
-          {hasRevisions ? (expanded ? "▾" : "▸") : ""}
-        </span>
-        <Icon name={KIND_ICONS.workbook} size={14} />
-        <span style={{ fontSize: 12, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontWeight: 600 }}>
-          {workbook.name}
-        </span>
-      </div>
-
-      {/* Revisions */}
-      {expanded && workbook.revisions.map((rev) => (
-        <RevisionRow
-          key={rev.id}
-          revision={rev}
-          isActive={rev.id === activeRevisionId}
-          onSelect={() => setActiveRevisionId(rev.id)}
-          onRename={(name) => renameWorkbookRevision(rev.id, name)}
-          onDelete={() => handleDelete(rev)}
-        />
-      ))}
-
-      {/* Inline new-revision input */}
-      {expanded && adding && (
-        <div style={{ display: "flex", alignItems: "center", height: theme.rowHeight, paddingLeft: theme.treeIndent * 2 + 4 + 14 + 4, paddingRight: 4, gap: 4, flexShrink: 0 }}>
-          <Icon name={KIND_ICONS.revision} size={14} />
-          <input
-            autoFocus
-            value={newName}
-            onChange={(e) => setNewName(e.target.value)}
-            onBlur={commitAdd}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") commitAdd();
-              if (e.key === "Escape") { setNewName(""); setAdding(false); }
-            }}
-            placeholder="Revision name…"
-            style={{
-              flex: 1,
-              fontSize: 12,
-              background: theme.bg.input,
-              border: `1px solid ${theme.accent}`,
-              color: theme.text.primary,
-              padding: "0 2px",
-              outline: "none",
-            }}
-          />
-        </div>
-      )}
-    </>
-  );
-}
-
-export function WorkbookSidebarPane() {
-  const workbooks = useAppStore((s) => s.workbooks);
-  const createWorkbookRevision = useAppStore((s) => s.createWorkbookRevision);
-
-  function handleNewRevision() {
-    if (workbooks.length > 0) {
-      // Trigger inline add on the first (only) workbook via a synthetic approach:
-      // We rely on the WorkbookRow's own "adding" state — but since that's internal,
-      // the header button uses a store action directly with a generated name.
-      const wb = workbooks[0];
-      const nextNum = wb.revisions.length + 1;
-      createWorkbookRevision(wb.id, `Revision ${nextNum}`);
-    }
+  async function handleCopy(rev: WorkbookRevisionDto) {
+    await copyWorkbookRevision(rev.id, `${rev.name} (Copy)`);
   }
 
   return (
@@ -276,8 +184,8 @@ export function WorkbookSidebarPane() {
           WORKBOOKS
         </span>
         <button
-          title="New Revision"
-          onClick={handleNewRevision}
+          title="New Workbook"
+          onClick={handleNewWorkbook}
           disabled={workbooks.length === 0}
           style={{
             background: "none",
@@ -293,10 +201,19 @@ export function WorkbookSidebarPane() {
         </button>
       </div>
 
-      {/* Tree */}
+      {/* List */}
       <div style={{ flex: 1, overflow: "auto", padding: "4px 0" }}>
-        {workbooks.map((wb) => (
-          <WorkbookRow key={wb.id} workbook={wb} />
+        {allRevisions.map(({ rev }) => (
+          <WorkbookRow
+            key={rev.id}
+            revision={rev}
+            isActive={rev.id === activeRevisionId}
+            canDelete={allRevisions.length > 1}
+            onSelect={() => setActiveRevisionId(rev.id)}
+            onRename={(name) => renameWorkbookRevision(rev.id, name)}
+            onDelete={() => handleDelete(rev)}
+            onCopy={() => handleCopy(rev)}
+          />
         ))}
       </div>
     </div>
