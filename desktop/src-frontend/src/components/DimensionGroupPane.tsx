@@ -247,7 +247,7 @@ function DimensionTreeRow({
           <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{displayName}</span>
         </div>
         <div style={{ paddingRight: 8, textAlign: "right", color: isActive ? "#FFFFFF" : theme.text.primary }}>{summary.quantity}</div>
-        <div style={{ color: isActive ? "#FFFFFF" : theme.text.primary }}>{summary.uom}</div>
+        <div style={{ paddingLeft: 6, color: isActive ? "#FFFFFF" : theme.text.primary }}>{summary.uom}</div>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "center" }}>
           {node.node_type === "dimension_group" ? (
             <span style={{ width: 16, height: 16, background: node.colour ?? theme.accent, border: `1px solid ${theme.border.divider}` }} />
@@ -275,7 +275,7 @@ function DimensionTreeRow({
             <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{row.label}</span>
           </div>
           <div style={{ paddingRight: 8, textAlign: "right" }}>{row.total.toFixed(3)}</div>
-          <div>m</div>
+          <div style={{ paddingLeft: 6 }}>m</div>
           <div />
         </div>
       ))}
@@ -302,7 +302,7 @@ function DimensionTreeRow({
             <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{row.label}</span>
           </div>
           <div style={{ paddingRight: 8, textAlign: "right" }}>{row.total.toFixed(3)}</div>
-          <div>m</div>
+          <div style={{ paddingLeft: 6 }}>m</div>
           <div />
         </div>
       ))}
