@@ -87,13 +87,22 @@ export interface Opening {
 
 /** A raking frame on one wall segment: the top plate slopes between `startMm` (wall height at the
  *  segment start) and `endMm` (at the segment end). If `gable` is set, the top plate instead rises
- *  from `startMm` to the apex `middleMm` at the segment midpoint, then falls to `endMm`. */
+ *  from `startMm` to the apex `middleMm` at arc-length `middlePositionMm` from the segment start
+ *  (default the segment midpoint when absent — back-compat with rakes saved before this field
+ *  existed), then falls to `endMm`. */
 export interface Rake {
   segmentIndex: number;
   startMm: number;
   endMm: number;
   gable?: boolean;
   middleMm?: number;
+  middlePositionMm?: number;
+}
+
+/** The gable apex's arc-length (mm) from the segment start — `rake.middlePositionMm` if set,
+ *  otherwise the segment midpoint (the only behaviour before the apex-position field existed). */
+export function rakeApexMm(rake: Pick<Rake, "middlePositionMm">, segLenMm: number): number {
+  return rake.middlePositionMm ?? segLenMm / 2;
 }
 
 /** A manually-placed extra stud on a wall segment (select-mode Ctrl-hover), at arc-length `centreMm`. */
@@ -197,6 +206,185 @@ export function serializeWallFraming(framing: WallFraming): string {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Vertex insertion/deletion re-keying — a wall's Opening/Rake/ExtraStud/DoubledStud entries are
+// keyed by segmentIndex + a local arc-length in mm along that specific segment. Inserting or
+// removing a polyline point shifts/merges segments, so anything keyed by segmentIndex must be
+// re-based alongside the geometry edit — otherwise it silently points at the wrong segment with a
+// meaningless local offset (the cause of a real bug report: a door placed on a wall that was later
+// split for raking-frame apex control ended up with corrupted king/jack studs).
+// ---------------------------------------------------------------------------------------------
+
+export interface ReindexResult {
+  framing: WallFraming;
+  /** User-facing notes about entries that couldn't be re-based unambiguously (e.g. an opening
+   *  whose footprint straddled the split/merge point, or a rake dropped on merge). */
+  warnings: string[];
+}
+
+function segLenMmBetween(a: PagePoint, b: PagePoint, mmPerPoint: number): number {
+  return Math.hypot(b.x - a.x, b.y - a.y) * mmPerPoint;
+}
+
+/** Re-bases a (segmentIndex, centreMm) entry that sits on the segment being split at `splitMm`. */
+function splitPointEntry<T extends { segmentIndex: number; centreMm: number }>(entry: T, splitSegmentIndex: number, splitMm: number): T {
+  if (entry.segmentIndex < splitSegmentIndex) return entry;
+  if (entry.segmentIndex > splitSegmentIndex) return { ...entry, segmentIndex: entry.segmentIndex + 1 };
+  return entry.centreMm < splitMm ? entry : { ...entry, segmentIndex: entry.segmentIndex + 1, centreMm: entry.centreMm - splitMm };
+}
+
+/** Height (mm) at arc-length `s` along a rake's start->[apex]->end slope. */
+function rakeHeightAt(rake: Rake, s: number, segLenMm: number): number {
+  if (rake.gable && rake.middleMm !== undefined) {
+    const apexMm = rakeApexMm(rake, segLenMm);
+    if (apexMm <= 0) return rake.middleMm;
+    if (apexMm >= segLenMm) return rake.startMm + (rake.middleMm - rake.startMm) * (s / segLenMm);
+    return s <= apexMm
+      ? rake.startMm + (rake.middleMm - rake.startMm) * (s / apexMm)
+      : rake.middleMm + (rake.endMm - rake.middleMm) * ((s - apexMm) / (segLenMm - apexMm));
+  }
+  return segLenMm > 0 ? rake.startMm + (rake.endMm - rake.startMm) * (s / segLenMm) : rake.startMm;
+}
+
+/** Splits a `Rake` spanning the segment being divided at `splitMm` into two rakes for the new
+ *  sub-segments. A gable's apex lands wholly in one sub-segment (re-based to its local origin);
+ *  the other sub-segment becomes a plain slope from/to the split height. */
+function splitRakeEntry(rake: Rake, splitSegmentIndex: number, splitMm: number, oldSegLenMm: number): Rake[] {
+  if (rake.segmentIndex < splitSegmentIndex) return [rake];
+  if (rake.segmentIndex > splitSegmentIndex) return [{ ...rake, segmentIndex: rake.segmentIndex + 1 }];
+
+  const hSplit = rakeHeightAt(rake, splitMm, oldSegLenMm);
+  const first: Rake = { segmentIndex: splitSegmentIndex, startMm: rake.startMm, endMm: hSplit };
+  const second: Rake = { segmentIndex: splitSegmentIndex + 1, startMm: hSplit, endMm: rake.endMm };
+
+  if (!rake.gable || rake.middleMm === undefined) return [first, second];
+
+  const apexMm = rakeApexMm(rake, oldSegLenMm);
+  if (splitMm <= apexMm) {
+    // Apex stays on the second sub-segment, re-based to its local origin.
+    second.gable = true;
+    second.middleMm = rake.middleMm;
+    second.middlePositionMm = apexMm - splitMm;
+  } else {
+    // Apex stays on the first sub-segment; its position is already local to it.
+    first.gable = true;
+    first.middleMm = rake.middleMm;
+    first.middlePositionMm = apexMm;
+  }
+  return [first, second];
+}
+
+/** Re-keys a wall's framing extras after a vertex is inserted at `insertSegmentIndex + 1`
+ *  (splitting the old segment `insertSegmentIndex` into two). `path` is the geometry BEFORE the
+ *  insertion. Entries that already existed before the edit keep meaning; nothing is silently
+ *  corrupted. */
+export function reindexFramingForVertexInsertion(
+  framing: WallFraming,
+  path: PagePoint[],
+  insertSegmentIndex: number,
+  insertPoint: PagePoint,
+  mmPerPoint: number,
+): ReindexResult {
+  const warnings: string[] = [];
+  const a = path[insertSegmentIndex];
+  const b = path[insertSegmentIndex + 1];
+  if (!a || !b || !(mmPerPoint > 0)) return { framing, warnings };
+
+  const splitMm = segLenMmBetween(a, insertPoint, mmPerPoint);
+  const oldSegLenMm = segLenMmBetween(a, b, mmPerPoint);
+
+  const openings = framing.openings.map((o) => {
+    if (o.segmentIndex === insertSegmentIndex) {
+      const half = o.daylightWidthMm / 2;
+      if (o.centreMm - half < splitMm && o.centreMm + half > splitMm) {
+        warnings.push(`The ${o.kind} near the new point may need repositioning.`);
+      }
+    }
+    return splitPointEntry(o, insertSegmentIndex, splitMm);
+  });
+  const extraStuds = framing.extraStuds.map((e) => splitPointEntry(e, insertSegmentIndex, splitMm));
+  const doubledStuds = framing.doubledStuds?.map((d) => splitPointEntry(d, insertSegmentIndex, splitMm));
+  const rakes = framing.rakes.flatMap((r) => splitRakeEntry(r, insertSegmentIndex, splitMm, oldSegLenMm));
+
+  return { framing: { ...framing, openings, rakes, extraStuds, doubledStuds }, warnings };
+}
+
+/** Re-keys a wall's framing extras after the vertex at `deleteVertexIndex` is removed. An interior
+ *  vertex merges its two adjacent segments into one (segment `deleteVertexIndex - 1`); an endpoint
+ *  vertex removes the extremal segment outright. `path` is the geometry BEFORE the deletion. */
+export function reindexFramingForVertexDeletion(
+  framing: WallFraming,
+  path: PagePoint[],
+  deleteVertexIndex: number,
+  mmPerPoint: number,
+): ReindexResult {
+  const warnings: string[] = [];
+  const isEndpoint = deleteVertexIndex <= 0 || deleteVertexIndex >= path.length - 1;
+
+  if (isEndpoint) {
+    // The extremal segment (the one that had this vertex as one of its ends) disappears entirely.
+    const removedSegmentIndex = deleteVertexIndex === 0 ? 0 : path.length - 2;
+    const hasEntry = (segmentIndex: number) => segmentIndex === removedSegmentIndex;
+    if (
+      framing.openings.some((o) => hasEntry(o.segmentIndex)) ||
+      framing.rakes.some((r) => hasEntry(r.segmentIndex)) ||
+      framing.extraStuds.some((e) => hasEntry(e.segmentIndex)) ||
+      framing.doubledStuds?.some((d) => hasEntry(d.segmentIndex))
+    ) {
+      warnings.push("An opening, rake, or extra stud on the removed end of the wall was deleted with it.");
+    }
+    const shift = (segmentIndex: number) => (removedSegmentIndex === 0 ? segmentIndex - 1 : segmentIndex);
+    const keep = <T extends { segmentIndex: number }>(entries: T[]): T[] =>
+      entries.filter((e) => !hasEntry(e.segmentIndex)).map((e) => ({ ...e, segmentIndex: shift(e.segmentIndex) }));
+    return {
+      framing: {
+        ...framing,
+        openings: keep(framing.openings),
+        rakes: keep(framing.rakes),
+        extraStuds: keep(framing.extraStuds),
+        doubledStuds: framing.doubledStuds ? keep(framing.doubledStuds) : undefined,
+      },
+      warnings,
+    };
+  }
+
+  // Interior vertex: merge old segments (v-1) and v into new segment (v-1); shift everything after.
+  const v = deleteVertexIndex;
+  const mergedIndex = v - 1;
+  const lenBeforeMm = segLenMmBetween(path[v - 1], path[v], mmPerPoint);
+
+  const mergePointEntry = <T extends { segmentIndex: number; centreMm: number }>(entry: T): T => {
+    if (entry.segmentIndex < mergedIndex) return entry;
+    if (entry.segmentIndex === mergedIndex) return entry; // was on segment v-1, origin unchanged
+    if (entry.segmentIndex === v) return { ...entry, segmentIndex: mergedIndex, centreMm: entry.centreMm + lenBeforeMm };
+    return { ...entry, segmentIndex: entry.segmentIndex - 1 };
+  };
+
+  const openings = framing.openings.map(mergePointEntry);
+  const extraStuds = framing.extraStuds.map(mergePointEntry);
+  const doubledStuds = framing.doubledStuds?.map(mergePointEntry);
+
+  const rakeBefore = framing.rakes.find((r) => r.segmentIndex === mergedIndex);
+  const rakeAfter = framing.rakes.find((r) => r.segmentIndex === v);
+  const otherRakes = framing.rakes
+    .filter((r) => r.segmentIndex !== mergedIndex && r.segmentIndex !== v)
+    .map((r) => (r.segmentIndex > v ? { ...r, segmentIndex: r.segmentIndex - 1 } : r));
+
+  const rakes = [...otherRakes];
+  if (rakeBefore && rakeAfter) {
+    const continuous = Math.abs(rakeBefore.endMm - rakeAfter.startMm) < 1;
+    if (continuous && !rakeBefore.gable && !rakeAfter.gable) {
+      rakes.push({ segmentIndex: mergedIndex, startMm: rakeBefore.startMm, endMm: rakeAfter.endMm });
+    } else {
+      warnings.push("Rake cleared on the merged segment — please re-set the raking frame for this wall.");
+    }
+  } else if (rakeBefore || rakeAfter) {
+    warnings.push("Rake cleared on the merged segment — please re-set the raking frame for this wall.");
+  }
+
+  return { framing: { ...framing, openings, rakes, extraStuds, doubledStuds }, warnings };
+}
+
+// ---------------------------------------------------------------------------------------------
 // Straight-wall geometry (M2). All inputs/outputs in PDF points (Y-up) unless noted.
 // ---------------------------------------------------------------------------------------------
 
@@ -213,6 +401,20 @@ export interface FramingGeometry {
 }
 
 const GEOM_EPS = 1e-6;
+
+/** Removes near-duplicate arc-length positions (within `tolerancePts`) from a list of candidate
+ *  stud centres. Anchor/gable-apex candidates and the regular grid are computed independently and
+ *  can coincidentally land on (or within a fraction of a mm of) the same position — e.g. a gable
+ *  apex offset by half a stud thickness landing exactly on a 400mm grid line — which would
+ *  otherwise push the same physical stud twice into the takeoff. Order-preserving: the first
+ *  occurrence of a cluster is kept. */
+function dedupePositions(positions: number[], tolerancePts: number): number[] {
+  const kept: number[] = [];
+  for (const p of positions) {
+    if (!kept.some((k) => Math.abs(k - p) < tolerancePts)) kept.push(p);
+  }
+  return kept;
+}
 
 /** Unit "left" normal of edge a→b (rotate the direction +90°). */
 function edgeUnitNormal(a: PagePoint, b: PagePoint): PagePoint {
@@ -455,8 +657,15 @@ export function computeFramingGeometry(
   const openingRects: { daylight: PagePoint[]; kind: "door" | "window" }[] = [];
 
   const halfDepthForCut = halfDepth;
-  const nearAnyOpening = (p: PagePoint): boolean => {
+  // Only for a DIFFERENT segment's opening reaching into this one at a corner (a corner-makeup
+  // anchor can sit at negative `s`/beyond `segLen`, physically overlapping the adjacent segment's
+  // footprint) — the wider (+2 stud thicknesses) tolerance accounts for the anchor's own physical
+  // width, not just its centreline. The current segment's own opening is handled precisely by the
+  // exact-daylight-width check in `cut()`, so it's excluded here to avoid over-cutting studs that
+  // sit just outside the door but were being caught a second time by this looser margin.
+  const nearAnyOpening = (p: PagePoint, ownSegmentIndex: number): boolean => {
     for (let j = 0; j < layout.length; j += 1) {
+      if (j === ownSegmentIndex) continue;
       const segJ = layout[j];
       for (const o of openings.filter((op) => op.segmentIndex === j)) {
         const c = o.centreMm / mmPerPoint;
@@ -468,14 +677,23 @@ export function computeFramingGeometry(
     return false;
   };
 
+  const dedupeTolPts = 1 / mmPerPoint; // 1mm — anchor/gable-apex candidates and the regular grid are
+  // computed independently and can coincidentally land on (or within a fraction of a mm of) the
+  // same position, which would otherwise draw/count the same physical stud twice.
+
   layout.forEach((seg, segIndex) => {
     const segOpenings = openings.filter((o) => o.segmentIndex === segIndex);
     const cut = (s: number) =>
-      segOpenings.some((o) => Math.abs(s - o.centreMm / mmPerPoint) <= o.daylightWidthMm / mmPerPoint / 2 + 2 * studThkPts) ||
-      nearAnyOpening(pointAt(seg, s));
+      segOpenings.some((o) => Math.abs(s - o.centreMm / mmPerPoint) <= o.daylightWidthMm / mmPerPoint / 2) ||
+      nearAnyOpening(pointAt(seg, s), segIndex);
     // Sister stud offset: toward wall interior — positive in the first half, negative in the second.
     const sisterOffset = (s: number) => (s < seg.segLen / 2 ? studThkPts : -studThkPts);
-    for (const s of [...seg.anchors, ...seg.regular]) {
+    const rake = rakes.find((r) => r.segmentIndex === segIndex);
+    const gableApexS = rake?.gable && rake.middleMm !== undefined
+      ? [rakeApexMm(rake, seg.segLen * mmPerPoint) / mmPerPoint - halfThk, rakeApexMm(rake, seg.segLen * mmPerPoint) / mmPerPoint + halfThk]
+      : [];
+    const allCandidates = dedupePositions([...seg.anchors, ...gableApexS, ...seg.regular], dedupeTolPts);
+    for (const s of allCandidates) {
       if (!cut(s)) {
         studs.push(makeStudRect(pointAt(seg, s), seg.dir, halfThk, halfDepth));
         if (isStudDoubled(framing, segIndex, s * mmPerPoint)) {
@@ -490,22 +708,6 @@ export function computeFramingGeometry(
       const jambs = openingJambs(centrePts, dwHalf, studThkPts);
       for (const p of [...jambs.trimmers, ...jambs.kings]) studs.push(makeStudRect(pointAt(seg, p), seg.dir, halfThk, halfDepth));
       openingRects.push({ daylight: memberRect(seg, centrePts - dwHalf, centrePts + dwHalf, halfDepth), kind: o.kind });
-    }
-
-    // Gable apex: a stud under each side's top plate, meeting at the ridge (unless cut by an
-    // opening, in which case it becomes a jack/sill-jack instead — not drawn here, matching
-    // how cut regular studs are handled above).
-    const rake = rakes.find((r) => r.segmentIndex === segIndex);
-    if (rake?.gable && rake.middleMm !== undefined) {
-      const midS = seg.segLen / 2;
-      for (const s of [midS - halfThk, midS + halfThk]) {
-        if (!cut(s)) {
-          studs.push(makeStudRect(pointAt(seg, s), seg.dir, halfThk, halfDepth));
-          if (isStudDoubled(framing, segIndex, s * mmPerPoint)) {
-            studs.push(makeStudRect(pointAt(seg, s + sisterOffset(s)), seg.dir, halfThk, halfDepth));
-          }
-        }
-      }
     }
   });
 
@@ -702,19 +904,26 @@ export function wallMembers(
     if (!rake) return settings.wallHeightMm;
     const f = Math.max(0, Math.min(1, frac));
     if (rake.gable && rake.middleMm !== undefined) {
-      return f <= 0.5
-        ? rake.startMm + (rake.middleMm - rake.startMm) * (f / 0.5)
-        : rake.middleMm + (rake.endMm - rake.middleMm) * ((f - 0.5) / 0.5);
+      const segLenMm = (layout[segIndex]?.segLen ?? 0) * mmPerPoint;
+      const apexF = segLenMm > 0 ? Math.max(0, Math.min(1, rakeApexMm(rake, segLenMm) / segLenMm)) : 0.5;
+      return f <= apexF
+        ? rake.startMm + (rake.middleMm - rake.startMm) * (apexF > 0 ? f / apexF : 0)
+        : rake.middleMm + (rake.endMm - rake.middleMm) * (apexF < 1 ? (f - apexF) / (1 - apexF) : 0);
     }
     return rake.startMm + (rake.endMm - rake.startMm) * f;
   };
 
   // Corner-makeup anchors of one segment can sit at negative `s` (or beyond `segLen`), physically
   // overlapping the footprint of an ADJACENT segment. These two helpers test a world point against
-  // every segment's openings/roofline, so cuts and head-height caps work across the corner.
+  // every OTHER segment's openings/roofline, so cuts and head-height caps work across the corner.
+  // The current segment's own opening is excluded here — it's handled precisely by the exact
+  // daylight-width check in `cut()` below, so re-testing it with this wider (+2 stud thicknesses,
+  // to account for a corner anchor's own physical width) margin would over-cut studs that sit just
+  // outside the door but not actually within it.
   const halfDepthPts = depthPts / 2;
-  const nearAnyOpening = (p: PagePoint): boolean => {
+  const nearAnyOpening = (p: PagePoint, ownSegmentIndex: number): boolean => {
     for (let j = 0; j < layout.length; j += 1) {
+      if (j === ownSegmentIndex) continue;
       const segJ = layout[j];
       for (const o of openings.filter((op) => op.segmentIndex === j)) {
         const c = o.centreMm / mmPerPoint;
@@ -753,6 +962,9 @@ export function wallMembers(
     const rake = rakes.find((r) => r.segmentIndex === segIndex);
     const startH = rake ? rake.startMm : settings.wallHeightMm;
     const endH = rake ? rake.endMm : settings.wallHeightMm;
+    // The gable apex's arc-length position — distinct from `midS` (the true geometric segment
+    // midpoint, used for plate corner-extension centring, which must NOT move with the apex).
+    const apexS = rake?.gable && rake.middleMm !== undefined ? rakeApexMm(rake, segRunMm) / mmPerPoint : midS;
 
     // Vertical member (stud-like): records it for the dwang pass and emits its box. When
     // `rakeCut` is set on a raked segment, the top is cut to the underside of the sloped top
@@ -766,8 +978,13 @@ export function wallMembers(
       if (rakeCut && rake && seg.segLen > 0) {
         const sLeft = s - studThkPts / 2;
         const sRight = s + studThkPts / 2;
-        const yTopLeft = heightAt(segIndex, sLeft / seg.segLen) - topMakeup;
-        const yTopRight = heightAt(segIndex, sRight / seg.segLen) - topMakeup;
+        // A stud's jamb offset (king/jack) can overshoot this segment's own length near a short
+        // boundary segment (e.g. one carved out purely to carry a gable apex) — look up the
+        // roofline at its true physical position across all segments (like `ceilingMmAt` already
+        // does for the non-rake-cut branch below) instead of clamping to this segment's own rake,
+        // which would silently under- or over-cut the member.
+        const yTopLeft = ceilingMmAt(pointAt(seg, sLeft));
+        const yTopRight = ceilingMmAt(pointAt(seg, sRight));
         if (Math.min(yTopLeft, yTopRight) - yB <= 0) return;
         const quad: [number, number][] = [
           [0, M(yB)],
@@ -790,8 +1007,8 @@ export function wallMembers(
           verticals.push({ x: sD, yB, yT });
           const sLeftD = sD - studThkPts / 2;
           const sRightD = sD + studThkPts / 2;
-          const yTL = heightAt(segIndex, Math.max(0, Math.min(1, sLeftD / seg.segLen))) - topMakeup;
-          const yTR = heightAt(segIndex, Math.max(0, Math.min(1, sRightD / seg.segLen))) - topMakeup;
+          const yTL = ceilingMmAt(pointAt(seg, sLeftD));
+          const yTR = ceilingMmAt(pointAt(seg, sRightD));
           if (Math.min(yTL, yTR) - yB > 0) {
             const quadD: [number, number][] = [[0, M(yB)], [thkM, M(yB)], [thkM, M(yTR)], [0, M(yTL)]];
             members.push({ kind: "stud", lengthM: M((yTL + yTR) / 2 - yB), position: [fx(sLeftD), 0, fz(sLeftD)], size: [thkM, M(Math.max(yTL, yTR) - yB), depthM], yaw, pitch: 0, wedge: { quad: quadD, depthM } });
@@ -828,12 +1045,12 @@ export function wallMembers(
       members.push({ kind: "plate", lengthM: plateLenM, position: [fx(plateMidS), M(l * STUD_THICKNESS_MM + STUD_THICKNESS_MM / 2), fz(plateMidS)], size: [plateLenM, thkM, depthM], yaw, pitch: 0 });
     }
     // Top plate(s): one sloped piece spanning the segment, or (for a gable) two pieces meeting at
-    // the apex (`middleMm`) at the segment midpoint.
+    // the apex (`middleMm`) at `apexS` (the segment midpoint unless `middlePositionMm` overrides it).
     const topPieces =
       rake?.gable && rake.middleMm !== undefined
         ? [
-            { s0: 0, s1: midS, h0: startH, h1: rake.middleMm },
-            { s0: midS, s1: seg.segLen, h0: rake.middleMm, h1: endH },
+            { s0: 0, s1: apexS, h0: startH, h1: rake.middleMm },
+            { s0: apexS, s1: seg.segLen, h0: rake.middleMm, h1: endH },
           ]
         : [{ s0: 0, s1: seg.segLen, h0: startH, h1: endH }];
     for (const piece of topPieces) {
@@ -881,15 +1098,19 @@ export function wallMembers(
     // Studs (anchors + regulars + gable apex studs not cut by an opening).
     const segOpenings = openings.filter((o) => o.segmentIndex === segIndex);
     const cut = (s: number) =>
-      segOpenings.some((o) => Math.abs(s - o.centreMm / mmPerPoint) <= o.daylightWidthMm / mmPerPoint / 2 + 2 * studThkPts) ||
-      nearAnyOpening(pointAt(seg, s));
+      segOpenings.some((o) => Math.abs(s - o.centreMm / mmPerPoint) <= o.daylightWidthMm / mmPerPoint / 2) ||
+      nearAnyOpening(pointAt(seg, s), segIndex);
     // Gable apex: a stud under each side's top plate, meeting at the ridge. Corner-makeup anchors
     // and the gable apex pair are otherwise drawn unconditionally — but if an opening cuts through
     // here, they become jack (and sill jack) studs below, like any other cut stud.
-    const gableApexS = rake?.gable && rake.middleMm !== undefined ? [midS - studThkPts / 2, midS + studThkPts / 2] : [];
-    const cutCandidates = [...seg.anchors, ...gableApexS];
-    for (const s of [...cutCandidates.filter((x) => !cut(x)), ...seg.regular.filter((x) => !cut(x))]) {
-      addV("stud", s, bottomMakeup, heightAt(segIndex, seg.segLen > 0 ? s / seg.segLen : 0) - topMakeup, true);
+    const gableApexS = rake?.gable && rake.middleMm !== undefined ? [apexS - studThkPts / 2, apexS + studThkPts / 2] : [];
+    // Anchor/gable-apex candidates and the regular grid are computed independently and can
+    // coincidentally land on (or within a fraction of a mm of) the same position — e.g. a gable
+    // apex offset by half a stud thickness landing exactly on a grid line — which would otherwise
+    // draw/count the same physical stud twice (both as a full stud and, if cut, as two jacks).
+    const allCandidates = dedupePositions([...seg.anchors, ...gableApexS, ...seg.regular], 1 / mmPerPoint);
+    for (const s of allCandidates.filter((x) => !cut(x))) {
+      addV("stud", s, bottomMakeup, ceilingMmAt(pointAt(seg, s)), true);
     }
 
     // Opening members.
@@ -908,7 +1129,7 @@ export function wallMembers(
       const head = Math.min(sill + o.daylightHeightMm, rakeHeadLimit);
       openMeta.push({ centrePts, dwHalf, sill, head });
 
-      for (const k of jambs.kings) addV("king", k, bottomMakeup, heightAt(segIndex, k / seg.segLen) - topMakeup, true); // full, follows rake
+      for (const k of jambs.kings) addV("king", k, bottomMakeup, ceilingMmAt(pointAt(seg, k)), true); // full, follows rake
       for (const t of jambs.trimmers) addV("trimmer", t, bottomMakeup, head); // full: bottom plate → underside of lintel
       const lintelLenM = M(o.daylightWidthMm + 2 * STUD_THICKNESS_MM);
       const lintelSizeOverride = o.lintelSize;
@@ -920,8 +1141,8 @@ export function wallMembers(
         const plyOffset = (p - (o.lintelPly - 1) / 2) * plyDepthM;
         members.push({ kind: "lintel", sizeOverride: lintelSizeOverride, lengthM: lintelLenM, position: [fx(centrePts) + Math.sin(yaw) * plyOffset, M(head + lintelDepth / 2), fz(centrePts) + Math.cos(yaw) * plyOffset], size: [lintelLenM, M(lintelDepth), plyDepthM], yaw, pitch: 0 });
       }
-      const jackPositions = [...seg.regular, ...cutCandidates].filter((s) => Math.abs(s - centrePts) < dwHalf);
-      for (const s of jackPositions) addV("jack", s, head + lintelDepth, heightAt(segIndex, s / seg.segLen) - topMakeup, true);
+      const jackPositions = allCandidates.filter((s) => Math.abs(s - centrePts) <= dwHalf);
+      for (const s of jackPositions) addV("jack", s, head + lintelDepth, ceilingMmAt(pointAt(seg, s)), true);
 
       if (isWindow) {
         members.push({ kind: "sill", lengthM: M(o.daylightWidthMm), position: [fx(centrePts), M(sill - STUD_THICKNESS_MM / 2), fz(centrePts)], size: [M(o.daylightWidthMm), thkM, depthM], yaw, pitch: 0 });

@@ -11,6 +11,8 @@ import {
   parseFramingSettings,
   parseWallFraming,
   projectOntoPath,
+  reindexFramingForVertexDeletion,
+  reindexFramingForVertexInsertion,
   serializeWallFraming,
   STUD_THICKNESS_MM,
   wallStudPositions,
@@ -1140,7 +1142,18 @@ export function ViewerCanvas({
   // Right-click → Door options: the opening being edited in place.
   const [pendingOpeningEdit, setPendingOpeningEdit] = useState<{ measurementId: number; index: number; template: OpeningTemplate } | null>(null);
   // Right-click → Set Raking Frame: the segment being raked.
-  const [pendingRake, setPendingRake] = useState<{ measurementId: number; segmentIndex: number; start: number; end: number; gable: boolean; middle?: number } | null>(null);
+  const [pendingRake, setPendingRake] = useState<{
+    measurementId: number;
+    segmentIndex: number;
+    start: number;
+    end: number;
+    gable: boolean;
+    middle?: number;
+    middlePosition?: number;
+    segLenMm: number;
+    startPoint: PagePoint;
+    endPoint: PagePoint;
+  } | null>(null);
   // Ctrl-hover (select mode): ghost position for a manually-placed extra stud.
   const [studGhost, setStudGhost] = useState<{ measurementId: number; segmentIndex: number; centreMm: number } | null>(null);
   // Right-click → Double studs → Select studs: interactive stud-pick mode.
@@ -1709,6 +1722,27 @@ export function ViewerCanvas({
       ? overlayMeasurements.filter((m) => !(m.measurement_type === "array" && m.dimension_group_id === activeDimensionGroupId))
       : overlayMeasurements;
     drawOverlays(ctx, overlaysToRender, groupColours, groupProps, overlayColour, pan, zoom, page, pageIndex, selectedSet, editPreview, pageScale?.mm_per_point ?? null);
+    if (pendingRake) {
+      // While the raking-frame dialog is open, mark which real wall vertex is "Start" vs "End" —
+      // the dialog's mm-from-start fields are otherwise ambiguous relative to the drawing.
+      const sp = pageToScreen(pendingRake.startPoint.x, pendingRake.startPoint.y, page.height_pts, pan, zoom);
+      const ep = pageToScreen(pendingRake.endPoint.x, pendingRake.endPoint.y, page.height_pts, pan, zoom);
+      ctx.save();
+      ctx.font = "bold 12px Segoe UI, sans-serif";
+      ctx.textAlign = "center";
+      for (const [pt, label] of [[sp, "S"], [ep, "E"]] as const) {
+        ctx.beginPath();
+        ctx.arc(pt.x, pt.y, 9, 0, Math.PI * 2);
+        ctx.fillStyle = "#FFB300";
+        ctx.fill();
+        ctx.strokeStyle = "#00000066";
+        ctx.lineWidth = 1;
+        ctx.stroke();
+        ctx.fillStyle = "#000000";
+        ctx.fillText(label, pt.x, pt.y + 4);
+      }
+      ctx.restore();
+    }
     if (measuring) {
       if (drawingType === "line") {
         // Line mode: draw the detected wall segment as the live preview instead of a rubber-band.
@@ -1959,7 +1993,7 @@ export function ViewerCanvas({
         }
       }
     }
-  }, [activeProps, activeDimensionGroupId, arrayDirection, arrayExtraMembers, arraySpacingPts, arrayTrimDraft, arrayTrimKeepPt, arrayTrimMode, arrayTrimType, calibDialog, calibPoints, calibrating, clipboard, cursorPagePoint, doc, doubleStudSelect, draftColour, draftPoints, draftStyle, drawingArea, drawingArray, drawingFraming, drawingType, editPreview, groupColours, groupProps, lightMode, lineSnapResult, marqueeState, measuring, moveMode, openingGhost, openingPlacement, overlayColour, overlayMeasurements, page, pageIndex, pageScale, pageSize.height, pageSize.width, pan, pasteMode, selectedSet, shiftHeld, snapPoint, snapType, studGhost, viewportSize.height, viewportSize.width, zoom]);
+  }, [activeProps, activeDimensionGroupId, arrayDirection, arrayExtraMembers, arraySpacingPts, arrayTrimDraft, arrayTrimKeepPt, arrayTrimMode, arrayTrimType, calibDialog, calibPoints, calibrating, clipboard, cursorPagePoint, doc, doubleStudSelect, draftColour, draftPoints, draftStyle, drawingArea, drawingArray, drawingFraming, drawingType, editPreview, groupColours, groupProps, lightMode, lineSnapResult, marqueeState, measuring, moveMode, openingGhost, openingPlacement, overlayColour, overlayMeasurements, page, pageIndex, pageScale, pageSize.height, pageSize.width, pan, pasteMode, pendingRake, selectedSet, shiftHeld, snapPoint, snapType, studGhost, viewportSize.height, viewportSize.width, zoom]);
 
   function clampPan(nextPan: { x: number; y: number }, nextZoom = zoom) {
     if (!page) return nextPan;
@@ -2415,6 +2449,10 @@ export function ViewerCanvas({
             const framing = parseWallFraming(measurement.framing_json);
             const existingRake = framing.rakes.find((r) => r.segmentIndex === seg.segmentIndex);
             const groupSettings = parseFramingSettings(groupProps[measurement.dimension_group_id]?.framing_props_json ?? null);
+            const mmpp = pageScale?.mm_per_point ?? null;
+            const a = points[seg.segmentIndex];
+            const b = points[seg.segmentIndex + 1];
+            const segLenMm = mmpp && a && b ? Math.hypot(b.x - a.x, b.y - a.y) * mmpp : 0;
             items.push({
               label: existingRake ? "Edit raking frame…" : "Set raking frame…",
               action: () =>
@@ -2425,6 +2463,10 @@ export function ViewerCanvas({
                   end: existingRake?.endMm ?? groupSettings.wallHeightMm,
                   gable: existingRake?.gable ?? false,
                   middle: existingRake?.middleMm,
+                  middlePosition: existingRake?.middlePositionMm,
+                  segLenMm,
+                  startPoint: a,
+                  endPoint: b,
                 }),
             });
             if (existingRake) items.push({ label: "Clear raking frame", danger: true, action: () => clearRake(id, seg.segmentIndex) });
@@ -2527,6 +2569,15 @@ export function ViewerCanvas({
     const insertAt = segmentIndex + 1;
     const next = [...points.slice(0, insertAt), point, ...points.slice(insertAt)];
     void updateMeasurementGeometry(id, JSON.stringify(next)).catch((error) => onStatusChange(`ERROR: ${error}`));
+
+    const measurement = overlayMeasurements.find((m) => m.id === id);
+    const mmpp = pageScale?.mm_per_point ?? null;
+    if (measurement?.measurement_type === "timber_framing" && mmpp) {
+      const existing = parseWallFraming(measurement.framing_json);
+      const { framing, warnings } = reindexFramingForVertexInsertion(existing, points, segmentIndex, point, mmpp);
+      void updateMeasurementFraming(id, serializeWallFraming(framing)).catch((error) => onStatusChange(`ERROR: ${error}`));
+      if (warnings.length) onStatusChange(warnings.join(" "));
+    }
   }
 
   // Removes a vertex, leaving a straight segment between its neighbours.
@@ -2535,6 +2586,15 @@ export function ViewerCanvas({
     if (!points) return;
     const next = points.filter((_, index) => index !== vertexIndex);
     void updateMeasurementGeometry(id, JSON.stringify(next)).catch((error) => onStatusChange(`ERROR: ${error}`));
+
+    const measurement = overlayMeasurements.find((m) => m.id === id);
+    const mmpp = pageScale?.mm_per_point ?? null;
+    if (measurement?.measurement_type === "timber_framing" && mmpp) {
+      const existing = parseWallFraming(measurement.framing_json);
+      const { framing, warnings } = reindexFramingForVertexDeletion(existing, points, vertexIndex, mmpp);
+      void updateMeasurementFraming(id, serializeWallFraming(framing)).catch((error) => onStatusChange(`ERROR: ${error}`));
+      if (warnings.length) onStatusChange(warnings.join(" "));
+    }
   }
 
   function handleDoubleClick() {
@@ -2607,11 +2667,14 @@ export function ViewerCanvas({
   }
 
   // Sets (or replaces) the raking frame on one segment of a wall.
-  function setRake(measurementId: number, segmentIndex: number, startMm: number, endMm: number, gable: boolean, middleMm?: number) {
+  function setRake(measurementId: number, segmentIndex: number, startMm: number, endMm: number, gable: boolean, middleMm?: number, middlePositionMm?: number) {
     const measurement = overlayMeasurements.find((m) => m.id === measurementId);
     if (!measurement) return;
     const existing = parseWallFraming(measurement.framing_json);
-    const rakes = [...existing.rakes.filter((r) => r.segmentIndex !== segmentIndex), { segmentIndex, startMm, endMm, gable, middleMm: gable ? middleMm : undefined }];
+    const rakes = [
+      ...existing.rakes.filter((r) => r.segmentIndex !== segmentIndex),
+      { segmentIndex, startMm, endMm, gable, middleMm: gable ? middleMm : undefined, middlePositionMm: gable ? middlePositionMm : undefined },
+    ];
     void updateMeasurementFraming(measurementId, serializeWallFraming({ ...existing, rakes })).catch((error) => onStatusChange(`ERROR: ${error}`));
   }
 
@@ -3542,10 +3605,12 @@ export function ViewerCanvas({
         initialStart={pendingRake.start}
         initialEnd={pendingRake.end}
         initialMiddle={pendingRake.middle}
+        initialMiddlePosition={pendingRake.middlePosition}
         initialGable={pendingRake.gable}
+        segLenMm={pendingRake.segLenMm}
         onCancel={() => setPendingRake(null)}
-        onConfirm={(startMm, endMm, gable, middleMm) => {
-          setRake(pendingRake.measurementId, pendingRake.segmentIndex, startMm, endMm, gable, middleMm);
+        onConfirm={(startMm, endMm, gable, middleMm, middlePositionMm) => {
+          setRake(pendingRake.measurementId, pendingRake.segmentIndex, startMm, endMm, gable, middleMm, middlePositionMm);
           setPendingRake(null);
         }}
       />
