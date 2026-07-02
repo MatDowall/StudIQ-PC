@@ -118,6 +118,11 @@ function pagePixelSize(page: PageMeta, zoom: number) {
   };
 }
 
+// PDF points → screen pixels at 96 DPI, before pan/zoom.
+function pageScaleFactor(zoom: number) {
+  return (zoom * 96) / 72;
+}
+
 function pageToScreen(
   ptX: number,
   ptY: number,
@@ -125,7 +130,7 @@ function pageToScreen(
   pan: { x: number; y: number },
   zoom: number,
 ) {
-  const scale = (zoom * 96) / 72;
+  const scale = pageScaleFactor(zoom);
   return {
     x: ptX * scale - pan.x,
     y: (pageHeightPts - ptY) * scale - pan.y,
@@ -201,6 +206,27 @@ function drawCountMarker(ctx: CanvasRenderingContext2D, x: number, y: number, co
   ctx.lineTo(x, y + r);
   ctx.stroke();
   ctx.restore();
+}
+
+/** Custom count shape: a rectangle centred at a point, sized to the group's real-world Height/Width. */
+function drawCustomCountShape(ctx: CanvasRenderingContext2D, x: number, y: number, halfW: number, halfH: number, colour: string, selected = false) {
+  ctx.save();
+  ctx.strokeStyle = colour;
+  ctx.lineWidth = selected ? 3 : 2;
+  ctx.strokeRect(x - halfW, y - halfH, halfW * 2, halfH * 2);
+  ctx.restore();
+}
+
+/**
+ * Screen-space half-extents for a custom count shape, or null when it can't be sized (no page
+ * scale yet, or Height/Width not set) — callers should fall back to the standard marker.
+ */
+function customCountHalfExtentsPx(props: GroupProps, mmPerPoint: number | null, zoom: number): { halfW: number; halfH: number } | null {
+  if (!mmPerPoint || props.default_width <= 0 || props.default_height <= 0) return null;
+  const scale = pageScaleFactor(zoom);
+  const wPts = (props.default_width * 1000) / mmPerPoint;
+  const hPts = (props.default_height * 1000) / mmPerPoint;
+  return { halfW: (wPts * scale) / 2, halfH: (hPts * scale) / 2 };
 }
 
 function drawVertices(ctx: CanvasRenderingContext2D, screenPts: PagePoint[], colour: string, selected = false) {
@@ -416,11 +442,17 @@ function drawOverlays(
     const style = negative ? props?.neg_style : props?.pos_style;
     const selected = selectedIds.has(measurement.id);
 
-    // Count dimensions are point markers, not paths.
+    // Count dimensions are point markers, not paths. "custom" groups stamp a scaled rectangle
+    // instead of the ringed-cross marker, falling back to the marker if there's no page scale.
     if (measurement.measurement_type === "count") {
+      const extents = props?.count_type === "custom" ? customCountHalfExtentsPx(props, mmPerPoint, zoom) : null;
       for (const point of points) {
         const s = pageToScreen(point.x, point.y, page.height_pts, pan, zoom);
-        drawCountMarker(ctx, s.x, s.y, colour, selected);
+        if (extents) {
+          drawCustomCountShape(ctx, s.x, s.y, extents.halfW, extents.halfH, colour, selected);
+        } else {
+          drawCountMarker(ctx, s.x, s.y, colour, selected);
+        }
       }
       continue;
     }
@@ -1767,6 +1799,29 @@ export function ViewerCanvas({
           // Baseline phase: rubber-band the first segment.
           drawDraft(ctx, draftPoints, livePoint, draftColour, pan, zoom, page, draftStyle, false);
         }
+      } else if (drawingCount) {
+        // Count: ghost the marker/shape that will be stamped at the cursor, same translucent
+        // treatment as the move-ghost below (reuses drawOverlays so marker vs. custom-shape
+        // rendering stays in one place).
+        const livePoint = snapPoint ?? cursorPagePoint;
+        if (livePoint && activeDimensionGroupId !== null) {
+          const ghost: MeasurementDto = {
+            id: -1,
+            dimension_group_id: activeDimensionGroupId,
+            drawing_id: activeDrawingId ?? 0,
+            page_index: pageIndex,
+            measurement_type: "count",
+            geometry_json: JSON.stringify([livePoint]),
+            polarity: draftNegative ? -1 : 1,
+            quantity: null,
+            uom: null,
+            framing_json: null,
+          };
+          ctx.save();
+          ctx.globalAlpha = 0.65;
+          drawOverlays(ctx, [ghost], groupColours, groupProps, overlayColour, pan, zoom, page, pageIndex, new Set(), null, pageScale?.mm_per_point ?? null);
+          ctx.restore();
+        }
       } else {
         const livePoint = snapPoint ?? cursorPagePoint;
         drawDraft(ctx, draftPoints, livePoint, draftColour, pan, zoom, page, draftStyle, drawingArea);
@@ -2899,9 +2954,15 @@ export function ViewerCanvas({
       if (!Array.isArray(points) || points.length < 1) continue;
       const screenPts = points.map((point) => pageToScreen(point.x, point.y, page.height_pts, pan, zoom));
 
-      // Count markers are hit by proximity to the point.
+      // Count markers are hit by proximity to the point; custom shapes are hit by their
+      // rendered rectangle footprint instead.
       if (measurement.measurement_type === "count") {
-        if (screenPts.some((s) => Math.hypot(screenX - s.x, screenY - s.y) <= 8)) return measurement.id;
+        const props = groupProps[measurement.dimension_group_id];
+        const extents = props?.count_type === "custom" ? customCountHalfExtentsPx(props, pageScale?.mm_per_point ?? null, zoom) : null;
+        const hit = extents
+          ? screenPts.some((s) => Math.abs(screenX - s.x) <= extents.halfW + tolerance && Math.abs(screenY - s.y) <= extents.halfH + tolerance)
+          : screenPts.some((s) => Math.hypot(screenX - s.x, screenY - s.y) <= 8);
+        if (hit) return measurement.id;
         continue;
       }
       if (screenPts.length < 2) continue;
@@ -3083,9 +3144,14 @@ export function ViewerCanvas({
       const screenPts = points.map((point) => pageToScreen(point.x, point.y, page.height_pts, pan, zoom));
       const props = groupProps[measurement.dimension_group_id];
 
-      // Count markers: hover by proximity to the point, showing the count value.
+      // Count markers: hover by proximity to the point (or the shape footprint for custom
+      // shapes), showing the count value.
       if (measurement.measurement_type === "count") {
-        if (screenPts.some((s) => Math.hypot(screenX - s.x, screenY - s.y) <= 8)) {
+        const extents = props?.count_type === "custom" ? customCountHalfExtentsPx(props, pageScale?.mm_per_point ?? null, zoom) : null;
+        const hovered = extents
+          ? screenPts.some((s) => Math.abs(screenX - s.x) <= extents.halfW && Math.abs(screenY - s.y) <= extents.halfH)
+          : screenPts.some((s) => Math.hypot(screenX - s.x, screenY - s.y) <= 8);
+        if (hovered) {
           const quantity = props ? deriveQuantity(points, pageScale?.mm_per_point ?? null, props) : null;
           setHoverInfo({ x: clientX, y: clientY, text: quantity ? formatQuantity(quantity) : "1" });
           return;

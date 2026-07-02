@@ -19,6 +19,9 @@ export interface GroupProps {
   // Timber-framing settings (framing size, stud spacing, plate config, wall height, dwang
   // centres) as a JSON blob; null for non-framing groups. Parsed via lib/framing.ts.
   framing_props_json: string | null;
+  // "marker" | "custom" — only meaningful when measurement_type === "count". "custom" renders
+  // a rectangle sized by default_width/default_height instead of the ringed-cross marker.
+  count_type: string;
 }
 
 export interface PagePoint {

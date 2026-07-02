@@ -563,6 +563,38 @@ function buildIndex(primitives: VectorPrimitive[]): IndexedPrimitive[] {
     .filter((item) => item.snapPoints.length > 0);
 }
 
+/**
+ * Synthesises a "rect" VectorPrimitive for each already-placed custom-shape Count measurement
+ * on the given page, so its corners/edge-midpoints become snap candidates (via `buildIndex`) —
+ * this is what lets tiled shapes (e.g. plasterboard sheets) align to each other.
+ */
+function countShapeRectPrimitives(
+  measurements: MeasurementDto[],
+  groupProps: Record<number, GroupProps>,
+  pageIndex: number,
+  mmPerPoint: number | null,
+): VectorPrimitive[] {
+  if (!mmPerPoint) return [];
+  const prims: VectorPrimitive[] = [];
+  for (const measurement of measurements) {
+    if (measurement.measurement_type !== "count" || measurement.page_index !== pageIndex) continue;
+    const props = groupProps[measurement.dimension_group_id];
+    if (!props || props.count_type !== "custom" || props.default_width <= 0 || props.default_height <= 0) continue;
+    let points: SnapPoint[];
+    try {
+      points = JSON.parse(measurement.geometry_json);
+    } catch {
+      continue;
+    }
+    const centre = points[0];
+    if (!centre) continue;
+    const widthPts = (props.default_width * 1000) / mmPerPoint;
+    const heightPts = (props.default_height * 1000) / mmPerPoint;
+    prims.push({ type: "rect", x: centre.x - widthPts / 2, y: centre.y - heightPts / 2, width: widthPts, height: heightPts });
+  }
+  return prims;
+}
+
 function findIntersection(a: LineSegment, b: LineSegment): SnapPoint | null {
   const denominator = (a.x1 - a.x2) * (b.y1 - b.y2) - (a.y1 - a.y2) * (b.x1 - b.x2);
   if (Math.abs(denominator) < 1e-9) return null;
@@ -1433,8 +1465,49 @@ export const useAppStore = create<AppStore>((set, get) => ({
   },
 
   resolveSnap: (cursorPageX, cursorPageY, pageIndex, radiusPts) => {
-    const index = get().vectorIndex[pageIndex];
-    if (!index) {
+    const { overlayMeasurements, groupProps, pageScale, activeDimensionGroupId, vectorIndex } = get();
+    const mmPerPoint = pageScale?.mm_per_point ?? null;
+    const activeProps = activeDimensionGroupId !== null ? groupProps[activeDimensionGroupId] : undefined;
+
+    // While placing a Count dimension, already-placed custom-shape counts become snap targets
+    // too (their corners/edge-midpoints), so tiled shapes (e.g. plasterboard sheets) can align.
+    const countIndex =
+      activeProps?.measurement_type === "count"
+        ? buildIndex(countShapeRectPrimitives(overlayMeasurements, groupProps, pageIndex, mmPerPoint))
+        : [];
+
+    // Adjacency candidates: while placing a new custom-shape count, offer the point where its
+    // centre would sit flush against an already-placed custom shape's edge — true edge-to-edge
+    // tiling, not just corner/midpoint alignment.
+    const extraPoints: IndexedSnapPoint[] = [];
+    if (activeProps?.measurement_type === "count" && activeProps.count_type === "custom" && mmPerPoint && activeProps.default_width > 0 && activeProps.default_height > 0) {
+      const halfNewW = (activeProps.default_width * 1000) / mmPerPoint / 2;
+      const halfNewH = (activeProps.default_height * 1000) / mmPerPoint / 2;
+      for (const measurement of overlayMeasurements) {
+        if (measurement.measurement_type !== "count" || measurement.page_index !== pageIndex) continue;
+        const existingProps = groupProps[measurement.dimension_group_id];
+        if (!existingProps || existingProps.count_type !== "custom" || existingProps.default_width <= 0 || existingProps.default_height <= 0) continue;
+        let points: SnapPoint[];
+        try {
+          points = JSON.parse(measurement.geometry_json);
+        } catch {
+          continue;
+        }
+        const centre = points[0];
+        if (!centre) continue;
+        const halfExistingW = (existingProps.default_width * 1000) / mmPerPoint / 2;
+        const halfExistingH = (existingProps.default_height * 1000) / mmPerPoint / 2;
+        extraPoints.push(
+          { x: centre.x + halfExistingW + halfNewW, y: centre.y, type: "endpoint" },
+          { x: centre.x - halfExistingW - halfNewW, y: centre.y, type: "endpoint" },
+          { x: centre.x, y: centre.y + halfExistingH + halfNewH, type: "endpoint" },
+          { x: centre.x, y: centre.y - halfExistingH - halfNewH, type: "endpoint" },
+        );
+      }
+    }
+
+    const index = [...(vectorIndex[pageIndex] ?? []), ...countIndex];
+    if (index.length === 0 && extraPoints.length === 0) {
       set({ snapPoint: null, snapType: null });
       return;
     }
@@ -1446,6 +1519,16 @@ export const useAppStore = create<AppStore>((set, get) => ({
       midpoint: null,
       intersection: null,
     };
+
+    for (const point of extraPoints) {
+      const dx = point.x - cursorPageX;
+      const dy = point.y - cursorPageY;
+      const distanceSq = dx * dx + dy * dy;
+      const current = bestByType.endpoint;
+      if (distanceSq <= radiusSq && (!current || distanceSq < current.distanceSq)) {
+        bestByType.endpoint = { point: { x: point.x, y: point.y }, distanceSq };
+      }
+    }
 
     for (const item of index) {
       if (

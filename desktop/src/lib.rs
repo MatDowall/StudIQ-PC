@@ -288,6 +288,10 @@ pub struct DimensionGroupPropsDto {
     /// centres) as an opaque JSON blob. `None` for non-framing groups. The frontend owns the
     /// shape; the backend stores and round-trips it without interpreting it.
     pub framing_props_json: Option<String>,
+    /// "marker" | "custom" — only meaningful when `measurement_type == "count"`. "custom"
+    /// renders a rectangle sized by `default_width`/`default_height` instead of the standard
+    /// ringed-cross marker.
+    pub count_type: String,
 }
 
 /// A selectable destination folder in the dimensions tree, with its full `/`-joined path.
@@ -1393,10 +1397,10 @@ async fn copy_dimension_group(
         INSERT INTO dimension_group_props
             (node_id, measurement_type, default_display, default_multiplier, default_width,
              default_height, default_offset, add_to_gfa, pos_colour, pos_style, neg_colour,
-             neg_style, weight_uom, framing_props_json)
+             neg_style, weight_uom, framing_props_json, count_type)
         SELECT ?, measurement_type, default_display, default_multiplier, default_width,
                default_height, default_offset, add_to_gfa, pos_colour, pos_style, neg_colour,
-               neg_style, weight_uom, framing_props_json
+               neg_style, weight_uom, framing_props_json, count_type
         FROM dimension_group_props WHERE node_id = ?
         "#,
     )
@@ -1847,6 +1851,7 @@ async fn get_page_scale(
 
 const MEASUREMENT_TYPES: [&str; 5] = ["count", "length", "area", "timber_framing", "array"];
 const DISPLAY_TYPES: [&str; 7] = ["count", "length", "area", "perimeter", "wall_area", "volume", "weight"];
+const COUNT_TYPES: [&str; 2] = ["marker", "custom"];
 const LINE_STYLES: [&str; 4] = ["solid", "dashed", "dotted", "dash_dot"];
 
 /// Returns a dimension group's properties, or sensible defaults if none are stored yet
@@ -1873,7 +1878,7 @@ async fn get_dimension_group_props(
         r#"
         SELECT measurement_type, default_display, default_multiplier, default_width,
                default_height, default_offset, add_to_gfa, pos_style,
-               neg_colour, neg_style, weight_uom, framing_props_json
+               neg_colour, neg_style, weight_uom, framing_props_json, count_type
         FROM dimension_group_props
         WHERE node_id = ?
         "#,
@@ -1899,6 +1904,7 @@ async fn get_dimension_group_props(
             neg_style: row.try_get("neg_style").map_err(|e| e.to_string())?,
             weight_uom: row.try_get("weight_uom").map_err(|e| e.to_string())?,
             framing_props_json: row.try_get("framing_props_json").map_err(|e| e.to_string())?,
+            count_type: row.try_get("count_type").map_err(|e| e.to_string())?,
         });
     }
 
@@ -1918,6 +1924,7 @@ async fn get_dimension_group_props(
         neg_style: "solid".to_string(),
         weight_uom: None,
         framing_props_json: None,
+        count_type: "marker".to_string(),
     })
 }
 
@@ -1938,6 +1945,9 @@ async fn set_dimension_group_props(
     if !LINE_STYLES.contains(&props.pos_style.as_str()) || !LINE_STYLES.contains(&props.neg_style.as_str()) {
         return Err("Unsupported line style".to_string());
     }
+    if !COUNT_TYPES.contains(&props.count_type.as_str()) {
+        return Err(format!("Unsupported count_type: {}", props.count_type));
+    }
     if !props.default_multiplier.is_finite() {
         return Err("default_multiplier must be a finite number".to_string());
     }
@@ -1949,8 +1959,8 @@ async fn set_dimension_group_props(
         INSERT INTO dimension_group_props
             (node_id, measurement_type, default_display, default_multiplier, default_width,
              default_height, default_offset, add_to_gfa, pos_colour, pos_style, neg_colour,
-             neg_style, weight_uom, framing_props_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             neg_style, weight_uom, framing_props_json, count_type)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(node_id) DO UPDATE SET
             measurement_type = excluded.measurement_type,
             default_display = excluded.default_display,
@@ -1964,7 +1974,8 @@ async fn set_dimension_group_props(
             neg_colour = excluded.neg_colour,
             neg_style = excluded.neg_style,
             weight_uom = excluded.weight_uom,
-            framing_props_json = excluded.framing_props_json
+            framing_props_json = excluded.framing_props_json,
+            count_type = excluded.count_type
         "#,
     )
     .bind(props.node_id)
@@ -1981,6 +1992,7 @@ async fn set_dimension_group_props(
     .bind(&props.neg_style)
     .bind(&props.weight_uom)
     .bind(&props.framing_props_json)
+    .bind(&props.count_type)
     .execute(&db)
     .await
     .map_err(|e| format!("Failed to save dimension group props: {e}"))?;
@@ -3644,7 +3656,8 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), String> {
             neg_colour         TEXT    NOT NULL DEFAULT '#FF0000',
             neg_style          TEXT    NOT NULL DEFAULT 'solid',
             weight_uom         TEXT,
-            framing_props_json TEXT
+            framing_props_json TEXT,
+            count_type         TEXT    NOT NULL DEFAULT 'marker'
         );
         "#,
     )
@@ -3663,6 +3676,22 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), String> {
         if !msg.contains("duplicate column name") {
             return Err(format!(
                 "Failed to add dimension_group_props.framing_props_json: {msg}"
+            ));
+        }
+    }
+
+    // Project DBs created before custom-shape Count markers lack `count_type`; add it
+    // idempotently (same pattern as framing_props_json above).
+    if let Err(e) = sqlx::query(
+        "ALTER TABLE dimension_group_props ADD COLUMN count_type TEXT NOT NULL DEFAULT 'marker'",
+    )
+    .execute(pool)
+    .await
+    {
+        let msg = e.to_string();
+        if !msg.contains("duplicate column name") {
+            return Err(format!(
+                "Failed to add dimension_group_props.count_type: {msg}"
             ));
         }
     }

@@ -23,6 +23,10 @@ const MEASUREMENT_TYPES = [
   { value: "timber_framing", label: "Timber Framing" },
   { value: "array", label: "Array" },
 ] as const;
+const COUNT_TYPES = [
+  { value: "marker", label: "Marker" },
+  { value: "custom", label: "Custom..." },
+];
 const LINE_STYLES = [
   { value: "solid", label: "Solid" },
   { value: "dashed", label: "Dashed" },
@@ -100,6 +104,12 @@ export function DimensionGroupPropertiesDialog({
   const [negColour, setNegColour] = useState(initial.neg_colour);
   const [negStyle, setNegStyle] = useState(initial.neg_style);
   const [weightUom, setWeightUom] = useState(initial.weight_uom ?? "");
+  const [countType, setCountType] = useState(initial.count_type ?? "marker");
+  // Custom count shape Height/Width are edited in millimetres (the natural unit for a small
+  // real-world object — a fixture, a sheet, etc.) even though default_width/default_height are
+  // stored in metres everywhere else in the app; converted at the confirm() boundary.
+  const [customHeightMm, setCustomHeightMm] = useState(String(initial.default_height * 1000));
+  const [customWidthMm, setCustomWidthMm] = useState(String(initial.default_width * 1000));
 
   // Timber-framing settings (shown only when measurement type = Timber Framing). Kept as
   // editable strings/booleans, mirroring the numeric fields above; serialised on confirm.
@@ -116,7 +126,10 @@ export function DimensionGroupPropertiesDialog({
 
   const isFraming = measurementType === "timber_framing";
   const isArray = measurementType === "array";
+  const isCount = measurementType === "count";
+  const isCustomCount = isCount && countType === "custom";
   const displayOptions = DISPLAYS_BY_TYPE[measurementType] ?? DISPLAYS_BY_TYPE.length;
+  const customShapeInvalid = isCustomCount && (parseNumber(customWidthMm, 0) <= 0 || parseNumber(customHeightMm, 0) <= 0);
 
   function changeMeasurementType(next: string) {
     setMeasurementType(next);
@@ -155,8 +168,10 @@ export function DimensionGroupPropertiesDialog({
       // Framing always displays as length. Array displays as length or count.
       default_display: isFraming ? "length" : defaultDisplay,
       default_multiplier: parseNumber(multiplier, 1),
-      default_width: parseNumber(width, 0),
-      default_height: parseNumber(height, 0),
+      // Custom count shapes are edited in mm above; everything else edits default_width/height
+      // in metres directly. Marker-mode count groups don't use these — keep them unchanged.
+      default_width: isCount ? (isCustomCount ? parseNumber(customWidthMm, 0) / 1000 : initial.default_width) : parseNumber(width, 0),
+      default_height: isCount ? (isCustomCount ? parseNumber(customHeightMm, 0) / 1000 : initial.default_height) : parseNumber(height, 0),
       default_offset: parseNumber(offset, 0),
       add_to_gfa: addToGfa,
       pos_colour: posColour,
@@ -166,6 +181,7 @@ export function DimensionGroupPropertiesDialog({
       weight_uom: weightUom.trim() ? weightUom.trim() : null,
       // Persist framing settings when this is a framing group; otherwise keep any existing blob.
       framing_props_json: isFraming ? serializeFramingSettings(framingSettings) : initial.framing_props_json,
+      count_type: isCount ? countType : initial.count_type,
     });
   }
 
@@ -183,7 +199,39 @@ export function DimensionGroupPropertiesDialog({
               ))}
             </select>
           </Field>
-          {!isFraming ? (
+          {isCount ? (
+            <>
+              <Field label="Count Type">
+                <select value={countType} onChange={(e) => setCountType(e.target.value)} style={{ ...inputStyle, flex: 1 }}>
+                  {COUNT_TYPES.map((type) => (
+                    <option key={type.value} value={type.value}>
+                      {type.label}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+              {isCustomCount ? (
+                <>
+                  <Field label="Height">
+                    <input type="number" value={customHeightMm} onChange={(e) => setCustomHeightMm(e.target.value)} style={{ ...inputStyle, flex: 1 }} required />
+                    <span style={{ color: theme.text.secondary, fontSize: 12 }}>mm</span>
+                  </Field>
+                  <Field label="Width">
+                    <input type="number" value={customWidthMm} onChange={(e) => setCustomWidthMm(e.target.value)} style={{ ...inputStyle, flex: 1 }} required />
+                    <span style={{ color: theme.text.secondary, fontSize: 12 }}>mm</span>
+                  </Field>
+                  {customShapeInvalid ? (
+                    <div style={{ fontSize: 11, color: theme.text.secondary, textAlign: "right" }}>
+                      Height and Width are required for a custom shape.
+                    </div>
+                  ) : null}
+                </>
+              ) : null}
+              <Field label="Default Multiplier">
+                <input type="number" value={multiplier} onChange={(e) => setMultiplier(e.target.value)} style={{ ...inputStyle, flex: 1 }} />
+              </Field>
+            </>
+          ) : !isFraming ? (
             <>
               <Field label="Default Display">
                 <select value={defaultDisplay} onChange={(e) => setDefaultDisplay(e.target.value)} style={{ ...inputStyle, flex: 1 }}>
@@ -337,7 +385,18 @@ export function DimensionGroupPropertiesDialog({
           <button onClick={onCancel} style={{ height: 28, padding: "0 12px", background: theme.bg.input, color: theme.text.primary, border: `1px solid ${theme.border.divider}`, cursor: "pointer" }}>
             Cancel
           </button>
-          <button onClick={confirm} style={{ height: 28, padding: "0 12px", background: theme.bg.active, color: "#FFFFFF", border: `1px solid ${theme.accent}`, cursor: "pointer" }}>
+          <button
+            onClick={confirm}
+            disabled={customShapeInvalid}
+            style={{
+              height: 28,
+              padding: "0 12px",
+              background: customShapeInvalid ? theme.bg.input : theme.bg.active,
+              color: customShapeInvalid ? theme.text.disabled : "#FFFFFF",
+              border: `1px solid ${customShapeInvalid ? theme.border.divider : theme.accent}`,
+              cursor: customShapeInvalid ? "not-allowed" : "pointer",
+            }}
+          >
             Save
           </button>
         </div>
