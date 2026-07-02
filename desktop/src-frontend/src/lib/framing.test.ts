@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   DEFAULT_DOOR,
   DEFAULT_FRAMING_SETTINGS,
+  STUD_THICKNESS_MM,
   type FramingSettings,
   computeFramingGeometry,
   computeFramingQuantities,
@@ -331,6 +332,163 @@ describe("windows (M6) — 4 m wall, 90×45, single T&B, 2400 high, window at 2.
   });
   it("dwangs infill beside the opening + below the sill, skipping the glass = 5.72 m", () => {
     expect(comp("dwang")!.totalM).toBeCloseTo(5.72, 6);
+  });
+});
+
+describe("stacked openings (regression) — a window directly above a door on the same wall line", () => {
+  // Door 0–2100mm (head), a 300mm solid band, then a window from 2400mm sill to 3300mm head —
+  // both centred at 2000mm with the same 910mm daylight width, so their jamb studs land on
+  // exactly the same wall positions. Before the fix, a jack above the door ran straight through
+  // the window above it (and the window's sill jack ran straight through the door below it), and
+  // a king/trimmer that happened to coincide for both openings was emitted twice.
+  const stacked = {
+    openings: [
+      { kind: "door" as const, segmentIndex: 0, centreMm: 2000, daylightHeightMm: 2100, daylightWidthMm: 910, lintelSize: "90x45" as const, lintelPly: 1 },
+      { kind: "window" as const, segmentIndex: 0, centreMm: 2000, sillHeightMm: 2400, daylightHeightMm: 900, daylightWidthMm: 910, lintelSize: "90x45" as const, lintelPly: 1 },
+    ],
+    rakes: [],
+    extraStuds: [],
+  };
+  const s = settings({ framingSize: "90x45", wallHeightMm: 3700 });
+  const members = wallMembers(wall4m, s, MM_PER_PT, stacked);
+  const cavitiesMm = [
+    { lo: 0, hi: 2100 }, // door daylight
+    { lo: 2400, hi: 3300 }, // window daylight
+  ];
+
+  it("jack / sill-jack cripple studs never run through either opening's clear daylight", () => {
+    for (const m of members) {
+      if (m.kind !== "jack" && m.kind !== "sill_jack") continue;
+      const yBmm = (m.position[1] - m.size[1] / 2) * 1000;
+      const yTmm = (m.position[1] + m.size[1] / 2) * 1000;
+      for (const c of cavitiesMm) {
+        const overlapMm = Math.min(yTmm, c.hi) - Math.max(yBmm, c.lo);
+        expect(overlapMm).toBeLessThanOrEqual(1e-6);
+      }
+    }
+  });
+
+  it("king and trimmer studs at the shared jamb line are deduped, not doubled", () => {
+    const q = computeFramingQuantities(wall4m, s, MM_PER_PT, stacked)!;
+    expect(q.components.find((c) => c.kind === "king")!.count).toBe(2);
+    expect(q.components.find((c) => c.kind === "trimmer")!.count).toBe(2);
+  });
+
+  it("both lintels are present, aggregated as one 90×45 row of count 2", () => {
+    const q = computeFramingQuantities(wall4m, s, MM_PER_PT, stacked)!;
+    const lintelRows = q.components.filter((c) => c.kind === "lintel");
+    expect(lintelRows).toHaveLength(1);
+    expect(lintelRows[0].count).toBe(2);
+  });
+});
+
+describe("overlap priority (regression) — an opening's king lands on the wall's own flush end stud", () => {
+  // 3.4 m wall, 90×45, flush (unmitred) ends. A door centred so its right trimmer (2900 + 455 +
+  // 22.5 = 3377.5mm) lands EXACTLY on the wall's own flush end anchor (3400 − 22.5 = 3377.5mm) —
+  // the classic "opening right up against the end of the wall" case. Before this fix the generic
+  // end stud and the door's trimmer were both drawn as separate, fully overlapping full-height
+  // studs; the opening's own jamb should win and the redundant end stud should be dropped.
+  const wallEnd = [
+    { x: 0, y: 0 },
+    { x: 3400, y: 0 },
+  ];
+  const doorNearEnd = {
+    openings: [{ kind: "door" as const, segmentIndex: 0, centreMm: 2900, daylightHeightMm: 2100, daylightWidthMm: 910, lintelSize: "90x45" as const, lintelPly: 1 }],
+    rakes: [],
+    extraStuds: [],
+  };
+  const s = settings({ framingSize: "90x45", wallHeightMm: 2400 });
+
+  it("no two full-height vertical members share (near enough) the same wall position", () => {
+    const members = wallMembers(wallEnd, s, MM_PER_PT, doorNearEnd);
+    const fullHeightXsMm = members
+      .filter((m) => (m.kind === "stud" || m.kind === "king" || m.kind === "trimmer") && !m.wedge)
+      .map((m) => m.position[0] * 1000);
+    for (let i = 0; i < fullHeightXsMm.length; i += 1) {
+      for (let j = i + 1; j < fullHeightXsMm.length; j += 1) {
+        expect(Math.abs(fullHeightXsMm[i] - fullHeightXsMm[j])).toBeGreaterThanOrEqual(45);
+      }
+    }
+  });
+});
+
+describe("QA-reported real project case — a wide door and a narrower window on a gabled wall, where " +
+  "the window's right king coincidentally lands ~23mm past the door's own daylight edge", () => {
+  // Exact geometry from a real project: 140×45, 400mm centres, single T&B, 2.35m gabled wall.
+  // A 1950mm-wide door and a 1200mm-wide window (asymmetric widths/positions, not stacked/aligned)
+  // put the window's right king at 2270.9mm — just past the door's own right daylight edge
+  // (2247.9mm) but still well within reach of the door's jamb assembly. On the LEFT the window's
+  // king (935.9mm) already landed inside the door's daylight width and clipped correctly (sits on
+  // the door's lintel at 2140mm); on the RIGHT it didn't, because it was ~23mm outside the exact
+  // boundary — so it ran uncut all the way to the bottom plate. A second, independent bug: the
+  // door's own right trimmer (2270.4mm) sat only 0.4mm from the window's right king and was
+  // getting silently merged into it (king wins), hiding the trimmer from the takeoff entirely.
+  const wall = [
+    { x: 1063.019287109375, y: 992.7774047851562 },
+    { x: 1063.019287109375, y: 1125.940673828125 },
+  ];
+  const mmPerPoint = 17.638851407605607;
+  const gableSettings: FramingSettings = {
+    framingSize: "140x45",
+    studSpacingMm: 400,
+    topPlate: { on: true, double: false },
+    bottomPlate: { on: true, double: false },
+    wallHeightMm: 2400,
+    dwangCentresMm: 800,
+    dwangsOn: true,
+  };
+  const framing = {
+    openings: [
+      { kind: "door" as const, daylightHeightMm: 2000, daylightWidthMm: 1950, lintelSize: "140x45" as const, lintelPly: 3, segmentIndex: 0, centreMm: 1272.926635234765 },
+      { kind: "window" as const, daylightHeightMm: 600, daylightWidthMm: 1200, lintelSize: "90x45" as const, lintelPly: 2, sillHeightMm: 3850, segmentIndex: 0, centreMm: 1603.3591272242506 },
+    ],
+    rakes: [{ segmentIndex: 0, startMm: 4260, endMm: 4480, gable: true, middleMm: 4630, middlePositionMm: 1670 }],
+    extraStuds: [],
+  };
+  const members = wallMembers(wall, gableSettings, mmPerPoint, framing);
+  // Local arc-length (mm) along the wall and true vertical [yB, yT] (mm), accounting for the
+  // half-stud-thickness shift `addV` applies to a wedge (rake-cut) member's recorded position.
+  const rows = members
+    .filter((m) => m.kind === "king" || m.kind === "trimmer")
+    .map((m) => {
+      const arcMm = -(m.position[2] * 1000) - wall[0].y * mmPerPoint + (m.wedge ? STUD_THICKNESS_MM / 2 : 0);
+      const ys = m.wedge ? m.wedge.quad.map((p) => p[1] * 1000) : [(m.position[1] - m.size[1] / 2) * 1000, (m.position[1] + m.size[1] / 2) * 1000];
+      return { kind: m.kind, arcMm, yB: Math.min(...ys), yT: Math.max(...ys) };
+    });
+  const near = (target: number) => rows.filter((r) => Math.abs(r.arcMm - target) < 2);
+
+  it("the window's right king sits on the door's lintel (yB ≈ 2140mm), matching its left side", () => {
+    const leftKing = near(935.9).find((r) => r.kind === "king");
+    const rightKing = near(2270.9).find((r) => r.kind === "king");
+    expect(leftKing?.yB).toBeCloseTo(2140, 0);
+    expect(rightKing?.yB).toBeCloseTo(2140, 0);
+  });
+
+  it("the door's own right trimmer is present (not silently merged into the window's king)", () => {
+    const doorRightTrimmer = near(2270.4).find((r) => r.kind === "trimmer");
+    expect(doorRightTrimmer).toBeDefined();
+    expect(doorRightTrimmer?.yB).toBeCloseTo(45, 0);
+    expect(doorRightTrimmer?.yT).toBeCloseTo(2000, 0);
+  });
+
+  it("the door's own right king is unaffected — full height, independent of the window", () => {
+    const doorRightKing = near(2315.4).find((r) => r.kind === "king");
+    expect(doorRightKing?.yB).toBeCloseTo(45, 0);
+  });
+
+  it("the gable apex pair (1647.5mm / 1692.5mm) wins over the 25mm-distant regular grid stud at 1622.5mm — no overlapping column there", () => {
+    const allMembers = members.filter((m) => Math.abs((-(m.position[2] * 1000) - wall[0].y * mmPerPoint + (m.wedge ? STUD_THICKNESS_MM / 2 : 0)) - 1622.5) < 2);
+    expect(allMembers).toHaveLength(0);
+  });
+
+  it("the 2D plan view collapses the door's right trimmer and the window's right king (0.4mm apart) into a single stud, not a crossed/overlapping pair", () => {
+    const geom = computeFramingGeometry(wall, gableSettings, mmPerPoint, framing);
+    const centreArcLenMm = (rect: (typeof geom.studs)[number]) => {
+      const cy = rect.reduce((sum, p) => sum + p.y, 0) / rect.length;
+      return (cy - wall[0].y) * mmPerPoint;
+    };
+    const near2270 = geom.studs.filter((rect) => Math.abs(centreArcLenMm(rect) - 2270) < 5);
+    expect(near2270).toHaveLength(1);
   });
 });
 

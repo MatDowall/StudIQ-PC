@@ -683,30 +683,67 @@ export function computeFramingGeometry(
 
   layout.forEach((seg, segIndex) => {
     const segOpenings = openings.filter((o) => o.segmentIndex === segIndex);
+    // King and trimmer jamb positions, each merged only within their own kind — mirrors the same
+    // rule in `wallMembers` (never merge a king with a trimmer just because they land close
+    // together; two openings whose kings coincide are still only drawn once) so the plan-view
+    // overlay matches the 3D view and the takeoff quantities instead of drawing duplicate/
+    // overlapping rects for every opening independently.
+    const kingXs: number[] = [];
+    const trimmerXs: number[] = [];
+    for (const o of segOpenings) {
+      const centrePts = o.centreMm / mmPerPoint;
+      const dwHalf = o.daylightWidthMm / mmPerPoint / 2;
+      const jambs = openingJambs(centrePts, dwHalf, studThkPts);
+      for (const k of jambs.kings) if (!kingXs.some((x) => Math.abs(x - k) < dedupeTolPts)) kingXs.push(k);
+      for (const t of jambs.trimmers) if (!trimmerXs.some((x) => Math.abs(x - t) < dedupeTolPts)) trimmerXs.push(t);
+    }
+
+    // Cut (and, below, overlap-priority) tests — see `wallMembers` for the fuller rationale: a
+    // generic stud within half a stud thickness of a king/trimmer is a duplicate/overlapping
+    // timber, since the opening's jamb — already load-bearing for its lintel — takes its place.
     const cut = (s: number) =>
       segOpenings.some((o) => Math.abs(s - o.centreMm / mmPerPoint) <= o.daylightWidthMm / mmPerPoint / 2) ||
-      nearAnyOpening(pointAt(seg, s), segIndex);
+      nearAnyOpening(pointAt(seg, s), segIndex) ||
+      kingXs.some((x) => Math.abs(s - x) < studThkPts / 2) ||
+      trimmerXs.some((x) => Math.abs(s - x) < studThkPts / 2);
     // Sister stud offset: toward wall interior — positive in the first half, negative in the second.
     const sisterOffset = (s: number) => (s < seg.segLen / 2 ? studThkPts : -studThkPts);
     const rake = rakes.find((r) => r.segmentIndex === segIndex);
     const gableApexS = rake?.gable && rake.middleMm !== undefined
       ? [rakeApexMm(rake, seg.segLen * mmPerPoint) / mmPerPoint - halfThk, rakeApexMm(rake, seg.segLen * mmPerPoint) / mmPerPoint + halfThk]
       : [];
-    const allCandidates = dedupePositions([...seg.anchors, ...gableApexS, ...seg.regular], dedupeTolPts);
-    for (const s of allCandidates) {
-      if (!cut(s)) {
-        studs.push(makeStudRect(pointAt(seg, s), seg.dir, halfThk, halfDepth));
-        if (isStudDoubled(framing, segIndex, s * mmPerPoint)) {
-          studs.push(makeStudRect(pointAt(seg, s + sisterOffset(s)), seg.dir, halfThk, halfDepth));
-        }
-      }
+    // A regular grid stud whose footprint overlaps the apex pair AT ALL (full stud thickness, not
+    // just half) is dropped in favour of it — see `wallMembers` for the fuller rationale.
+    const regularClearOfApex = seg.regular.filter((r) => !gableApexS.some((a) => Math.abs(a - r) < studThkPts));
+    const allCandidates = dedupePositions([...seg.anchors, ...gableApexS, ...regularClearOfApex], dedupeTolPts);
+    const notCut = allCandidates.filter((s) => !cut(s));
+    const sisterPositions = notCut
+      .filter((s) => isStudDoubled(framing, segIndex, s * mmPerPoint))
+      .map((s) => s + sisterOffset(s));
+
+    // Unlike `wallMembers` (which correctly keeps a king and a trimmer from two DIFFERENT openings
+    // as separate members when they land close together, since they occupy different HEIGHTS — a
+    // door's trimmer runs to its own lintel while a window's king above continues to the ceiling), a
+    // flat plan view has no height axis to tell them apart: any two footprints within half a stud
+    // thickness of each other are, on this page, the same visible stud, and drawing both produces
+    // the crossed/overlapping-rect artefact reported by QA. So here (only) they're deduped into one
+    // rect regardless of which requirement produced them.
+    const finalXs: number[] = [];
+    const addFinal = (x: number) => {
+      if (!finalXs.some((f) => Math.abs(f - x) < studThkPts / 2)) finalXs.push(x);
+    };
+    for (const x of kingXs) addFinal(x);
+    for (const x of trimmerXs) addFinal(x);
+    for (const s of notCut) {
+      if (sisterPositions.some((sx) => Math.abs(sx - s) < studThkPts / 2)) continue;
+      addFinal(s);
+      if (isStudDoubled(framing, segIndex, s * mmPerPoint)) addFinal(s + sisterOffset(s));
     }
+    for (const x of finalXs) studs.push(makeStudRect(pointAt(seg, x), seg.dir, halfThk, halfDepth));
 
     for (const o of segOpenings) {
       const centrePts = o.centreMm / mmPerPoint;
       const dwHalf = o.daylightWidthMm / mmPerPoint / 2;
-      const jambs = openingJambs(centrePts, dwHalf, studThkPts);
-      for (const p of [...jambs.trimmers, ...jambs.kings]) studs.push(makeStudRect(pointAt(seg, p), seg.dir, halfThk, halfDepth));
       openingRects.push({ daylight: memberRect(seg, centrePts - dwHalf, centrePts + dwHalf, halfDepth), kind: o.kind });
     }
   });
@@ -1095,27 +1132,15 @@ export function wallMembers(
       }
     }
 
-    // Studs (anchors + regulars + gable apex studs not cut by an opening).
+    // Opening members. Two openings can share a wall position — a window stacked directly above a
+    // door — so every opening's geometry (centre/width/sill/head) is precomputed first, and each
+    // vertical member (king/trimmer/jack/sill jack) is clipped against every OTHER opening's own
+    // daylight "hole" at that arc-length instead of unconditionally running bottom-plate→ceiling.
+    // Without this, a jack above the door ran straight through the window above it (and vice versa
+    // for the window's sill jack running straight through the door below), and a king/trimmer that
+    // happened to land at the same position for both openings was emitted twice.
     const segOpenings = openings.filter((o) => o.segmentIndex === segIndex);
-    const cut = (s: number) =>
-      segOpenings.some((o) => Math.abs(s - o.centreMm / mmPerPoint) <= o.daylightWidthMm / mmPerPoint / 2) ||
-      nearAnyOpening(pointAt(seg, s), segIndex);
-    // Gable apex: a stud under each side's top plate, meeting at the ridge. Corner-makeup anchors
-    // and the gable apex pair are otherwise drawn unconditionally — but if an opening cuts through
-    // here, they become jack (and sill jack) studs below, like any other cut stud.
-    const gableApexS = rake?.gable && rake.middleMm !== undefined ? [apexS - studThkPts / 2, apexS + studThkPts / 2] : [];
-    // Anchor/gable-apex candidates and the regular grid are computed independently and can
-    // coincidentally land on (or within a fraction of a mm of) the same position — e.g. a gable
-    // apex offset by half a stud thickness landing exactly on a grid line — which would otherwise
-    // draw/count the same physical stud twice (both as a full stud and, if cut, as two jacks).
-    const allCandidates = dedupePositions([...seg.anchors, ...gableApexS, ...seg.regular], 1 / mmPerPoint);
-    for (const s of allCandidates.filter((x) => !cut(x))) {
-      addV("stud", s, bottomMakeup, ceilingMmAt(pointAt(seg, s)), true);
-    }
-
-    // Opening members.
-    const openMeta: { centrePts: number; dwHalf: number; sill: number; head: number }[] = [];
-    for (const o of segOpenings) {
+    const openMeta = segOpenings.map((o) => {
       const centrePts = o.centreMm / mmPerPoint;
       const dwHalf = o.daylightWidthMm / mmPerPoint / 2;
       const jambs = openingJambs(centrePts, dwHalf, studThkPts);
@@ -1127,10 +1152,139 @@ export function wallMembers(
       // segment's roofline at a shared corner — so the opening is trimmed rather than poking through.
       const rakeHeadLimit = Math.min(...jambs.kings.map((k) => ceilingMmAt(pointAt(seg, k)))) - lintelDepth;
       const head = Math.min(sill + o.daylightHeightMm, rakeHeadLimit);
-      openMeta.push({ centrePts, dwHalf, sill, head });
+      return { o, centrePts, dwHalf, sill, head, jambs, lintelDepth, isWindow };
+    });
 
-      for (const k of jambs.kings) addV("king", k, bottomMakeup, ceilingMmAt(pointAt(seg, k)), true); // full, follows rake
-      for (const t of jambs.trimmers) addV("trimmer", t, bottomMakeup, head); // full: bottom plate → underside of lintel
+    // Every OTHER opening's occupied zone [sill, head + lintelDepth] that covers arc-length `s`,
+    // sorted low→high — the daylight cavity itself PLUS the lintel bulk sitting directly above it,
+    // since no other member (a stacked opening's jack, a king passing through) can occupy that
+    // space either. `excludeIdxs` skips the given opening indices outright (needed for interior
+    // jack/sill-jack grid positions, which sit INSIDE their own opening's width and would otherwise
+    // "clip themselves" to nothing). `marginPts` widens the containment test beyond the opening's
+    // exact daylight width — used for king/trimmer clipping below, where two openings of different
+    // widths can put one's jamb just outside the other's daylight width yet still well within reach
+    // of its king/trimmer assembly (which itself extends `2×studThk` past the daylight edge) — a
+    // real QA case had a window's king only ~23mm past the door's own edge, just missing an exact
+    // `dwHalf` test and so never getting clipped to sit on the door's lintel like its other side did.
+    const holesAt = (
+      s: number,
+      excludeIdxs: ReadonlySet<number>,
+      marginPts = 0,
+    ): { lo: number; hi: number; isWindow: boolean }[] =>
+      openMeta
+        .filter((m, idx) => !excludeIdxs.has(idx) && Math.abs(s - m.centrePts) <= m.dwHalf + marginPts + GEOM_EPS)
+        .map((m) => ({ lo: m.sill - (m.isWindow ? STUD_THICKNESS_MM : 0), hi: m.head + m.lintelDepth, isWindow: m.isWindow }))
+        .sort((a, b) => a.lo - b.lo);
+    const NO_EXCLUSIONS: ReadonlySet<number> = new Set();
+
+    // Adds a member spanning [yB, yT] at `s`, first carving out every other opening's hole so the
+    // member breaks into separate pieces around them instead of running straight through. Only the
+    // top-most surviving piece (the one that actually reaches `yT`, e.g. the ceiling) gets the
+    // rake-cut treatment — an intermediate piece's top is a hole boundary, not the roofline.
+    const addVClipped = (
+      kind: FramingComponentKind,
+      s: number,
+      yB: number,
+      yT: number,
+      excludeIdxs: ReadonlySet<number>,
+      marginPts = 0,
+      rakeCut = false,
+    ) => {
+      let cursor = yB;
+      for (const hole of holesAt(s, excludeIdxs, marginPts)) {
+        const lo = Math.max(hole.lo, cursor);
+        const hi = Math.min(hole.hi, yT);
+        if (hi <= lo) continue;
+        if (lo > cursor) addV(kind, s, cursor, lo, false);
+        cursor = hi;
+      }
+      if (cursor < yT) addV(kind, s, cursor, yT, rakeCut);
+    };
+
+    // King and trimmer jamb studs, each merged ONLY within their own kind — a king merges with
+    // another opening's king landing at (near enough) the exact same position (e.g. two identically-
+    // wide openings stacked on the same line put their kings at literally the same arc-length), and
+    // likewise for trimmers, but a king is NEVER merged with a trimmer just because they happen to
+    // land close together. A real QA case had a door's trimmer land 0.4mm from an unrelated window's
+    // king (pure numeric coincidence from the specific widths involved) — merging them collapsed the
+    // window's own king requirement into the door's already-unclippable trimmer run, silently hiding
+    // the "sits on the lintel" break the window's king needed. Keeping kings and trimmers in
+    // separate merge groups means each opening's own king still gets its own correctly-clipped
+    // extent even when it happens to sit almost on top of a different opening's trimmer.
+    // `ownIdxs` tracks which opening(s) a merged group's OWN kind belongs to, so those openings'
+    // holes are excluded from its clip regardless of the widened margin below (a king/trimmer must
+    // never be clipped by its own opening — round-tripping through the exact boundary is no longer
+    // reliable once the margin is widened past the daylight edge).
+    const kingGroups: { x: number; ownIdxs: Set<number> }[] = [];
+    const trimmerGroups: { x: number; headMm: number; ownIdxs: Set<number> }[] = [];
+    openMeta.forEach((m, idx) => {
+      for (const k of m.jambs.kings) {
+        const g = kingGroups.find((c) => Math.abs(c.x - k) < 1 / mmPerPoint);
+        if (g) g.ownIdxs.add(idx);
+        else kingGroups.push({ x: k, ownIdxs: new Set([idx]) });
+      }
+      for (const t of m.jambs.trimmers) {
+        const g = trimmerGroups.find((c) => Math.abs(c.x - t) < 1 / mmPerPoint);
+        if (g) { g.headMm = Math.max(g.headMm, m.head); g.ownIdxs.add(idx); }
+        else trimmerGroups.push({ x: t, headMm: m.head, ownIdxs: new Set([idx]) });
+      }
+    });
+    // A king/trimmer never extends past `dwHalf + 2×studThk` from its own opening's centre (the
+    // king sits `1.5×studThk` out, plus its own half-thickness) — so that's the true reach of an
+    // opening's jamb assembly, wider than the bare daylight width used everywhere else.
+    const jambMarginPts = 2 * studThkPts;
+    for (const g of kingGroups) addVClipped("king", g.x, bottomMakeup, ceilingMmAt(pointAt(seg, g.x)), g.ownIdxs, jambMarginPts, true); // full, follows rake
+    for (const g of trimmerGroups) addVClipped("trimmer", g.x, bottomMakeup, g.headMm, g.ownIdxs, jambMarginPts, false); // bottom plate → underside of lintel
+
+    // Gable apex: a stud under each side's top plate, meeting at the ridge. Corner-makeup anchors
+    // and the gable apex pair are otherwise drawn unconditionally — but if an opening cuts through
+    // here, they become jack (and sill jack) studs below, like any other cut stud.
+    const gableApexS = rake?.gable && rake.middleMm !== undefined ? [apexS - studThkPts / 2, apexS + studThkPts / 2] : [];
+    // A regular grid stud can land close enough to the apex pair to physically clash with it (any
+    // overlap at all, not just a near-exact coincidence) — the apex pair always wins, since it's the
+    // structural requirement (the ridge meeting point), not an arbitrary spacing artefact. Unlike the
+    // king/trimmer-vs-generic-stud rule above (which only drops a HALF-thickness-or-closer overlap,
+    // to preserve merely-nearby regular-grid studs), this uses the FULL stud thickness: the apex pair
+    // is an explicit, always-present "double stud" requirement, and the regular grid position it
+    // clashes with contributes nothing the apex studs don't already cover.
+    const regularClearOfApex = seg.regular.filter((r) => !gableApexS.some((a) => Math.abs(a - r) < studThkPts));
+
+    // Studs (anchors + regulars + gable apex studs), minus anything cut by an opening's own daylight
+    // width, and minus anything genuinely overlapping a king/trimmer jamb stud placed above (a door
+    // or window landing on the wall's own end/corner stud, or a regular grid stud landing on a jamb,
+    // say) — the opening's jamb, already load-bearing for its lintel, wins there; the generic stud
+    // would just be a duplicate/overlapping timber. The threshold is deliberately HALF a stud
+    // thickness, not a full one: two stud-thick members whose centres are less than half a
+    // thickness apart genuinely overlap by more than half their footprint (the same physical spot);
+    // further apart than that and they're two distinct, non-clashing studs — e.g. the QA-regression
+    // case just above (a regular stud sitting exactly a half-thickness off a trimmer) must NOT be
+    // dropped, and it sits exactly on this boundary.
+    const cut = (s: number) =>
+      segOpenings.some((o) => Math.abs(s - o.centreMm / mmPerPoint) <= o.daylightWidthMm / mmPerPoint / 2) ||
+      nearAnyOpening(pointAt(seg, s), segIndex) ||
+      kingGroups.some((g) => Math.abs(s - g.x) < studThkPts / 2) ||
+      trimmerGroups.some((g) => Math.abs(s - g.x) < studThkPts / 2);
+    // Anchor/gable-apex candidates and the regular grid are computed independently and can
+    // coincidentally land on (or within a fraction of a mm of) the same position — e.g. a gable
+    // apex offset by half a stud thickness landing exactly on a grid line — which would otherwise
+    // draw/count the same physical stud twice (both as a full stud and, if cut, as two jacks).
+    const allCandidates = dedupePositions([...seg.anchors, ...gableApexS, ...regularClearOfApex], 1 / mmPerPoint);
+    const notCut = allCandidates.filter((x) => !cut(x));
+    // A doubled stud's sister lands a full stud-thickness away, toward the wall interior — if that
+    // lands on another candidate in the same set (a regular grid stud caught under a doubled gable-
+    // apex stud, say), the sister wins and the plain stud there is dropped rather than overlapped.
+    const sisterPositions = notCut
+      .filter((s) => isStudDoubled(framing, segIndex, s * mmPerPoint))
+      .map((s) => s + sisterOffset(s));
+    for (const s of notCut) {
+      // A sister sits exactly `studThkPts` from its own primary — well outside this half-thickness
+      // "genuine overlap" test — so this never drops the primary that generated it, only a
+      // genuinely different candidate landing in the same spot.
+      if (sisterPositions.some((sx) => Math.abs(sx - s) < studThkPts / 2)) continue;
+      addV("stud", s, bottomMakeup, ceilingMmAt(pointAt(seg, s)), true);
+    }
+
+    for (const { o, centrePts, head, lintelDepth } of openMeta) {
       const lintelLenM = M(o.daylightWidthMm + 2 * STUD_THICKNESS_MM);
       const lintelSizeOverride = o.lintelSize;
       // Lintel ply rendered as `ply` stacked beams across the depth (for legibility); length counts ×ply.
@@ -1141,14 +1295,43 @@ export function wallMembers(
         const plyOffset = (p - (o.lintelPly - 1) / 2) * plyDepthM;
         members.push({ kind: "lintel", sizeOverride: lintelSizeOverride, lengthM: lintelLenM, position: [fx(centrePts) + Math.sin(yaw) * plyOffset, M(head + lintelDepth / 2), fz(centrePts) + Math.cos(yaw) * plyOffset], size: [lintelLenM, M(lintelDepth), plyDepthM], yaw, pitch: 0 });
       }
-      const jackPositions = allCandidates.filter((s) => Math.abs(s - centrePts) <= dwHalf);
-      for (const s of jackPositions) addV("jack", s, head + lintelDepth, ceilingMmAt(pointAt(seg, s)), true);
-
-      if (isWindow) {
+      if (o.kind === "window") {
+        const sill = o.sillHeightMm ?? 0;
         members.push({ kind: "sill", lengthM: M(o.daylightWidthMm), position: [fx(centrePts), M(sill - STUD_THICKNESS_MM / 2), fz(centrePts)], size: [M(o.daylightWidthMm), thkM, depthM], yaw, pitch: 0 });
-        const sillTop = sill - STUD_THICKNESS_MM; // underside of the sill
-        const supports = [centrePts - (dwHalf - studThkPts / 2), centrePts + (dwHalf - studThkPts / 2)]; // tight inside the trimmers
-        for (const s of [...jackPositions, ...supports]) addV("sill_jack", s, bottomMakeup, sillTop);
+      }
+    }
+
+    // Interior cripple ("jack") stud positions: the regular stud-grid line threading through an
+    // opening's daylight width. A position can lie inside more than one opening's width when two
+    // openings are stacked (e.g. a window directly above a door) — piece the column together around
+    // BOTH openings' holes in one pass (self-inclusive: the current opening's own hole is exactly
+    // what carves the below-sill / above-head split) rather than computing each opening's jack run
+    // independently, which used to double up members or run a sill jack straight through a lower
+    // opening's daylight.
+    const jackGridPositions = dedupePositions(
+      openMeta.flatMap((m) => allCandidates.filter((s) => Math.abs(s - m.centrePts) <= m.dwHalf)),
+      1 / mmPerPoint,
+    );
+    for (const s of jackGridPositions) {
+      const top = ceilingMmAt(pointAt(seg, s));
+      let cursor = bottomMakeup;
+      for (const hole of holesAt(s, NO_EXCLUSIONS)) {
+        const lo = Math.max(hole.lo, cursor);
+        const hi = Math.min(hole.hi, top);
+        if (hi <= lo) continue;
+        if (lo > cursor) addV(hole.isWindow && Math.abs(lo - hole.lo) < GEOM_EPS ? "sill_jack" : "jack", s, cursor, lo, false);
+        cursor = hi;
+      }
+      if (cursor < top) addV("jack", s, cursor, top, true);
+    }
+
+    // Window-only tight support studs directly under the sill (inside the trimmers) — always a
+    // plain sill jack, still clipped against a lower opening stacked on the same line.
+    for (const m of openMeta) {
+      if (!m.isWindow) continue;
+      const sillTop = m.sill - STUD_THICKNESS_MM; // underside of the sill
+      for (const s of [m.centrePts - (m.dwHalf - studThkPts / 2), m.centrePts + (m.dwHalf - studThkPts / 2)]) {
+        addVClipped("sill_jack", s, bottomMakeup, sillTop, NO_EXCLUSIONS);
       }
     }
 

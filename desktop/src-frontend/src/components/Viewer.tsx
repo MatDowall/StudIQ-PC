@@ -122,6 +122,48 @@ export function Viewer() {
     };
   }, []);
 
+  // Debug/QA: dumps every timber-framing wall on the current page as JSON (points, settings,
+  // openings/rakes) — everything needed to reproduce a wall's exact geometry in a unit test.
+  // Run `dumpFramingWalls()` in devtools (F12) and paste the console output when reporting a
+  // framing bug.
+  useEffect(() => {
+    (window as unknown as Record<string, unknown>).dumpFramingWalls = () => {
+      const state = useAppStore.getState();
+      const mmpp = state.pageScale?.mm_per_point ?? null;
+      const dump = state.overlayMeasurements
+        .filter((mz) => mz.measurement_type === "timber_framing" && mz.page_index === state.activePageIndex)
+        .map((mz) => {
+          let pts: unknown = null;
+          try {
+            pts = JSON.parse(mz.geometry_json);
+          } catch {
+            pts = mz.geometry_json;
+          }
+          let framing: unknown = null;
+          try {
+            framing = mz.framing_json ? JSON.parse(mz.framing_json) : null;
+          } catch {
+            framing = mz.framing_json;
+          }
+          return {
+            measurementId: mz.id,
+            dimensionGroupId: mz.dimension_group_id,
+            mmPerPoint: mmpp,
+            settings: state.groupProps[mz.dimension_group_id]?.framing_props_json
+              ? JSON.parse(state.groupProps[mz.dimension_group_id]!.framing_props_json!)
+              : null,
+            points: pts,
+            framing,
+          };
+        });
+      console.log("[dumpFramingWalls]", JSON.stringify(dump, null, 2));
+      return dump;
+    };
+    return () => {
+      delete (window as unknown as Record<string, unknown>).dumpFramingWalls;
+    };
+  }, []);
+
   const calibrating = useAppStore((state) => state.calibrating);
   const setCalibrating = useAppStore((state) => state.setCalibrating);
   const drawPolarity = useAppStore((state) => state.drawPolarity);
