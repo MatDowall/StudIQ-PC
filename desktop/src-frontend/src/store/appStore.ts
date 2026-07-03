@@ -157,6 +157,7 @@ export interface WorkbookGridApi {
   insertBelow: () => void;
   exportExcel: (levels: FlattenExportLevels) => Promise<void>;
   print: () => void;
+  recalculate: () => Promise<void>;
 }
 
 // Imperative bridge: WorkbookView registers these so the ribbon's Format

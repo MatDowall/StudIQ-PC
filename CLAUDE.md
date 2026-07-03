@@ -183,6 +183,7 @@ Material Symbols Outlined.
 | Area group | `crop_free` |
 | Count group | `123` |
 | Length group | `straighten` |
+| Recalculate workbook | `calculate` |
 
 ### Ribbon layout rules
 - The ribbon uses `display: flex; align-items: stretch` — group divs fill the full ribbon height.

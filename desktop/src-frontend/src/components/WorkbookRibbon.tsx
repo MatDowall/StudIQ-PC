@@ -11,6 +11,7 @@ const BUTTON_ICONS: Record<string, string> = {
   "Add Row": "playlist_add",
   "Insert Above": "vertical_align_top",
   "Insert Below": "vertical_align_bottom",
+  Recalculate: "calculate",
 };
 
 const FONT_FAMILIES = ["Arial", "Calibri", "Segoe UI", "Times New Roman", "Courier New", "Verdana"];
@@ -191,6 +192,7 @@ export function WorkbookRibbon() {
   const groups = [
     { label: "Workbook", tools: ["Blank Workbook", "New from Template", "Delete"] },
     { label: "Rows", tools: ["Add Row", "Insert Above", "Insert Below"] },
+    { label: "Calculate", tools: ["Recalculate"] },
     { label: "Format", tools: [] as string[] },
   ];
 
@@ -201,6 +203,7 @@ export function WorkbookRibbon() {
     "Add Row":            hasGrid     ? () => gridApi.addRow() : undefined,
     "Insert Above":       hasGrid     ? () => gridApi.insertAbove() : undefined,
     "Insert Below":       hasGrid     ? () => gridApi.insertBelow() : undefined,
+    "Recalculate":        hasGrid     ? () => void gridApi.recalculate() : undefined,
   };
 
   const enabled: Record<string, boolean> = {
@@ -210,6 +213,7 @@ export function WorkbookRibbon() {
     "Add Row":           hasGrid,
     "Insert Above":      hasGrid,
     "Insert Below":      hasGrid,
+    "Recalculate":       hasGrid,
   };
 
   return (

@@ -74,7 +74,14 @@ const QTY_COLUMNS = [
 ] as const;
 
 const NUM_COLS     = COLUMNS.length;   // 16
-const NUM_ROWS     = 100;
+// Row count is dynamic, not fixed — every sheet starts at 100 rows and grows in
+// chunks as the user fills the bottom of the grid (see `growRowsTo` / hotSettings'
+// afterChange) or as a previously-grown sheet loads back in (see `padData`, which
+// never truncates real saved data). `NUM_ROWS` is the single shared bound every
+// sheet's array is padded/iterated to — it only ever grows, never shrinks.
+let NUM_ROWS = 100;
+const ROW_GROWTH_CHUNK     = 50;
+const ROW_GROWTH_THRESHOLD = 5;  // grow once an edit lands within this many rows of the bottom
 const COL_SUBTOTAL = 5;                // F – drillable at Level 1
 const COL_TOTAL    = 7;                // H – yellow highlight only
 const COL_RATE     = 4;                // E – drillable at Level 2
@@ -302,8 +309,12 @@ function cloneStyleMap(map: Map<string, CellStyle> | undefined): Map<string, Cel
   return new Map(Array.from(map.entries(), ([key, style]) => [key, { ...style }]));
 }
 
-/** Ensure loaded JSON has exactly NUM_ROWS × NUM_COLS, padding with nulls as needed. */
+/** Ensure loaded JSON has at least NUM_ROWS × NUM_COLS, padding with nulls as needed.
+ *  Never truncates — a sheet saved with more rows than the current NUM_ROWS (grown in
+ *  an earlier session, before this one's `NUM_ROWS` reset to its initial value) grows
+ *  the shared bound to fit instead of silently dropping its bottom rows. */
 function padData(raw: (string | null)[][]): (string | null)[][] {
+  if (raw.length > NUM_ROWS) NUM_ROWS = raw.length;
   const result = createEmptyData();
   for (let r = 0; r < Math.min(raw.length, NUM_ROWS); r++) {
     const row = raw[r] ?? [];
@@ -313,6 +324,16 @@ function padData(raw: (string | null)[][]): (string | null)[][] {
     }
   }
   return result;
+}
+
+/** Pads `data` up to `rows` rows (appending blank rows) without touching existing
+ *  content — used to keep an already-cached sheet in sync when `NUM_ROWS` grows
+ *  elsewhere, so `0..NUM_ROWS` loops never index past a stale-sized cached array. */
+function padRowsTo(data: (string | null)[][], rows: number): (string | null)[][] {
+  if (data.length >= rows) return data;
+  const grown = data.slice();
+  while (grown.length < rows) grown.push(Array<string | null>(NUM_COLS).fill(null));
+  return grown;
 }
 
 /**
@@ -585,6 +606,86 @@ function evaluateClonedRows(data: (string | null)[][]): unknown[][] {
     return data;
   } finally {
     hf?.destroy();
+  }
+}
+
+/**
+ * Like `evaluateClonedRows`, but also registers the given named cell values as
+ * HyperFormula named expressions before evaluating — needed by `recalculateWorkbook`
+ * so a formula referencing a named cell (e.g. `=NamedRate*1.1`) on a sheet that isn't
+ * the live/displayed one still resolves against that name's *current* value, not
+ * whatever it was worth the last time this sheet happened to be on screen.
+ */
+function evaluateWithNames(data: (string | null)[][], namedValues: Map<string, unknown>): unknown[][] {
+  let hf: HyperFormula | null = null;
+  try {
+    hf = HyperFormula.buildFromArray(dataForHot(data), { licenseKey: "gpl-v3" });
+    for (const [name, value] of namedValues) {
+      try { hf.addNamedExpression(name, namedExprFromValue(value)); } catch { /* invalid/duplicate name — skip */ }
+    }
+    return hf.getSheetValues(0);
+  } catch {
+    return data;
+  } finally {
+    hf?.destroy();
+  }
+}
+
+/** Rolls a Rate Build-up sheet's evaluated H:Total (and Lab/Mat/Sub/Sum pull-through)
+ *  into its Level-2 parent row's E:Rate / I,K,M,O / J,L,N,P — the same aggregation
+ *  `drillUp` applies when leaving a Level-3 rate sheet. Shared so `recalculateWorkbook`
+ *  can apply identical rollups without the user physically drilling through every row. */
+function rollupRateIntoL2(
+  parentData: (string | null)[][],
+  rowInParent: number,
+  computed: unknown[][],
+  excluded: (col: number) => boolean,
+): void {
+  const sumH = sumComputedCol(computed, COL_TOTAL);
+  if (!excluded(COL_RATE)) parentData[rowInParent][COL_RATE] = sumH !== null ? String(sumH) : null;
+  const pullThroughCols: Array<[number, number]> = [
+    [COL_LAB, COL_LAB_TOTAL],
+    [COL_MAT, COL_MAT_TOTAL],
+    [COL_SUB, COL_SUB_TOTAL],
+    [COL_SUM, COL_SUM_TOTAL],
+  ];
+  for (const [src, total] of pullThroughCols) {
+    const s = sumComputedCol(computed, src);
+    if (!excluded(src)) parentData[rowInParent][src] = s !== null ? String(s) : null;
+    if (!excluded(total)) {
+      parentData[rowInParent][total] =
+        (s !== null) ? `=${COLUMNS[src].letter}${rowInParent + 1}*C${rowInParent + 1}` : null;
+    }
+  }
+}
+
+/** Rolls a Quantity Build-up sheet's evaluated H:Quantity into its Level-2 parent
+ *  row's C:Quantity — mirrors `drillUp`'s "leaving a Quantity Build-up sheet" branch. */
+function rollupQtyIntoL2(
+  parentData: (string | null)[][],
+  rowInParent: number,
+  computed: unknown[][],
+  excluded: (col: number) => boolean,
+): void {
+  const sumH = sumComputedCol(computed, COL_TOTAL);
+  if (!excluded(COL_QTY)) parentData[rowInParent][COL_QTY] = sumH !== null ? String(sumH) : null;
+}
+
+/** Rolls a Level-2 sheet's evaluated H:Total (and …-Total pull-throughs) into its
+ *  Level-1 parent row's F:Subtotal / J,L,N,P — mirrors `drillUp`'s "leaving Level 2"
+ *  branch. */
+function rollupL2IntoL1(
+  parentData: (string | null)[][],
+  rowInParent: number,
+  computed: unknown[][],
+  excluded: (col: number) => boolean,
+): void {
+  const sumH = sumComputedCol(computed, COL_TOTAL);
+  if (!excluded(COL_SUBTOTAL)) parentData[rowInParent][COL_SUBTOTAL] = sumH !== null ? String(sumH) : null;
+  for (const total of [COL_LAB_TOTAL, COL_MAT_TOTAL, COL_SUB_TOTAL, COL_SUM_TOTAL]) {
+    if (excluded(total)) continue;
+    const s = sumComputedCol(computed, total);
+    parentData[rowInParent][total] = s !== null ? String(s) : null;
   }
 }
 
@@ -1711,6 +1812,7 @@ export function WorkbookView() {
     insertBelow: () => {},
     exportExcel: async (_levels: FlattenExportLevels) => {},
     print: () => {},
+    recalculate: async () => {},
   });
 
   const gridApiRef = useRef<WorkbookGridApi>({
@@ -1719,6 +1821,7 @@ export function WorkbookView() {
     insertBelow:  () => gridApiImplRef.current.insertBelow(),
     exportExcel:  (levels) => gridApiImplRef.current.exportExcel(levels),
     print:        () => gridApiImplRef.current.print(),
+    recalculate:  () => gridApiImplRef.current.recalculate(),
   });
 
   useEffect(() => {
@@ -1783,6 +1886,21 @@ export function WorkbookView() {
       }
     }
     return result;
+  }
+
+  /** Grows the shared row bound to `targetRows` (a no-op if already that big or
+   *  bigger): adds the extra rows to the live grid and re-pads every sheet already
+   *  cached in `sheetDataMap.current` to match, so no cached array falls out of sync
+   *  with the many `0..NUM_ROWS` loops elsewhere in this file. */
+  function growRowsTo(hot: Handsontable, targetRows: number): void {
+    if (targetRows <= NUM_ROWS) return;
+    const additional = targetRows - NUM_ROWS;
+    const insertAfter = NUM_ROWS - 1;
+    NUM_ROWS = targetRows;
+    hot.alter("insert_row_below", insertAfter, additional);
+    for (const [path, data] of sheetDataMap.current) {
+      if (data.length < NUM_ROWS) sheetDataMap.current.set(path, padRowsTo(data, NUM_ROWS));
+    }
   }
 
   /** Schedule a debounced auto-save of the current sheet. */
@@ -1926,7 +2044,8 @@ export function WorkbookView() {
       for (let r = NUM_ROWS - 1; r >= 0; r--) {
         if (isLineItemRow(data[r])) { lastOccupied = r; break; }
       }
-      const targetRow = Math.min(lastOccupied + 1, NUM_ROWS - 1);
+      const targetRow = lastOccupied + 1;
+      if (targetRow >= NUM_ROWS) growRowsTo(hot, NUM_ROWS + ROW_GROWTH_CHUNK);
       hot.selectCell(targetRow, COL_DESC);
       hot.scrollViewportTo(targetRow, COL_DESC, true, true);
     },
@@ -1947,7 +2066,7 @@ export function WorkbookView() {
       const selected = getSelectedCells();
       if (selected.length === 0) return;
       const insertAt = Math.max(...selected.map(c => c.row)) + 1;
-      if (insertAt >= NUM_ROWS) return;
+      if (insertAt >= NUM_ROWS) growRowsTo(hot, NUM_ROWS + ROW_GROWTH_CHUNK);
       insertBlankRowAt(hot, curSheetPath(), insertAt);
       hot.selectCell(insertAt, COL_DESC);
       scheduleSaveRef.current();
@@ -2098,6 +2217,19 @@ export function WorkbookView() {
       iframe.contentWindow?.print();
       setTimeout(() => { try { document.body.removeChild(iframe); } catch { /* already gone */ } }, 1000);
     },
+
+    async recalculate() {
+      if (cleanupBusy) return;
+      setCleanupBusy(true);
+      try {
+        await recalculateWorkbook();
+        showCleanupMessage("Workbook recalculated.");
+      } catch (e) {
+        showCleanupMessage(`Failed to recalculate workbook: ${e}`);
+      } finally {
+        setCleanupBusy(false);
+      }
+    },
   };
 
   // ── Load root sheet when active revision changes ───────────────────────
@@ -2215,7 +2347,14 @@ export function WorkbookView() {
     const display = (data: (string | null)[][]) => {
       sheetDataMap.current.set(newPath, data);
       const hot2 = hotRef.current?.hotInstance;
-      if (hot2) loadLevelDataExcl(hot2, data, newLevel, isAutoUpdatingRef, newPath);
+      if (hot2) {
+        loadLevelDataExcl(hot2, data, newLevel, isAutoUpdatingRef, newPath);
+        // Drilling in should land on the child sheet's top-left, not wherever the
+        // parent row happened to leave the grid scrolled — the row index that was
+        // meaningful in the parent has no relation to this sheet's rows.
+        hot2.selectCell(0, 0);
+        hot2.scrollViewportTo(0, 0);
+      }
       syncSheetLinks(newPath);
     };
 
@@ -2311,47 +2450,19 @@ export function WorkbookView() {
       const excluded = (col: number) => isCellExcluded(parentPath, rowInParent, col);
 
       if (lv === 2) {
-        // Leaving Level 2 → Level 1:
-        //   F:Subtotal              = SUM of Level-2 H:Total
-        //   J/L/N/P (…-Total)       = SUM of their matching Level-2 columns (pulled through)
-        const sumH = sumComputedCol(computed, COL_TOTAL);
-        if (!excluded(COL_SUBTOTAL)) parentData[rowInParent][COL_SUBTOTAL] = sumH !== null ? String(sumH) : null;
-        for (const total of [COL_LAB_TOTAL, COL_MAT_TOTAL, COL_SUB_TOTAL, COL_SUM_TOTAL]) {
-          if (excluded(total)) continue;
-          const s = sumComputedCol(computed, total);
-          parentData[rowInParent][total] = s !== null ? String(s) : null;
-        }
+        // Leaving Level 2 → Level 1: F:Subtotal + J/L/N/P pulled-through totals.
+        rollupL2IntoL1(parentData, rowInParent, computed, excluded);
         sheetDataMap.current.set(parentPath, parentData);
       } else if (lv === 3 && isQtyBuildupPath(curPath)) {
-        // Leaving a Quantity Build-up sheet → Level 2:
-        //   C:Quantity = SUM of the build-up sheet's H:Quantity
+        // Leaving a Quantity Build-up sheet → Level 2: C:Quantity.
         // F:Subtotal/G:Factor/H:Total and the J/L/N/P pull-through formulas all
         // reference C, so they're recomputed for free by deriveLevelFormulas when
         // the parent (standard Level 2) sheet is redisplayed — nothing else to write.
-        const sumH = sumComputedCol(computed, COL_TOTAL);
-        if (!excluded(COL_QTY)) parentData[rowInParent][COL_QTY] = sumH !== null ? String(sumH) : null;
+        rollupQtyIntoL2(parentData, rowInParent, computed, excluded);
         sheetDataMap.current.set(parentPath, parentData);
       } else if (lv === 3) {
-        // Leaving Level 3 → Level 2:
-        //   E:Rate           = SUM of Level-3 H:Total
-        //   I/K/M/O (Lab/Mat/Sub/Sum) = SUM of their matching Level-3 columns (pulled through)
-        //   J/L/N/P (…-Total)         = formula: pulled-through rate × this row's Quantity (C)
-        const sumH = sumComputedCol(computed, COL_TOTAL);
-        if (!excluded(COL_RATE)) parentData[rowInParent][COL_RATE] = sumH !== null ? String(sumH) : null;
-        const pullThroughCols: Array<[number, number]> = [
-          [COL_LAB, COL_LAB_TOTAL],
-          [COL_MAT, COL_MAT_TOTAL],
-          [COL_SUB, COL_SUB_TOTAL],
-          [COL_SUM, COL_SUM_TOTAL],
-        ];
-        for (const [src, total] of pullThroughCols) {
-          const s = sumComputedCol(computed, src);
-          if (!excluded(src)) parentData[rowInParent][src] = s !== null ? String(s) : null;
-          if (!excluded(total)) {
-            parentData[rowInParent][total] =
-              (s !== null) ? `=${COLUMNS[src].letter}${rowInParent + 1}*C${rowInParent + 1}` : null;
-          }
-        }
+        // Leaving Level 3 → Level 2: E:Rate + I/K/M/O pulled-through + J/L/N/P formulas.
+        rollupRateIntoL2(parentData, rowInParent, computed, excluded);
         sheetDataMap.current.set(parentPath, parentData);
       }
 
@@ -2562,15 +2673,166 @@ export function WorkbookView() {
     return (code != null && code !== "") || (desc != null && desc !== "");
   };
 
-  /** Fetch a sheet's source data — in-memory cache first, else SQLite, else empty. */
+  /** Fetch a sheet's source data — in-memory cache first, else SQLite, else empty.
+   *  Re-pads a cache hit up to the current `NUM_ROWS` — a sheet can be cached from
+   *  before `NUM_ROWS` grew (e.g. a different sheet was the one that just grew) and
+   *  callers here iterate `0..NUM_ROWS` directly against the returned array. */
   async function fetchSheetSourceData(revisionId: number, path: string): Promise<(string | null)[][]> {
     const cached = sheetDataMap.current.get(path);
-    if (cached) return cached;
+    if (cached) return padRowsTo(cached, NUM_ROWS);
     try {
       const json = await invoke<string>("load_workbook_sheet", { revisionId, sheetPath: path });
       return padData(JSON.parse(json) as (string | null)[][]);
     } catch {
       return createEmptyData();
+    }
+  }
+
+  /** Like `fetchSheetSourceData`, but returns `null` when the sheet has never been
+   *  created (no persisted row) instead of an empty grid — used by `recalculateWorkbook`
+   *  to tell "no build-up sheet exists here, leave the parent's manually-entered value
+   *  alone" apart from "a real build-up sheet exists and is currently empty" (which
+   *  should roll up as zero/blank, same as `drillUp` already does). */
+  async function fetchSheetForRecalc(revisionId: number, path: string): Promise<(string | null)[][] | null> {
+    const cached = sheetDataMap.current.get(path);
+    if (cached) return padRowsTo(cached, NUM_ROWS);
+    try {
+      const json = await invoke<string>("load_workbook_sheet", { revisionId, sheetPath: path });
+      if (!json || json === "[]") return null;
+      return padData(JSON.parse(json) as (string | null)[][]);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Recalculate the whole workbook: re-evaluates every sheet's formulas against
+   * every named cell's *current* value, then re-runs the same rollup drillUp would
+   * apply at every parent/child boundary — without requiring the user to physically
+   * drill into and back out of every sheet.
+   *
+   * Why this is needed: only one sheet is ever loaded into HyperFormula's "Sheet1"
+   * at a time (see the module doc comment above `evaluateClonedRows`). A named cell
+   * bound to a *different* sheet is registered as a frozen literal snapshot of its
+   * last-known value (`namedExprFormula`), refreshed only when that sheet becomes
+   * active. Editing a named cell therefore only live-updates formulas on the sheet
+   * you're currently viewing — every other sheet's `=NamedRate*1.1`-style formula,
+   * and every rollup literal (E:Rate/C:Quantity/F:Subtotal/I-P) baked from one, stays
+   * stale until visited. This walks the whole L1→L2→L3 tree bottom-up and fixes it.
+   */
+  async function recalculateWorkbook(): Promise<void> {
+    const hot = hotRef.current?.hotInstance;
+    const revId = revIdRef.current;
+    if (!hot || revId == null) return;
+
+    // Persist the currently displayed sheet's edits first, exactly as drillDown/
+    // drillUp/exportExcel do before reading from SQLite, so the recalc sees them.
+    closeActiveEditor(hot);
+    if (saveTimerRef.current) { clearTimeout(saveTimerRef.current); saveTimerRef.current = null; }
+    const curPath = pathStack.current[pathStack.current.length - 1];
+    const curSourceData = captureSourceData(hot);
+    sheetDataMap.current.set(curPath, curSourceData);
+    persistSheet(revId, curPath, curSourceData);
+
+    // 1. Resolve every named cell's current true value by evaluating its bound
+    //    sheet's own formulas. Two passes so a named cell whose formula references
+    //    another named cell (rare, but not disallowed) settles to a stable value.
+    const namedValues = new Map<string, unknown>();
+    for (const nc of namedCellMap.current.values()) namedValues.set(nc.name, 0);
+    for (let pass = 0; pass < 2; pass++) {
+      for (const nc of namedCellMap.current.values()) {
+        const data = (await fetchSheetForRecalc(revId, nc.path)) ?? createEmptyData();
+        const computed = evaluateWithNames(data, namedValues);
+        // Cache the full evaluated snapshot too — readCellValue() (used when this
+        // sheet's cells are later referenced by name from wherever the user is
+        // currently viewing) falls back to it instead of an un-evaluated formula string.
+        sheetComputedMap.current.set(nc.path, computed);
+        namedValues.set(nc.name, computed[nc.row]?.[nc.col] ?? null);
+      }
+    }
+
+    // 2. Walk the L1 → L2 → L3 tree bottom-up, re-evaluating each sheet against the
+    //    resolved named values and rolling child totals into their parent row —
+    //    the same aggregation `drillUp` applies one drill-step at a time.
+    const l1Path = "L1";
+    const l1Data = await fetchSheetSourceData(revId, l1Path);
+    await ensureSheetExclusionsLoaded(revId, l1Path);
+    let l1Changed = false;
+    const l2ComputedByPath = new Map<string, unknown[][]>();
+
+    for (let r1 = 0; r1 < NUM_ROWS; r1++) {
+      if (!isLineItemRow(l1Data[r1])) continue;
+      const l2Path = `${l1Path}/R${r1}`;
+      const l2Data = await fetchSheetForRecalc(revId, l2Path);
+      if (l2Data == null) continue; // never drilled into — F/H are manually entered, leave as-is
+
+      await ensureSheetExclusionsLoaded(revId, l2Path);
+      let l2Changed = false;
+
+      // Check every row for a Rate/Quantity Build-up child, not just rows that look
+      // like "line items" (Code/Description set) — a build-up can exist under a row
+      // whose Code/Description were never filled in, e.g. a bare rate calculation.
+      for (let r2 = 0; r2 < NUM_ROWS; r2++) {
+        const l2Excluded = (col: number) => isCellExcluded(l2Path, r2, col);
+
+        const ratePath = `${l2Path}/R${r2}`;
+        const rateData = await fetchSheetForRecalc(revId, ratePath);
+        if (rateData != null) {
+          rollupRateIntoL2(l2Data, r2, evaluateWithNames(rateData, namedValues), l2Excluded);
+          l2Changed = true;
+        }
+
+        const qtyPath = `${l2Path}/Q${r2}`;
+        const qtyData = await fetchSheetForRecalc(revId, qtyPath);
+        if (qtyData != null) {
+          rollupQtyIntoL2(l2Data, r2, evaluateWithNames(qtyData, namedValues), l2Excluded);
+          l2Changed = true;
+        }
+      }
+
+      if (l2Changed) {
+        sheetDataMap.current.set(l2Path, l2Data);
+        persistSheet(revId, l2Path, l2Data);
+      }
+
+      // Evaluate L2 with the (possibly just-updated) rollup values in place so its
+      // own F=E×C / H=F×G / J=I×C… formulas recompute before rolling into L1.
+      const l2Computed = evaluateWithNames(l2Data, namedValues);
+      l2ComputedByPath.set(l2Path, l2Computed);
+      sheetComputedMap.current.set(l2Path, l2Computed);
+      rollupL2IntoL1(l1Data, r1, l2Computed, (col) => isCellExcluded(l1Path, r1, col));
+      l1Changed = true;
+    }
+
+    if (l1Changed) {
+      sheetDataMap.current.set(l1Path, l1Data);
+      persistSheet(revId, l1Path, l1Data);
+    }
+    const l1Computed = evaluateWithNames(l1Data, namedValues);
+    sheetComputedMap.current.set(l1Path, l1Computed);
+
+    // 3. Refresh the breadcrumb toolbars and the currently displayed sheet in place —
+    //    reloading re-registers every named expression (see loadLevelDataExcl/
+    //    refreshNamedCellsForPath), which now resolves against the fresh values and
+    //    snapshots cached above.
+    const stack = pathStack.current;
+    const newBreadcrumb: BreadcrumbCtx[] = [];
+    for (let i = 0; i < stack.length - 1; i++) {
+      const parentPath = stack[i];
+      const childPath = stack[i + 1];
+      const row = pathLastRow(childPath) ?? 0;
+      const parentComputed = parentPath === l1Path
+        ? l1Computed
+        : l2ComputedByPath.get(parentPath)
+          ?? evaluateWithNames(sheetDataMap.current.get(parentPath) ?? createEmptyData(), namedValues);
+      newBreadcrumb.push(readRowCtx(row, parentComputed));
+    }
+    setBreadcrumb(newBreadcrumb);
+
+    const displayPath = stack[stack.length - 1];
+    const hot2 = hotRef.current?.hotInstance;
+    if (hot2) {
+      loadLevelDataExcl(hot2, sheetDataMap.current.get(displayPath) ?? createEmptyData(), levelRef.current, isAutoUpdatingRef, displayPath);
     }
   }
 
@@ -2951,6 +3213,11 @@ export function WorkbookView() {
     autoColumnSize: false,
     stretchH: "none",
     height: 400,
+    // Clicking a ribbon Format button (outside the grid) would otherwise deselect the
+    // current range before the button's onClick runs — so getSelectedRange() (used by
+    // applyToSelection) sees nothing and falls back to a single last-known cell instead
+    // of the full multi-cell selection.
+    outsideClickDeselects: false,
 
     // ── Formula engine ──────────────────────────────────────────────────
     formulas: {
@@ -3065,6 +3332,14 @@ export function WorkbookView() {
       // Skipped when isAutoUpdatingRef is true — i.e. for the nested afterChange
       // calls fired by our own setDataAtCell writes below (prevents recursion).
       if (!isAutoUpdatingRef.current) {
+        // Auto-extend the grid once an edit lands near the bottom — matches Google
+        // Sheets' "grow as you fill the last few rows" behaviour instead of hard-
+        // capping the sheet at its initial row count.
+        const maxEditedRow = Math.max(...changes.map(ch => ch[0]));
+        if (maxEditedRow >= NUM_ROWS - ROW_GROWTH_THRESHOLD) {
+          growRowsTo(hot, NUM_ROWS + ROW_GROWTH_CHUNK);
+        }
+
         // Remove stale cell links when a linked C:Quantity cell is cleared by the user.
         // Without this, refreshLinkedCells on next sheet load re-populates the cleared cell.
         const path = curSheetPath();
