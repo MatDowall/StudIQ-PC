@@ -685,11 +685,29 @@ async fn export_package(dest_path: String, state: State<'_, AppState>) -> Result
 async fn import_package(
     pkg_path: String,
     dest_tcop_path: String,
+    force: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<ProjectMeta, String> {
     use std::io::Read as _;
 
     let dest_tcop = Path::new(&dest_tcop_path);
+
+    // Guard against silently overwriting a project file that has been modified more
+    // recently than the package being imported (e.g. importing an older emailed/backed-up
+    // .tcopkg over a .tcop the user has kept working on). Compare OS mtimes; if the
+    // destination is newer, require the caller to explicitly confirm with force=true.
+    if !force.unwrap_or(false) && dest_tcop.exists() {
+        let dest_mtime = std::fs::metadata(dest_tcop).and_then(|m| m.modified()).ok();
+        let pkg_mtime = std::fs::metadata(&pkg_path).and_then(|m| m.modified()).ok();
+        if let (Some(dest_mtime), Some(pkg_mtime)) = (dest_mtime, pkg_mtime) {
+            if dest_mtime > pkg_mtime {
+                return Err(format!(
+                    "NEWER_FILE_EXISTS::The project file at \"{dest_tcop_path}\" was modified more recently than this package. Importing here will overwrite that newer version with the older package contents."
+                ));
+            }
+        }
+    }
+
     let dest_dir = dest_tcop
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -1198,6 +1216,32 @@ async fn add_drawing(
     .map_err(|e| format!("Failed to add drawing: {e}"))?;
 
     get_tree_node(&db, result.last_insert_rowid()).await
+}
+
+/// Re-points an existing drawing node at a new PDF location on disk (e.g. after the
+/// original file was moved, renamed, or is missing because the project was opened on a
+/// different machine). Recomputes `page_count` from the new file.
+#[tauri::command]
+async fn relink_drawing(
+    node_id: i64,
+    new_path: String,
+    state: State<'_, AppState>,
+) -> Result<TreeNodeDto, String> {
+    let db = active_project_db(&state)?;
+    verify_node_type(&db, node_id, "drawing").await?;
+
+    let page_count =
+        i64::from(load_document_meta_via_renderer(&state.renderer, &new_path)?.page_count);
+
+    sqlx::query("UPDATE tree_nodes SET file_path = ?, page_count = ? WHERE id = ?")
+        .bind(&new_path)
+        .bind(page_count)
+        .bind(node_id)
+        .execute(&db)
+        .await
+        .map_err(|e| format!("Failed to relink drawing: {e}"))?;
+
+    get_tree_node(&db, node_id).await
 }
 
 #[tauri::command]
@@ -4529,6 +4573,7 @@ pub fn run() {
             copy_dimension_group,
             add_drawing,
             add_drawing_to_folder_path,
+            relink_drawing,
             delete_node,
             rename_node,
             update_dimension_group_colour,

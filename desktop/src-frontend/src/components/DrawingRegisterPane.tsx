@@ -18,6 +18,7 @@ export function DrawingRegisterPane() {
   const deleteNode = useAppStore((state) => state.deleteNode);
   const openDrawing = useAppStore((state) => state.openDrawing);
   const openDrawingPage = useAppStore((state) => state.openDrawingPage);
+  const relinkDrawing = useAppStore((state) => state.relinkDrawing);
   const activeDrawingId = useAppStore((state) => state.activeDrawingId);
   const activePageNodeId = useAppStore((state) => state.activePageNodeId);
   const [selectedFolderId, setSelectedFolderId] = useState<number | null>(null);
@@ -48,7 +49,7 @@ export function DrawingRegisterPane() {
         setSelectedFolderId(null);
         setStatus("");
       } catch (error) {
-        setStatus(`ERROR: ${error}`);
+        await handleMissingPdf(error, node);
       }
       return;
     }
@@ -60,12 +61,47 @@ export function DrawingRegisterPane() {
         setSelectedFolderId(null);
         setStatus("");
       } catch (error) {
-        setStatus(`ERROR: ${error}`);
+        await handleMissingPdf(error, node);
       }
       return;
     }
 
     setSelectedFolderId(node.id);
+  }
+
+  // The PDF renderer reports a missing file as "Failed to open PDF: ...". Rather than a
+  // dead-end error, offer to locate the PDF's new location and retry the open.
+  async function handleMissingPdf(error: unknown, node: TreeNodeDto) {
+    const message = String(error);
+    if (!message.includes("Failed to open PDF")) {
+      setStatus(`ERROR: ${error}`);
+      return;
+    }
+    const drawingId = node.node_type === "drawing" ? node.id : node.parent_id;
+    if (drawingId === null || drawingId === undefined) {
+      setStatus(`ERROR: ${error}`);
+      return;
+    }
+    setStatus("PDF not found at its saved location — choose its new location.");
+    const selected = await open({ filters: [{ name: "PDF", extensions: ["pdf"] }], multiple: false });
+    if (!selected || typeof selected !== "string") {
+      setStatus(`ERROR: ${error}`);
+      return;
+    }
+    setStatus("Relinking drawing...");
+    try {
+      await relinkDrawing(drawingId, selected);
+      const relinkedNode = { ...node, file_path: selected };
+      if (node.node_type === "drawing") {
+        await openDrawing(relinkedNode);
+      } else {
+        await openDrawingPage(relinkedNode);
+      }
+      setSelectedFolderId(null);
+      setStatus("");
+    } catch (relinkError) {
+      setStatus(`ERROR: ${relinkError}`);
+    }
   }
 
   function handleContextMenu(event: MouseEvent, node: TreeNodeDto) {

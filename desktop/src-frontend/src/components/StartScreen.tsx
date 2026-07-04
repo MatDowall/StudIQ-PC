@@ -17,6 +17,7 @@ export function StartScreen() {
   const removeRecentProject = useAppStore((state) => state.removeRecentProject);
   const [showNewProject, setShowNewProject] = useState(false);
   const [pendingRemove, setPendingRemove] = useState<string | null>(null);
+  const [pendingOverwriteImport, setPendingOverwriteImport] = useState<{ pkgPath: string; destPath: string; message: string } | null>(null);
   const [status, setStatus] = useState("");
 
   useEffect(() => {
@@ -65,11 +66,23 @@ export function StartScreen() {
       filters: [{ name: "Take-it-Off Project", extensions: ["tcop"] }],
     });
     if (!destTcopPath || typeof destTcopPath !== "string") return;
+    const path = destTcopPath.toLowerCase().endsWith(".tcop") ? destTcopPath : destTcopPath + ".tcop";
+    await runImport(pkgPath, path);
+  }
+
+  async function runImport(pkgPath: string, destPath: string, force = false) {
     setStatus("Importing package…");
     try {
-      const path = destTcopPath.toLowerCase().endsWith(".tcop") ? destTcopPath : destTcopPath + ".tcop";
-      await importPackage(pkgPath, path);
+      await importPackage(pkgPath, destPath, force);
+      setPendingOverwriteImport(null);
     } catch (error) {
+      const message = String(error);
+      const sentinel = "NEWER_FILE_EXISTS::";
+      if (message.includes(sentinel)) {
+        setStatus("");
+        setPendingOverwriteImport({ pkgPath, destPath, message: message.slice(message.indexOf(sentinel) + sentinel.length) });
+        return;
+      }
       setStatus(`ERROR: ${error}`);
     }
   }
@@ -308,6 +321,16 @@ export function StartScreen() {
           confirmLabel="Remove"
           onCancel={() => setPendingRemove(null)}
           onConfirm={() => { void confirmRemove(); }}
+        />
+      ) : null}
+
+      {pendingOverwriteImport ? (
+        <ConfirmDialog
+          title="Overwrite newer project file?"
+          body={`${pendingOverwriteImport.message}\n\nThis cannot be undone. Choose a different destination if you don't want to lose the newer version.`}
+          confirmLabel="Overwrite anyway"
+          onCancel={() => setPendingOverwriteImport(null)}
+          onConfirm={() => { void runImport(pendingOverwriteImport.pkgPath, pendingOverwriteImport.destPath, true); }}
         />
       ) : null}
     </main>

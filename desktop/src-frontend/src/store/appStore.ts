@@ -375,7 +375,7 @@ interface AppStore {
   closeProject: () => Promise<void>;
   exportProject: (destPath: string) => Promise<void>;
   exportPackage: (destPath: string) => Promise<void>;
-  importPackage: (pkgPath: string, destTcopPath: string) => Promise<void>;
+  importPackage: (pkgPath: string, destTcopPath: string, force?: boolean) => Promise<void>;
   /** Debug/QA: export the current page's timber-framing walls as a 2D elevation PDF. Returns the
    *  saved file path, or null if there's nothing to export or the user cancelled the dialog. */
   exportFramingElevations: () => Promise<string | null>;
@@ -387,6 +387,7 @@ interface AppStore {
   createFolder: (tree: string, parentId: number | null, name: string) => Promise<TreeNodeDto>;
   addDrawing: (parentId: number | null, name: string, filePath: string) => Promise<void>;
   addDrawingToFolderPath: (folderPath: string, name: string, filePath: string) => Promise<void>;
+  relinkDrawing: (nodeId: number, newPath: string) => Promise<void>;
   createDimensionGroupInFolderPath: (folderPath: string, name: string, colour: string, measurementType: string) => Promise<void>;
   listDimensionFolders: () => Promise<FolderOption[]>;
   copyDimensionGroup: (sourceNodeId: number, targetFolderId: number, name: string, copyDimensions: boolean) => Promise<void>;
@@ -1061,8 +1062,8 @@ export const useAppStore = create<AppStore>((set, get) => ({
     await invoke<void>("export_package", { destPath });
   },
 
-  importPackage: async (pkgPath, destTcopPath) => {
-    const project = await invoke<ProjectMeta>("import_package", { pkgPath, destTcopPath });
+  importPackage: async (pkgPath, destTcopPath, force = false) => {
+    const project = await invoke<ProjectMeta>("import_package", { pkgPath, destTcopPath, force });
     set({ activeProject: project, workbooks: [], activeRevisionId: null });
     await get().loadRecentProjects();
     await get().loadWorkbooks();
@@ -1166,6 +1167,11 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   addDrawingToFolderPath: async (folderPath, name, filePath) => {
     await invoke<TreeNodeDto>("add_drawing_to_folder_path", { folderPath, name, filePath });
+    await refreshTree("drawings", set);
+  },
+
+  relinkDrawing: async (nodeId, newPath) => {
+    await invoke<TreeNodeDto>("relink_drawing", { nodeId, newPath });
     await refreshTree("drawings", set);
   },
 
