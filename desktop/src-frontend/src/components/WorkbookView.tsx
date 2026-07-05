@@ -163,6 +163,11 @@ function styleKey(row: number, col: number) {
 interface CellLink {
   groupId: number;
   display: string;
+  /** Set only on a framing group's auto-inserted "<size> Lintel to last" line-item
+   *  rows: the lintel's own framing size (e.g. "140x45"). Marks the cell as tracking
+   *  that specific lintel size's live total rather than the group's matchingTotalM, so
+   *  refreshLinkedCells keeps it in step with the group (see reconcileFramingLintels). */
+  lintelSize?: string;
 }
 
 // ─── Named cells (Excel-style "New Named Cell") ───────────────────────────────
@@ -355,6 +360,63 @@ function qtyTotalFormula(r: number): string {
 
 function dataForHot(data: (string | null)[][]): string[][] {
   return data.map(row => row.map(cell => cell ?? ""));
+}
+
+/** Canonical line-item description for a framing lintel of the given size. Shared by the
+ *  drop (`populateFramingRollup`) and the live re-sync (`reconcileFramingLintels`) so a
+ *  lintel row is always matched/backfilled by the exact text it was written with. */
+function lintelRowDesc(size: string): string {
+  return `${size} Lintel to last`;
+}
+
+/** Matches a lintel line-item description, capturing the framing size (group 1).
+ *  Mirrors `lintelRowDesc` — keep the two in sync. */
+const LINTEL_DESC_RE = /^(.+?) Lintel to last$/;
+
+/** The current lineal-metre total for one lintel size within a framing breakdown, or
+ *  `null` if that size is no longer present (its row's quantity should then go to 0). */
+function liveLintelTotal(breakdown: FramingGroupBreakdown | null, size: string): number | null {
+  if (!breakdown) return null;
+  const c = breakdown.components.find(x => x.sizeOverride === size);
+  return c ? c.totalM : null;
+}
+
+/** Builds the Quantity Build-up sheet for a framing group's non-lintel component
+ *  breakdown: one Description/Length row per component (Plates, Studs, Dwangs, …), with
+ *  Factor=1 and the standard H=PRODUCT(...) total so the sheet is immediately valid
+ *  (identical to what deriveLevelFormulas' qty pass would produce). Lintels are excluded
+ *  — they are always separate line items (see CLAUDE.md framing-multi-size-model).
+ *
+ *  Shared by the initial drop (`populateFramingRollup`) and the live re-sync
+ *  (`refreshLinkedCells`) so a framing row's breakdown always reflects the group's
+ *  current geometry and never drifts from the linked C:Quantity cell. */
+function buildFramingQtyData(breakdown: FramingGroupBreakdown): (string | null)[][] {
+  const nonLintels = breakdown.components.filter(c => !c.sizeOverride);
+  const qtyData = createEmptyData();
+  nonLintels.forEach((c, i) => {
+    if (i >= NUM_ROWS) return;
+    qtyData[i][COL_DESC]   = c.label;
+    qtyData[i][COL_LENGTH] = c.totalM.toFixed(3);
+    qtyData[i][COL_FACTOR] = "1";
+    qtyData[i][COL_TOTAL]  = qtyTotalFormula(i);
+  });
+  return qtyData;
+}
+
+/** True when two sheets carry the same non-empty content (ignoring trailing blank
+ *  rows/cells) — used to skip a redundant persist when a re-derived framing breakdown
+ *  is identical to what's already stored. */
+function sameSheetContent(a: (string | null)[][], b: (string | null)[][]): boolean {
+  const rows = Math.max(a.length, b.length);
+  for (let r = 0; r < rows; r++) {
+    const ra = a[r] ?? [];
+    const rb = b[r] ?? [];
+    const cols = Math.max(ra.length, rb.length);
+    for (let c = 0; c < cols; c++) {
+      if ((ra[c] ?? "") !== (rb[c] ?? "")) return false;
+    }
+  }
+  return true;
 }
 
 /**
@@ -642,7 +704,13 @@ function rollupRateIntoL2(
   excluded: (col: number) => boolean,
 ): void {
   const sumH = sumComputedCol(computed, COL_TOTAL);
-  if (!excluded(COL_RATE)) parentData[rowInParent][COL_RATE] = sumH !== null ? String(sumH) : null;
+  // An empty Rate Build-up sheet (no rows → sumH === null) must NOT overwrite a
+  // rate the user entered directly on the parent row. Empty sub-sheets are orphans
+  // left behind by drilling into an E:Rate cell without building anything up;
+  // rolling their "null" total into E would wipe a real rate and zero the row.
+  // Treat "no build-up content" as "no rollup at all" and leave the cell as-is.
+  if (sumH === null) return;
+  if (!excluded(COL_RATE)) parentData[rowInParent][COL_RATE] = String(sumH);
   const pullThroughCols: Array<[number, number]> = [
     [COL_LAB, COL_LAB_TOTAL],
     [COL_MAT, COL_MAT_TOTAL],
@@ -668,7 +736,11 @@ function rollupQtyIntoL2(
   excluded: (col: number) => boolean,
 ): void {
   const sumH = sumComputedCol(computed, COL_TOTAL);
-  if (!excluded(COL_QTY)) parentData[rowInParent][COL_QTY] = sumH !== null ? String(sumH) : null;
+  // Same guard as rollupRateIntoL2: an empty Quantity Build-up sheet must not wipe
+  // a quantity entered directly on the parent row (which would zero the whole row's
+  // Subtotal/Total). See the comment there — empty orphan sub-sheets are common.
+  if (sumH === null) return;
+  if (!excluded(COL_QTY)) parentData[rowInParent][COL_QTY] = String(sumH);
 }
 
 /** Rolls a Level-2 sheet's evaluated H:Total (and …-Total pull-throughs) into its
@@ -1381,23 +1453,52 @@ export function WorkbookView() {
    * geometry/props and rewrites C/D if they've changed — keeps the workbook in sync
    * when a measurement is edited after being imported. Bails out if the user has
    * since navigated away from `path`.
+   *
+   * For timber-framing links it ALSO re-seeds the row's Quantity Build-up sub-sheet
+   * (`<path>/Q<row>`) from the live component breakdown. Previously only the parent
+   * C:Quantity was kept live; the build-up sheet was a one-shot snapshot written at
+   * drop time and never refreshed, so it silently drifted (e.g. the breakdown summed
+   * to 221.72 while the cell showed the live 231.85). Re-deriving it here keeps the
+   * breakdown and its parent cell in lock-step every time the sheet is displayed.
    */
   const refreshLinkedCells = useCallback(async (path: string) => {
     const links = cellLinkMap.current.get(path);
     if (!links || links.size === 0) return;
+
+    // Load each group's live context at most once per refresh — a framing group is
+    // referenced by its main row's link AND every lintel row's link.
+    const ctxCache = new Map<number, GroupImportContext | null>();
+    const getCtx = async (groupId: number): Promise<GroupImportContext | null> => {
+      if (ctxCache.has(groupId)) return ctxCache.get(groupId) ?? null;
+      let c: GroupImportContext | null = null;
+      try { c = await loadGroupImportContext(groupId); } catch { c = null; }
+      ctxCache.set(groupId, c);
+      return c;
+    };
+
     for (const [key, link] of Array.from(links.entries())) {
       if (curSheetPath() !== path) return;
       const [rowStr] = key.split(",");
       const row = Number(rowStr);
-      let quantity: Quantity | null;
-      try {
-        quantity = deriveLinkedQuantity(await loadGroupImportContext(link.groupId), link.display);
-      } catch {
-        continue;
-      }
-      if (!quantity || curSheetPath() !== path) continue;
+      const ctx = await getCtx(link.groupId);
+      if (!ctx || curSheetPath() !== path) continue;
       const hot = hotRef.current?.hotInstance;
       if (!hot) continue;
+
+      // Lintel line-item row: track its own size's live total (0 if that size is gone
+      // from the group), never the group's matchingTotalM.
+      if (link.lintelSize != null) {
+        const total = liveLintelTotal(ctx.framingBreakdown, link.lintelSize);
+        const text = total != null ? total.toFixed(3) : "0";
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        if (String((hot as any).getSourceDataAtCell(row, COL_QTY) ?? "") !== text) {
+          hot.setDataAtCell(row, COL_QTY, text);
+        }
+        continue;
+      }
+
+      const quantity = deriveLinkedQuantity(ctx, link.display);
+      if (!quantity) continue;
       const newQtyText = quantityValueText(quantity);
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       if (String((hot as any).getSourceDataAtCell(row, COL_QTY) ?? "") !== newQtyText) {
@@ -1407,9 +1508,73 @@ export function WorkbookView() {
       if (String((hot as any).getSourceDataAtCell(row, COL_UNIT) ?? "") !== quantity.uom) {
         hot.setDataAtCell(row, COL_UNIT, quantity.uom);
       }
+
+      // Keep the framing breakdown sub-sheet AND the lintel line-item rows in step with
+      // the live group.
+      if (ctx.props.measurement_type === "timber_framing" && ctx.framingBreakdown) {
+        const revId = revIdRef.current;
+        if (revId == null) continue;
+        const qtyPath = `${path}/Q${row}`;
+        const freshQty = buildFramingQtyData(ctx.framingBreakdown);
+        const existing = sheetDataMap.current.get(qtyPath);
+        if (!existing || !sameSheetContent(existing, freshQty)) {
+          sheetDataMap.current.set(qtyPath, freshQty);
+          sheetComputedMap.current.delete(qtyPath); // force re-eval on next read
+          persistSheet(revId, qtyPath, freshQty);
+        }
+        reconcileFramingLintels(hot, path, row, link.groupId, ctx.framingBreakdown);
+      }
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  /** Backfills lintel-row cell links onto legacy (pre-link) framing rows and refreshes
+   *  each lintel row's quantity in place from the live breakdown. Scans the contiguous
+   *  block of "<size> Lintel to last" rows immediately below the group's row — the shape
+   *  `insertLintelRowsBelow` creates — so each lintel row is attributed to THIS group even
+   *  when several framing groups share a sheet. Only cell values / links change (never row
+   *  structure), so it is safe to run on every display. A vanished size drives its row's
+   *  quantity to 0; a NEW size with no existing row is not auto-inserted (that needs a
+   *  re-drop, which also lets the user price it). */
+  function reconcileFramingLintels(
+    hot: Handsontable,
+    path: string,
+    groupRow: number,
+    groupId: number,
+    breakdown: FramingGroupBreakdown,
+  ): void {
+    let attachedLink = false;
+    for (let r = groupRow + 1; r < NUM_ROWS; r++) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const desc = String((hot as any).getSourceDataAtCell(r, COL_DESC) ?? "");
+      const m = LINTEL_DESC_RE.exec(desc);
+      if (!m) break; // end of the contiguous lintel block
+      const size = m[1];
+
+      const existingLink = getCellLink(path, r, COL_QTY);
+      // A row linked to a different group (or to a non-lintel meaning) ends this group's
+      // contiguous lintel block — never touch someone else's row.
+      if (existingLink && (existingLink.groupId !== groupId || existingLink.lintelSize == null)) break;
+      if (!existingLink) {
+        setCellLink(path, r, COL_QTY, { groupId, display: "length", lintelSize: size });
+        setCellExcluded(path, r, COL_QTY, true);
+        attachedLink = true;
+      }
+
+      const total = liveLintelTotal(breakdown, size);
+      const text = total != null ? total.toFixed(3) : "0";
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      if (String((hot as any).getSourceDataAtCell(r, COL_QTY) ?? "") !== text) {
+        hot.setDataAtCell(r, COL_QTY, text);
+      }
+    }
+    // A qty edit above would persist the sheet (with its links) via afterChange/scheduleSave;
+    // if we only attached links without changing any quantity, persist explicitly.
+    if (attachedLink) {
+      const revId = revIdRef.current;
+      if (revId != null) persistSheet(revId, path, sheetDataMap.current.get(path) ?? captureSourceData(hot));
+    }
+  }
 
   /** Ensures a freshly-displayed sheet's links are loaded and its linked cells reflect
    *  the latest dimension-group quantities. Call right after `loadLevelData`. */
@@ -1543,7 +1708,8 @@ export function WorkbookView() {
     hot: Handsontable,
     path: string,
     afterRow: number,
-    items: Array<{ desc: string; qty: string }>,
+    groupId: number,
+    items: Array<{ desc: string; qty: string; size: string }>,
   ): void {
     const count = items.length;
     if (count === 0) return;
@@ -1567,6 +1733,9 @@ export function WorkbookView() {
       // the quantity is a flat total (nothing to build up), and drilling would create a
       // sub-sheet whose rollup would overwrite the placed value on drill-up.
       setCellExcluded(path, r, COL_QTY, true);
+      // Link the row to its lintel size so refreshLinkedCells keeps its quantity live
+      // with the group (see reconcileFramingLintels) instead of freezing at drop time.
+      setCellLink(path, r, COL_QTY, { groupId, display: "length", lintelSize: items[i].size });
     }
     hot.render();
     scheduleSaveRef.current();
@@ -1579,7 +1748,7 @@ export function WorkbookView() {
    *
    *  Lintels are deliberately NOT folded into the Quantity Build-up — they're always a
    *  separate sub-quantity that must not roll into the group's own matchingTotalM. */
-  function populateFramingRollup(row: number, breakdown: FramingGroupBreakdown): void {
+  function populateFramingRollup(row: number, groupId: number, breakdown: FramingGroupBreakdown): void {
     const hot = hotRef.current?.hotInstance;
     const revId = revIdRef.current;
     if (!hot || revId == null) return;
@@ -1590,12 +1759,7 @@ export function WorkbookView() {
 
     if (nonLintels.length > 0) {
       const qtyPath = `${path}/Q${row}`;
-      const qtyData = createEmptyData();
-      nonLintels.forEach((c, i) => {
-        if (i >= NUM_ROWS) return;
-        qtyData[i][COL_DESC]   = c.label;
-        qtyData[i][COL_LENGTH] = c.totalM.toFixed(3);
-      });
+      const qtyData = buildFramingQtyData(breakdown);
       sheetDataMap.current.set(qtyPath, qtyData);
       persistSheet(revId, qtyPath, qtyData);
     }
@@ -1604,10 +1768,11 @@ export function WorkbookView() {
       // aggregateFramingGroup groups lintels by size (framingComponentKey includes
       // sizeOverride), so each entry here is one distinct lintel size.
       const items = lintels.map(c => ({
-        desc: `${c.sizeOverride} Lintel to last`,
+        desc: `${lintelRowDesc(c.sizeOverride!)}`,
         qty: c.totalM.toFixed(3),
+        size: c.sizeOverride!,
       }));
-      insertLintelRowsBelow(hot, path, row, items);
+      insertLintelRowsBelow(hot, path, row, groupId, items);
     }
   }
 
@@ -1626,7 +1791,7 @@ export function WorkbookView() {
     if (ctx.props.measurement_type === "timber_framing") {
       const quantity = deriveLinkedQuantity(ctx, "length");
       if (quantity) applyImport(row, groupId, "length", quantity);
-      if (ctx.framingBreakdown) populateFramingRollup(row, ctx.framingBreakdown);
+      if (ctx.framingBreakdown) populateFramingRollup(row, groupId, ctx.framingBreakdown);
       return;
     }
 
@@ -2767,6 +2932,9 @@ export function WorkbookView() {
       if (l2Data == null) continue; // never drilled into — F/H are manually entered, leave as-is
 
       await ensureSheetExclusionsLoaded(revId, l2Path);
+      // Links tell us which C:Quantity / E:Rate cells are driven by a live dimension
+      // group (see the getCellLink guard below) — load them before the row scan.
+      await ensureSheetLinksLoaded(revId, l2Path);
       let l2Changed = false;
 
       // Check every row for a Rate/Quantity Build-up child, not just rows that look
@@ -2777,14 +2945,20 @@ export function WorkbookView() {
 
         const ratePath = `${l2Path}/R${r2}`;
         const rateData = await fetchSheetForRecalc(revId, ratePath);
-        if (rateData != null) {
+        // A cell linked to a dimension group is kept live by refreshLinkedCells from
+        // the group's current geometry; its Build-up sub-sheet is only a one-shot
+        // snapshot taken when the group was dropped and is NEVER refreshed, so it goes
+        // stale the moment the group's measurements change. Rolling that stale snapshot
+        // back into the cell would overwrite the correct live value — the exact reason
+        // recalc diverged from the (self-healing) drill path. Skip linked cells.
+        if (rateData != null && !getCellLink(l2Path, r2, COL_RATE)) {
           rollupRateIntoL2(l2Data, r2, evaluateWithNames(rateData, namedValues), l2Excluded);
           l2Changed = true;
         }
 
         const qtyPath = `${l2Path}/Q${r2}`;
         const qtyData = await fetchSheetForRecalc(revId, qtyPath);
-        if (qtyData != null) {
+        if (qtyData != null && !getCellLink(l2Path, r2, COL_QTY)) {
           rollupQtyIntoL2(l2Data, r2, evaluateWithNames(qtyData, namedValues), l2Excluded);
           l2Changed = true;
         }
