@@ -1310,7 +1310,12 @@ async fn create_dimension_group(
     .map_err(|e| format!("Failed to create dimension group: {e}"))?;
 
     let node_id = result.last_insert_rowid();
-    let default_display = if mtype == "timber_framing" { "length" } else { mtype.as_str() };
+    // "array" isn't itself a valid display type (DISPLAY_TYPES), so default it to "length"
+    // like timber_framing — matches DISPLAYS_BY_TYPE.array[0] in the properties dialog.
+    let default_display = match mtype.as_str() {
+        "timber_framing" | "array" => "length",
+        _ => mtype.as_str(),
+    };
 
     sqlx::query(
         r#"

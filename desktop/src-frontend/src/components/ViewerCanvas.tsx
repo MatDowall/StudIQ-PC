@@ -209,10 +209,11 @@ function drawCountMarker(ctx: CanvasRenderingContext2D, x: number, y: number, co
 }
 
 /** Custom count shape: a rectangle centred at a point, sized to the group's real-world Height/Width. */
-function drawCustomCountShape(ctx: CanvasRenderingContext2D, x: number, y: number, halfW: number, halfH: number, colour: string, selected = false) {
+function drawCustomCountShape(ctx: CanvasRenderingContext2D, x: number, y: number, halfW: number, halfH: number, colour: string, selected = false, style?: string) {
   ctx.save();
   ctx.strokeStyle = colour;
   ctx.lineWidth = selected ? 3 : 2;
+  ctx.setLineDash(lineDash(style));
   ctx.strokeRect(x - halfW, y - halfH, halfW * 2, halfH * 2);
   ctx.restore();
 }
@@ -449,7 +450,7 @@ function drawOverlays(
       for (const point of points) {
         const s = pageToScreen(point.x, point.y, page.height_pts, pan, zoom);
         if (extents) {
-          drawCustomCountShape(ctx, s.x, s.y, extents.halfW, extents.halfH, colour, selected);
+          drawCustomCountShape(ctx, s.x, s.y, extents.halfW, extents.halfH, colour, selected, style);
         } else {
           drawCountMarker(ctx, s.x, s.y, colour, selected);
         }
@@ -2053,9 +2054,16 @@ export function ViewerCanvas({
   function clampPan(nextPan: { x: number; y: number }, nextZoom = zoom) {
     if (!page) return nextPan;
     const size = pagePixelSize(page, nextZoom);
+    // When the page is smaller than the viewport (zoomed out), size - viewportSize is negative —
+    // allow panning across that whole negative..0 range instead of pinning to 0, so the page is
+    // freely moveable rather than glued to the top-left corner.
+    const minX = Math.min(0, size.width - viewportSize.width);
+    const maxX = Math.max(0, size.width - viewportSize.width);
+    const minY = Math.min(0, size.height - viewportSize.height);
+    const maxY = Math.max(0, size.height - viewportSize.height);
     return {
-      x: Math.max(0, Math.min(nextPan.x, Math.max(0, size.width - viewportSize.width))),
-      y: Math.max(0, Math.min(nextPan.y, Math.max(0, size.height - viewportSize.height))),
+      x: Math.max(minX, Math.min(nextPan.x, maxX)),
+      y: Math.max(minY, Math.min(nextPan.y, maxY)),
     };
   }
 

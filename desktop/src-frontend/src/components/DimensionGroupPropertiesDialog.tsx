@@ -98,12 +98,10 @@ export function DimensionGroupPropertiesDialog({
   const [width, setWidth] = useState(String(initial.default_width));
   const [height, setHeight] = useState(String(initial.default_height));
   const [offset, setOffset] = useState(String(initial.default_offset));
-  const [addToGfa, setAddToGfa] = useState(initial.add_to_gfa);
   const [posColour, setPosColour] = useState(initial.pos_colour);
   const [posStyle, setPosStyle] = useState(initial.pos_style);
   const [negColour, setNegColour] = useState(initial.neg_colour);
   const [negStyle, setNegStyle] = useState(initial.neg_style);
-  const [weightUom, setWeightUom] = useState(initial.weight_uom ?? "");
   const [countType, setCountType] = useState(initial.count_type ?? "marker");
   // Custom count shape Height/Width are edited in millimetres (the natural unit for a small
   // real-world object — a fixture, a sheet, etc.) even though default_width/default_height are
@@ -173,19 +171,18 @@ export function DimensionGroupPropertiesDialog({
       default_width: isCount ? (isCustomCount ? parseNumber(customWidthMm, 0) / 1000 : initial.default_width) : parseNumber(width, 0),
       default_height: isCount ? (isCustomCount ? parseNumber(customHeightMm, 0) / 1000 : initial.default_height) : parseNumber(height, 0),
       default_offset: parseNumber(offset, 0),
-      add_to_gfa: addToGfa,
+      // Add To GFA and Weight UOM are no longer editable here — keep whatever was already stored.
+      add_to_gfa: initial.add_to_gfa,
       pos_colour: posColour,
       pos_style: posStyle,
       neg_colour: negColour,
       neg_style: negStyle,
-      weight_uom: weightUom.trim() ? weightUom.trim() : null,
+      weight_uom: initial.weight_uom,
       // Persist framing settings when this is a framing group; otherwise keep any existing blob.
       framing_props_json: isFraming ? serializeFramingSettings(framingSettings) : initial.framing_props_json,
       count_type: isCount ? countType : initial.count_type,
     });
   }
-
-  const isWeight = defaultDisplay === "weight";
 
   return (
     <DialogShell title={`Dimension Group Properties — ${groupName}`} width={460} zIndex={1250} onClose={onCancel}>
@@ -304,9 +301,6 @@ export function DimensionGroupPropertiesDialog({
             <input type="number" value={offset} onChange={(e) => setOffset(e.target.value)} style={{ ...inputStyle, flex: 1 }} title="Height above datum (3D only); no effect on 2D quantity" />
             <span style={{ color: theme.text.secondary, fontSize: 12 }}>m</span>
           </Field>
-          <Field label="Add To GFA">
-            <input type="checkbox" checked={addToGfa} onChange={(e) => setAddToGfa(e.target.checked)} />
-          </Field>
           {/* Timber Framing has no positive/negative polarity, so its colour/style is set via
               the group's "Change Colour" menu, not here. */}
           {!isFraming ? (
@@ -333,17 +327,7 @@ export function DimensionGroupPropertiesDialog({
               </Field>
             </>
           ) : null}
-          {!isFraming ? (
-            <Field label="Weight UOM">
-              <input
-                value={weightUom}
-                onChange={(e) => setWeightUom(e.target.value)}
-                disabled={!isWeight}
-                placeholder={isWeight ? "kg, t…" : "(weight display not enabled)"}
-                style={{ ...inputStyle, flex: 1, opacity: isWeight ? 1 : 0.5 }}
-              />
-            </Field>
-          ) : (
+          {isFraming ? (
             <div style={{ marginTop: 4, border: `1px solid ${theme.border.divider}`, background: theme.bg.input }}>
               <div style={{ padding: "5px 8px", borderBottom: `1px solid ${theme.border.subtle}`, fontSize: 12, fontWeight: 600 }}>
                 Makeup summary
@@ -379,7 +363,7 @@ export function DimensionGroupPropertiesDialog({
                 </div>
               )}
             </div>
-          )}
+          ) : null}
         </div>
         <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, padding: "10px 12px", borderTop: `1px solid ${theme.border.subtle}` }}>
           <button onClick={onCancel} style={{ height: 28, padding: "0 12px", background: theme.bg.input, color: theme.text.primary, border: `1px solid ${theme.border.divider}`, cursor: "pointer" }}>
