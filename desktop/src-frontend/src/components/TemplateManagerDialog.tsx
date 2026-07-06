@@ -155,7 +155,7 @@ export function TemplateManagerDialog() {
                 fontSize: 12,
               }}
             >
-              <span className="material-symbols-outlined" style={{ fontSize: 16 }}>upload</span>
+              <span className="material-symbols-outlined" style={{ fontSize: 16 }}>download</span>
               Import...
             </button>
           </div>
@@ -178,7 +178,7 @@ export function TemplateManagerDialog() {
                       border: `1px solid ${theme.border.divider}`, cursor: "pointer",
                     }}
                   >
-                    <span className="material-symbols-outlined" style={{ fontSize: 16 }}>download</span>
+                    <span className="material-symbols-outlined" style={{ fontSize: 16 }}>upload</span>
                   </button>
                   <button
                     title="Rename"

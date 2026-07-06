@@ -356,6 +356,7 @@ interface BreadcrumbCtx {
   unit:        string;
   rate:        string;
   subtotal:    string;
+  factor:      string;
   total:       string;
 }
 
@@ -687,15 +688,62 @@ function loadLevelData(
 }
 
 /**
- * Build breadcrumb display context from a row of *evaluated* data (e.g. `hot.getData()`).
- * Using evaluated values — rather than source/formula strings — ensures formula cells
- * (e.g. F holding `=E5*C5`) display their computed numeric result, not the formula text,
- * so BreadcrumbRow can render Subtotal/Total as plain formatted numbers.
+ * Build breadcrumb display context from a row of *evaluated* data (e.g. a computed
+ * snapshot array). Using evaluated values — rather than source/formula strings —
+ * ensures formula cells (e.g. F holding `=E5*C5`) display their computed numeric
+ * result, not the formula text, so BreadcrumbRow can render Subtotal/Total as plain
+ * formatted numbers.
  */
 function readRowCtx(rowIndex: number, data: unknown[][]): BreadcrumbCtx {
   const r = (data[rowIndex] ?? []) as unknown[];
   const v = (i: number): string => (r[i] != null && r[i] !== "" ? String(r[i]) : "");
-  return { code: v(0), description: v(1), quantity: v(2), unit: v(3), rate: v(4), subtotal: v(5), total: v(7) };
+  return { code: v(0), description: v(1), quantity: v(2), unit: v(3), rate: v(4), subtotal: v(5), factor: v(6), total: v(7) };
+}
+
+/**
+ * Same as `readRowCtx`, but reads directly from the live grid via `hot.getDataAtCell`
+ * — the same accessor used elsewhere for evaluated formula results (see readCellValue
+ * / selection stats) — instead of a bulk `hot.getData()` snapshot. `getData()` was
+ * found to hand back the raw formula string instead of its computed value for cells
+ * whose formula references a named expression bound elsewhere (e.g.
+ * `=1+margin_pct/100`), even though the cell renders correctly on screen and
+ * `getDataAtCell` resolves it fine.
+ */
+function readRowCtxFromGrid(hot: Handsontable, rowIndex: number): BreadcrumbCtx {
+  const v = (col: number): string => {
+    const val = hot.getDataAtCell(rowIndex, col);
+    return val != null && val !== "" ? String(val) : "";
+  };
+  return { code: v(0), description: v(1), quantity: v(2), unit: v(3), rate: v(4), subtotal: v(5), factor: v(6), total: v(7) };
+}
+
+/**
+ * Snapshot the whole displayed sheet as *evaluated* values, cell by cell via
+ * `hot.getDataAtCell` — see `readRowCtxFromGrid` for why bulk `hot.getData()` can't
+ * be trusted here: it hands back raw formula text (not the computed value) for
+ * cells whose formula references a named expression bound elsewhere. Used anywhere
+ * an evaluated snapshot of the current sheet is cached/exported (drillDown/drillUp's
+ * `sheetComputedMap`, print), so downstream rollups and displays never see a formula
+ * string where a number is expected.
+ */
+function getEvaluatedGridData(hot: Handsontable): unknown[][] {
+  const rows = hot.countRows();
+  const cols = hot.countCols();
+  const out: unknown[][] = new Array(rows);
+  for (let r = 0; r < rows; r++) {
+    const row: unknown[] = new Array(cols);
+    for (let c = 0; c < cols; c++) row[c] = hot.getDataAtCell(r, c);
+    out[r] = row;
+  }
+  return out;
+}
+
+/** Read `col` of `row` from an evaluated snapshot, falling back to `rawFallback`
+ *  (e.g. a cloned live row's own raw value) if the snapshot has nothing for that
+ *  cell yet — see propagateLiveRollup's Factor handling. */
+function evaluatedOrRaw(computed: unknown[][], row: number, col: number, rawFallback: string | null): string | null {
+  const val = computed[row]?.[col];
+  return val != null && val !== "" ? String(val) : rawFallback;
 }
 
 /** Get the trailing alphabetic token the user is currently typing (for autocomplete). */
@@ -916,74 +964,126 @@ function flatExportRowFrom(evaluated: unknown[], sectionCode: string, sectionDes
 // ─── Breadcrumb toolbar row ───────────────────────────────────────────────
 
 interface BreadcrumbRowProps {
-  ctx:      BreadcrumbCtx;
-  onBack:   () => void;
-  showCode: boolean; // true = Level-1 context (code + description separate boxes)
+  ctx:    BreadcrumbCtx;
+  onBack: () => void;
 }
 
-function BreadcrumbRow({ ctx, onBack, showCode }: BreadcrumbRowProps) {
-  const BD: React.CSSProperties = { borderRight: "1px solid #ccc" };
-  const cell = (extra?: React.CSSProperties): React.CSSProperties => ({
-    height: "100%",
-    display: "flex",
-    alignItems: "center",
-    padding: "0 4px",
-    fontSize: 12,
-    flexShrink: 0,
-    overflow: "hidden",
-    whiteSpace: "nowrap",
-    ...BD,
-    ...extra,
-  });
+// CostX renders each breadcrumb field as its own separate bordered/rounded chip
+// (including the back-arrow) laid out in a row with a small gap between them,
+// rather than one continuous bordered strip with internal divider lines.
+const BREADCRUMB_ROW_H = 24;
+const BREADCRUMB_CHIP_GAP = 4;
 
+function BreadcrumbChip({
+  children,
+  width,
+  align = "left",
+  bold,
+  yellow,
+  header,
+}: {
+  children: React.ReactNode;
+  width:    number;
+  align?:   "left" | "right";
+  bold?:    boolean;
+  yellow?:  boolean;
+  header?:  boolean;
+}) {
   return (
-    <div style={{ display: "flex", alignItems: "center", height: 28, borderBottom: "1px solid #ccc", background: "#e8e8e8", flexShrink: 0, overflow: "hidden" }}>
+    <div
+      style={{
+        width,
+        boxSizing: "border-box",
+        height: BREADCRUMB_ROW_H,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: align === "right" ? "flex-end" : "flex-start",
+        padding: "0 6px",
+        fontSize: header ? 11 : 12,
+        fontWeight: header ? 700 : bold ? 600 : 400,
+        color: header ? "#33475b" : "#1f2d3d",
+        flexShrink: 0,
+        overflow: "hidden",
+        whiteSpace: "nowrap",
+        textOverflow: "ellipsis",
+        border: header ? undefined : "1px solid #b9c2cc",
+        borderRadius: header ? undefined : 0,
+        background: header ? undefined : yellow ? "#fffff0" : "#fff",
+      }}
+    >
+      {children}
+    </div>
+  );
+}
 
-      {/* ← back arrow — same width as rowHeaderWidth so column A aligns with the grid */}
+/** Column-label header for the breadcrumb pills below — rendered once, not per
+ *  level, sized to fit its content rather than stretching the full grid width. */
+function BreadcrumbHeaderRow() {
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: BREADCRUMB_CHIP_GAP, padding: "4px 8px 0", flexShrink: 0 }}>
+      <div style={{ width: ROW_HDR_W, flexShrink: 0 }} />
+      <BreadcrumbChip header width={COLUMNS[0].width}>Code</BreadcrumbChip>
+      <BreadcrumbChip header width={COLUMNS[1].width}>Description</BreadcrumbChip>
+      <BreadcrumbChip header width={COLUMNS[2].width} align="right">Quantity</BreadcrumbChip>
+      <BreadcrumbChip header width={COLUMNS[3].width}>Unit</BreadcrumbChip>
+      <BreadcrumbChip header width={COLUMNS[4].width} align="right">Rate</BreadcrumbChip>
+      <BreadcrumbChip header width={COLUMNS[5].width} align="right">Sub-Total</BreadcrumbChip>
+      <BreadcrumbChip header width={COLUMNS[6].width} align="right">Factor</BreadcrumbChip>
+      <BreadcrumbChip header width={COLUMNS[7].width} align="right">Total</BreadcrumbChip>
+    </div>
+  );
+}
+
+function BreadcrumbRow({ ctx, onBack }: BreadcrumbRowProps) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: BREADCRUMB_CHIP_GAP, padding: "4px 8px", flexShrink: 0 }}>
+      {/* ← back-navigation icon — its own chip, same width as rowHeaderWidth so column A aligns with the grid */}
       <button
         onClick={onBack}
         title="Return to previous level"
-        style={{ width: ROW_HDR_W, height: "100%", border: "none", ...BD, background: "transparent", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}
+        style={{
+          width: ROW_HDR_W,
+          height: BREADCRUMB_ROW_H,
+          boxSizing: "border-box",
+          border: "1px solid #b9c2cc",
+          background: "#fff",
+          cursor: "pointer",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          flexShrink: 0,
+        }}
       >
-        <span className="material-symbols-outlined" style={{ fontSize: 16, color: "#555" }}>arrow_back</span>
+        <span className="material-symbols-outlined" style={{ fontSize: 15, color: "#7a8794" }}>reply</span>
       </button>
 
-      {/* A: Code – only when showing Level-1 context */}
-      {showCode && (
-        <div style={cell({ width: COLUMNS[0].width, color: "#555", fontWeight: 500 })}>
-          {ctx.code}
-        </div>
-      )}
+      {/* A: Code */}
+      <BreadcrumbChip width={COLUMNS[0].width} bold>{ctx.code}</BreadcrumbChip>
 
-      {/* B: Description – takes A+B width if code is hidden */}
-      <div style={cell({ width: showCode ? COLUMNS[1].width : COLUMNS[0].width + COLUMNS[1].width, fontWeight: showCode ? 600 : 400 })}>
-        {ctx.description}
-      </div>
+      {/* B: Description */}
+      <BreadcrumbChip width={COLUMNS[1].width} bold>{ctx.description}</BreadcrumbChip>
 
       {/* C: Quantity */}
-      <div style={cell({ width: COLUMNS[2].width, justifyContent: "flex-end" })}>
-        {ctx.quantity}
-      </div>
+      <BreadcrumbChip width={COLUMNS[2].width} align="right">{ctx.quantity}</BreadcrumbChip>
 
       {/* D: Unit */}
-      <div style={cell({ width: COLUMNS[3].width })}>
-        {ctx.unit}
-      </div>
+      <BreadcrumbChip width={COLUMNS[3].width}>{ctx.unit}</BreadcrumbChip>
 
       {/* E: Rate */}
-      <div style={cell({ width: COLUMNS[4].width, justifyContent: "flex-end" })}>
-        {ctx.rate}
-      </div>
+      <BreadcrumbChip width={COLUMNS[4].width} align="right">{ctx.rate}</BreadcrumbChip>
 
-      {/* F: Subtotal – yellow */}
-      <div style={cell({ width: COLUMNS[5].width, justifyContent: "flex-end", background: "#fffff0" })}>
+      {/* F: Sub-Total – yellow */}
+      <BreadcrumbChip width={COLUMNS[5].width} align="right" yellow>
         {formatNumericDisplay(ctx.subtotal, DEFAULT_WORKBOOK_FORMAT.decimals) ?? ctx.subtotal}
-      </div>
+      </BreadcrumbChip>
 
-      {/* H: Total – yellow (factor column omitted; H is already F×G from the sheet) */}
-      <div style={cell({ width: COLUMNS[6].width + COLUMNS[7].width, justifyContent: "flex-end", background: "#fffff0" })}>
+      {/* G: Factor */}
+      <BreadcrumbChip width={COLUMNS[6].width} align="right">{ctx.factor}</BreadcrumbChip>
+
+      {/* H: Total – yellow */}
+      <BreadcrumbChip width={COLUMNS[7].width} align="right" bold yellow>
         {formatNumericDisplay(ctx.total, DEFAULT_WORKBOOK_FORMAT.decimals) ?? ctx.total}
-      </div>
+      </BreadcrumbChip>
     </div>
   );
 }
@@ -1078,6 +1178,10 @@ export function WorkbookView() {
   revIdRef.current = activeRevisionId;
 
   const setWorkbookRevisionProjectTotal = useAppStore(s => s.setWorkbookRevisionProjectTotal);
+  const workbooks = useAppStore(s => s.workbooks);
+  const activeProjectTotal = workbooks
+    .flatMap(wb => wb.revisions)
+    .find(rev => rev.id === activeRevisionId)?.project_total ?? null;
 
   // Format toolbar bridge (ribbon ⇄ grid) — see appStore.ts
   const setWorkbookFormat    = useAppStore(s => s.setWorkbookFormat);
@@ -1157,7 +1261,7 @@ export function WorkbookView() {
   const sheetDataMap = useRef<Map<string, (string | null)[][]>>(
     new Map([["L1", createEmptyData()]])
   );
-  // Parallel cache of *evaluated* snapshots (hot.getData()), captured at the same
+  // Parallel cache of *evaluated* snapshots (getEvaluatedGridData(hot)), captured at the same
   // moments as sheetDataMap (when leaving a sheet). Needed so live breadcrumb rollup
   // can sum ancestor sheets' formula columns (F, H, …) without re-loading/evaluating
   // them — sheetDataMap's formula strings would otherwise sum to NaN.
@@ -2459,7 +2563,7 @@ export function WorkbookView() {
       if (!hot) return;
       const kind = sheetKindForPath(curSheetPath());
       const base = kind === "qty" ? QTY_COLUMNS : COLUMNS;
-      const rawData: unknown[][] = hot.getData() as unknown[][];
+      const rawData: unknown[][] = getEvaluatedGridData(hot);
 
       const headers = buildColHeaders(base, hot.countCols());
       const headerCells = headers.map(h => `<th>${h}</th>`).join("");
@@ -2601,15 +2705,15 @@ export function WorkbookView() {
     sheetDataMap.current.set(curPath, curData);
     // Cache evaluated snapshot too — needed by propagateLiveRollup to sum ancestor
     // sheets' formula columns once this sheet is no longer the displayed one.
-    sheetComputedMap.current.set(curPath, hot.getData() as unknown[][]);
+    sheetComputedMap.current.set(curPath, getEvaluatedGridData(hot));
 
     // Persist current sheet before leaving it
     const revId = revIdRef.current;
     if (revId != null) persistSheet(revId, curPath, curData);
 
     // Use evaluated values (not source/formula strings) for the breadcrumb context —
-    // see readRowCtx doc comment.
-    const ctx = readRowCtx(row, hot.getData() as unknown[][]);
+    // see readRowCtxFromGrid doc comment.
+    const ctx = readRowCtxFromGrid(hot, row);
     // C:Quantity opens a Quantity Build-up sheet ("/Q<row>"); every other drill column
     // (F:Subtotal at L1, E:Rate at L2) opens a standard/Rate Build-up sheet ("/R<row>").
     const isQtyDrill = levelRef.current === 2 && col === COL_QTY;
@@ -2712,9 +2816,9 @@ export function WorkbookView() {
     sheetDataMap.current.set(curPath, curData);
 
     // ── Roll up aggregate columns into the parent sheet ───────────────────
-    // Use hot.getData() (evaluated values) rather than source data (formula strings)
-    // so formula cells contribute their computed result to the sums.
-    const computed  = hot.getData() as unknown[][];
+    // Use getEvaluatedGridData(hot) (evaluated values) rather than source data (formula
+    // strings) so formula cells contribute their computed result to the sums.
+    const computed  = getEvaluatedGridData(hot);
     // Cache evaluated snapshot too — needed by propagateLiveRollup to sum ancestor
     // sheets' formula columns once this sheet is no longer the displayed one.
     sheetComputedMap.current.set(curPath, computed);
@@ -2800,7 +2904,7 @@ export function WorkbookView() {
     const path = pathStack.current;
     // Snapshot the currently-displayed sheet's evaluated data once, up front — it's
     // the base for the innermost (curLevel === lv) rollup step on every invocation.
-    const baseComputed: unknown[][] = hot.getData() as unknown[][];
+    const baseComputed: unknown[][] = getEvaluatedGridData(hot);
 
     setBreadcrumb(prev => {
       if (prev.length === 0) return prev;
@@ -2845,7 +2949,10 @@ export function WorkbookView() {
           }
 
           if (!excluded(COL_FACTOR) || !excluded(COL_TOTAL)) {
-            let gRaw: string | null = liveRow[COL_FACTOR];
+            // Read the *evaluated* Factor value, not the raw source — a formula
+            // referencing a named cell (e.g. `=1+margin_pct/100`) can't be parsed by
+            // toNum() as-is, which silently zeroed the live-rolled-up Total.
+            let gRaw: string | null = evaluatedOrRaw(parentComputed, rowInParent, COL_FACTOR, liveRow[COL_FACTOR]);
             if (f > 0 && (gRaw == null || gRaw === "")) gRaw = "1";
             if (!excluded(COL_FACTOR)) liveRow[COL_FACTOR] = gRaw;
             const g = toNum(gRaw);
@@ -2876,7 +2983,8 @@ export function WorkbookView() {
           if (!excluded(COL_SUBTOTAL)) liveRow[COL_SUBTOTAL] = (e !== 0 || cVal !== 0) ? String(f) : null;
 
           if (!excluded(COL_FACTOR) || !excluded(COL_TOTAL)) {
-            let gRaw: string | null = liveRow[COL_FACTOR];
+            // See the L1-rollup branch above for why this reads the evaluated value.
+            let gRaw: string | null = evaluatedOrRaw(parentComputed, rowInParent, COL_FACTOR, liveRow[COL_FACTOR]);
             if (f > 0 && (gRaw == null || gRaw === "")) gRaw = "1";
             if (!excluded(COL_FACTOR)) liveRow[COL_FACTOR] = gRaw;
             const g = toNum(gRaw);
@@ -2907,7 +3015,8 @@ export function WorkbookView() {
           if (!excluded(COL_SUBTOTAL)) liveRow[COL_SUBTOTAL] = (e !== 0 || cVal !== 0) ? String(f) : null;
 
           if (!excluded(COL_FACTOR) || !excluded(COL_TOTAL)) {
-            let gRaw: string | null = liveRow[COL_FACTOR];
+            // See the L1-rollup branch above for why this reads the evaluated value.
+            let gRaw: string | null = evaluatedOrRaw(parentComputed, rowInParent, COL_FACTOR, liveRow[COL_FACTOR]);
             if (f > 0 && (gRaw == null || gRaw === "")) gRaw = "1";
             if (!excluded(COL_FACTOR)) liveRow[COL_FACTOR] = gRaw;
             const g = toNum(gRaw);
@@ -4096,26 +4205,48 @@ export function WorkbookView() {
         .handsontable .ht-project-total-cell { background: #ffe27a !important; }
         .handsontable th { white-space: nowrap; overflow: hidden; }
         .handsontable td { font-size: 12px; }
-        .handsontable th { font-size: 12px; }
+        .handsontable th {
+          font-size: 12px;
+          font-weight: 700;
+          color: #33475b;
+          background-color: #dde6f0 !important;
+          border-color: #b7c6d9 !important;
+        }
+        .handsontable th .colHeader { color: #33475b; }
       `}</style>
 
       {/* ─────────────────────────────────────────────────────────────────
           Toolbar row 1: active cell | formula bar | Total
       ──────────────────────────────────────────────────────────────────── */}
-      <div style={{ display: "flex", alignItems: "center", height: 28, borderBottom: TB_BORDER, background: "#f0f0f0", flexShrink: 0, position: "relative" }}>
+      <div style={{ display: "flex", alignItems: "center", height: 34, borderBottom: TB_BORDER, background: "#eef2f7", flexShrink: 0, position: "relative", padding: "0 8px", gap: 8 }}>
 
-        {/* Active cell reference box */}
-        <div style={tbCell({ width: 64, fontWeight: 600, color: "#333", justifyContent: "center" })}>
+        {/* Active cell reference box — bordered field, like Excel's Name Box */}
+        <div
+          style={{
+            width: 64,
+            height: 24,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            fontSize: 12,
+            fontWeight: 600,
+            color: "#333",
+            background: "#fff",
+            border: "1px solid #b9c2cc",
+            borderRadius: 3,
+            flexShrink: 0,
+          }}
+        >
           {activeCell}
         </div>
 
         {/* "Cell =" label */}
-        <div style={tbCell({ width: 48, color: "#666" })}>
+        <div style={{ fontSize: 12, color: "#666", flexShrink: 0 }}>
           Cell =
         </div>
 
-        {/* Formula input + autocomplete dropdown */}
-        <div style={{ flex: 1, position: "relative", height: "100%", display: "flex", alignItems: "center" }}>
+        {/* Formula input + autocomplete dropdown — bordered field, like Excel's formula bar */}
+        <div style={{ flex: 1, position: "relative", height: 24, display: "flex", alignItems: "center" }}>
           <input
             ref={formulaBarRef}
             value={activeCellValue}
@@ -4123,7 +4254,19 @@ export function WorkbookView() {
             onKeyDown={handleFormulaBarKeyDown}
             onBlur={handleFormulaBarBlur}
             placeholder=""
-            style={{ width: "100%", border: "none", outline: "none", background: "transparent", fontSize: 12, padding: "0 6px", color: "#333", fontFamily: "inherit", height: "100%" }}
+            style={{
+              width: "100%",
+              height: "100%",
+              border: "1px solid #b9c2cc",
+              borderRadius: 3,
+              outline: "none",
+              background: "#fff",
+              fontSize: 12,
+              padding: "0 8px",
+              color: "#333",
+              fontFamily: "inherit",
+              boxSizing: "border-box",
+            }}
           />
           <FormulaAutocomplete
             completions={completions}
@@ -4133,6 +4276,29 @@ export function WorkbookView() {
           />
         </div>
 
+        {/* Project total — CostX-style boxed readout at the right of the toolbar */}
+        <div
+          style={{
+            height: 24,
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+            padding: "0 10px",
+            flexShrink: 0,
+            whiteSpace: "nowrap",
+            background: "#fff",
+            border: "1px solid #b9c2cc",
+            borderRadius: 3,
+            fontSize: 12,
+          }}
+        >
+          <span style={{ color: "#666" }}>Total =</span>
+          <span style={{ fontWeight: 700, color: "#1f2d3d" }}>
+            {activeProjectTotal != null
+              ? activeProjectTotal.toLocaleString("en-NZ", { minimumFractionDigits: 0, maximumFractionDigits: 0 })
+              : "—"}
+          </span>
+        </div>
       </div>
 
       {/* Transient status message from a maintenance operation */}
@@ -4157,17 +4323,24 @@ export function WorkbookView() {
       )}
 
       {/* ─────────────────────────────────────────────────────────────────
+          Breadcrumb column-label header — shown once, above every pill below
+      ──────────────────────────────────────────────────────────────────── */}
+      {level >= 2 && breadcrumb.length >= 1 && (
+        <BreadcrumbHeaderRow />
+      )}
+
+      {/* ─────────────────────────────────────────────────────────────────
           Toolbar row 2 (Level 2+): Level-1 row context + back arrow
       ──────────────────────────────────────────────────────────────────── */}
       {level >= 2 && breadcrumb.length >= 1 && (
-        <BreadcrumbRow ctx={breadcrumb[0]} onBack={drillUp} showCode />
+        <BreadcrumbRow ctx={breadcrumb[0]} onBack={drillUp} />
       )}
 
       {/* ─────────────────────────────────────────────────────────────────
           Toolbar row 3 (Level 3): Level-2 row context + back arrow
       ──────────────────────────────────────────────────────────────────── */}
       {level >= 3 && breadcrumb.length >= 2 && (
-        <BreadcrumbRow ctx={breadcrumb[1]} onBack={drillUp} showCode={false} />
+        <BreadcrumbRow ctx={breadcrumb[1]} onBack={drillUp} />
       )}
 
       {/* ─────────────────────────────────────────────────────────────────
