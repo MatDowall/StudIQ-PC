@@ -17,6 +17,8 @@
     "fs:allow-write-file",
     "fs:allow-mkdir",
     "updater:default",
-    "process:allow-restart"
+    "process:allow-restart",
+    "clipboard-manager:allow-read-text",
+    "clipboard-manager:allow-write-text"
   ]
 }

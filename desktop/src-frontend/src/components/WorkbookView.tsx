@@ -1,6 +1,8 @@
 import React, { useRef, useState, useCallback, useMemo, useEffect } from "react";
+import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
+import { readText as readClipboardText } from "@tauri-apps/plugin-clipboard-manager";
 import { HotTable } from "@handsontable/react-wrapper";
 import type { HotTableRef } from "@handsontable/react-wrapper";
 import { registerAllModules } from "handsontable/registry";
@@ -14,7 +16,7 @@ import type { WorkbookFormatApi, WorkbookGridApi, FlattenExportLevels } from "..
 import ExcelJS from "exceljs";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { TemplateManagerDialog } from "./TemplateManagerDialog";
-import { ContextMenu } from "./ContextMenu";
+import { ContextMenu, type ContextMenuEntry } from "./ContextMenu";
 import { TextInputDialog } from "./TextInputDialog";
 import { NamedCellsManagerDialog, type NamedCellEntry } from "./NamedCellsManagerDialog";
 import { ImportDimensionDialog, type ImportDisplayOption } from "./ImportDimensionDialog";
@@ -746,6 +748,46 @@ function evaluatedOrRaw(computed: unknown[][], row: number, col: number, rawFall
   return val != null && val !== "" ? String(val) : rawFallback;
 }
 
+/**
+ * Reads the system clipboard via the Tauri clipboard-manager plugin, retrying
+ * a few times on failure or an empty result. The read crosses a process
+ * boundary (WebView2's own Cut/Copy write happens in the renderer process;
+ * this read happens in the Rust host process via `arboard`/Win32 clipboard
+ * APIs) — right after a Copy, the OS clipboard can transiently report empty
+ * or throw "access denied" until that write has fully propagated. A short
+ * retry loop absorbs that instead of the caller silently getting nothing.
+ */
+async function readClipboardWithRetry(attempts = 6, delayMs = 40): Promise<string> {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const text = await readClipboardText();
+      if (text) return text;
+    } catch {
+      // transient cross-process clipboard lock — retry below
+    }
+    if (i < attempts - 1) await new Promise(resolve => setTimeout(resolve, delayMs));
+  }
+  return "";
+}
+
+/**
+ * Stops Handsontable's own shortcut handling (cell navigation, Tab-to-next-cell,
+ * etc.) for this keydown from within a `beforeKeyDown` hook callback.
+ *
+ * The real DOM `event.stopImmediatePropagation()` does NOT do this — Handsontable's
+ * shortcut manager doesn't check native propagation state at all; it checks its own
+ * bespoke `event.isImmediatePropagationEnabled` property (see
+ * `handsontable/helpers/dom/event.js`'s own `stopImmediatePropagation`/
+ * `isImmediatePropagationStopped` pair, and `shortcuts/recorder.js`'s `onkeydown`,
+ * which reads that same property right after invoking `beforeKeyDown`). Calling
+ * only the native method leaves that property untouched, so Handsontable proceeds
+ * to run its own arrow-key/Tab/Enter cell-navigation shortcut regardless.
+ */
+function stopHotShortcut(event: KeyboardEvent): void {
+  (event as unknown as { isImmediatePropagationEnabled?: boolean }).isImmediatePropagationEnabled = false;
+  event.stopImmediatePropagation();
+}
+
 /** Get the trailing alphabetic token the user is currently typing (for autocomplete). */
 function currentAlphaToken(value: string, cursorPos: number): string {
   const before = value.slice(0, cursorPos);
@@ -753,10 +795,28 @@ function currentAlphaToken(value: string, cursorPos: number): string {
   return match ? match[1].toUpperCase() : "";
 }
 
-/** Given a partial token, return matching function names. */
-function matchingFunctions(token: string): string[] {
+/** Given a partial token, return matching function names and named-cell names
+ *  (named cells sorted after functions — Excel/Sheets convention). */
+function matchingCompletions(token: string, namedCells: Map<string, NamedCell>): string[] {
   if (!token) return [];
-  return FUNCTION_NAMES.filter(f => f.startsWith(token) && f !== token);
+  const fnMatches = FUNCTION_NAMES.filter(f => f.startsWith(token) && f !== token);
+  const namedMatches = Array.from(namedCells.keys()).filter(n => {
+    const upper = n.toUpperCase();
+    return upper.startsWith(token) && upper !== token;
+  });
+  return [...fnMatches, ...namedMatches];
+}
+
+/** Syntax/description shown under the autocomplete list for the highlighted
+ *  entry — functions show their syntax signature, named cells show what
+ *  they're bound to. Returns null for a name that's neither (shouldn't happen
+ *  since completions only ever come from matchingCompletions). */
+function describeCompletion(name: string, namedCells: Map<string, NamedCell>): { syntax: string; desc: string } | null {
+  const fn = FORMULA_FUNCTIONS[name];
+  if (fn) return fn;
+  const nc = namedCells.get(name);
+  if (nc) return { syntax: name, desc: `Named cell → ${nc.path}!${cellRefLabel(nc.row, nc.col)}` };
+  return null;
 }
 
 /** Extract the 0-based row index from the last path segment, e.g. "L1/R3" → 3,
@@ -1095,18 +1155,24 @@ interface AutocompleteProps {
   selectedIndex:  number;
   onSelect:       (name: string) => void;
   onHover:        (index: number) => void;
+  namedCells:     Map<string, NamedCell>;
+  /** When provided, the dropdown is fixed-positioned at these viewport
+   *  coordinates instead of anchored via `position: absolute; top: 100%`
+   *  under a `position: relative` parent — used for the in-cell popup, which
+   *  is portaled to document.body since the editor's cell can be anywhere. */
+  fixedPosition?: { top: number; left: number };
 }
 
-function FormulaAutocomplete({ completions, selectedIndex, onSelect, onHover }: AutocompleteProps) {
+function FormulaAutocomplete({ completions, selectedIndex, onSelect, onHover, namedCells, fixedPosition }: AutocompleteProps) {
   if (completions.length === 0) return null;
-  const fn = FORMULA_FUNCTIONS[completions[selectedIndex]];
+  const info = describeCompletion(completions[selectedIndex], namedCells);
 
   return (
     <div
       style={{
-        position: "absolute",
-        top: "100%",
-        left: 0,
+        position: fixedPosition ? "fixed" : "absolute",
+        top: fixedPosition ? fixedPosition.top : "100%",
+        left: fixedPosition ? fixedPosition.left : 0,
         zIndex: 200,
         background: "#fff",
         border: "1px solid #bbb",
@@ -1119,7 +1185,7 @@ function FormulaAutocomplete({ completions, selectedIndex, onSelect, onHover }: 
       // Prevent the input from losing focus when clicking the dropdown
       onMouseDown={e => e.preventDefault()}
     >
-      {/* Function list */}
+      {/* Function/named-cell list */}
       <div style={{ maxHeight: 160, overflowY: "auto" }}>
         {completions.map((name, i) => (
           <div
@@ -1140,11 +1206,11 @@ function FormulaAutocomplete({ completions, selectedIndex, onSelect, onHover }: 
         ))}
       </div>
 
-      {/* Syntax hint for selected function */}
-      {fn && (
+      {/* Syntax/binding hint for the selected entry */}
+      {info && (
         <div style={{ borderTop: "1px solid #ddd", padding: "5px 8px", background: "#f8f8f8", borderRadius: "0 0 4px 4px" }}>
-          <div style={{ fontWeight: 600, color: "#1a5fa8", marginBottom: 2 }}>{fn.syntax}</div>
-          <div style={{ color: "#555" }}>{fn.desc}</div>
+          <div style={{ fontWeight: 600, color: "#1a5fa8", marginBottom: 2 }}>{info.syntax}</div>
+          <div style={{ color: "#555" }}>{info.desc}</div>
         </div>
       )}
     </div>
@@ -1213,9 +1279,23 @@ export function WorkbookView() {
   const [activeCell,      setActiveCell]      = useState("A1");
   const [activeCellValue, setActiveCellValue] = useState("");
 
-  // Formula autocomplete
+  // Formula autocomplete (formula bar)
   const [completions,    setCompletions]    = useState<string[]>([]);
   const [completionIdx,  setCompletionIdx]  = useState(0);
+
+  // Formula autocomplete while typing directly in a cell (not just the formula
+  // bar) — see afterBeginEditing/beforeKeyDown in hotSettings. `cellCompletions*Ref`
+  // mirror the state so the memoised (deps: []) hotSettings' beforeKeyDown can
+  // read the latest value without recreating the Handsontable instance — same
+  // pattern as scheduleSaveRef/formatApiRef below.
+  const [cellCompletions,    setCellCompletions]    = useState<string[]>([]);
+  const [cellCompletionIdx,  setCellCompletionIdx]  = useState(0);
+  const [cellCompletionPos,  setCellCompletionPos]  = useState<{ top: number; left: number } | null>(null);
+  const cellCompletionsRef   = useRef<string[]>([]);
+  const cellCompletionIdxRef = useRef(0);
+  const cellEditorTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  useEffect(() => { cellCompletionsRef.current = cellCompletions; }, [cellCompletions]);
+  useEffect(() => { cellCompletionIdxRef.current = cellCompletionIdx; }, [cellCompletionIdx]);
 
   // Last grid cell that had selection focus — used to sync formula bar edits
   // back to the cell even after focus moves to the input element.
@@ -1232,6 +1312,12 @@ export function WorkbookView() {
     rowCount: number;
     colCount: number;
   } | null>(null);
+
+  // System-clipboard text for the right-click menu's Paste item, prefetched as
+  // soon as the menu opens (see handleGridContextMenu) so it's normally already
+  // resolved by the time the user clicks Paste. `null` means "not resolved
+  // yet" — Paste's own click handler falls back to its own read in that case.
+  const pendingPasteTextRef = useRef<string | null>(null);
 
   // Excel-style status bar stats for the current selection
   const [selectionStats, setSelectionStats] = useState<{ count: number; sum: number; average: number } | null>(null);
@@ -1331,8 +1417,11 @@ export function WorkbookView() {
     row: number; groupId: number; groupName: string; options: ImportDisplayOption[]; defaultKey: string;
   } | null>(null);
   const [gridContextMenu, setGridContextMenu] = useState<{
-    x: number; y: number; items: { label: string; action: () => void; danger?: boolean }[];
+    x: number; y: number; items: ContextMenuEntry[];
   } | null>(null);
+  // Row/column pending a confirmed delete — set when the target holds real
+  // content, so a right-click delete can't silently destroy data.
+  const [pendingDelete, setPendingDelete] = useState<{ kind: "row" | "col"; from: number; to: number } | null>(null);
   const goToDimensionGroup = useAppStore(s => s.goToDimensionGroup);
 
   function curSheetPath(): string {
@@ -1809,14 +1898,21 @@ export function WorkbookView() {
     cols: number,
   ): void {
     if (!map || map.size === 0) return;
-    for (let r = toRowExclusive - 1; r >= fromRow; r--) {
+    // Shifting down (by > 0) must process the highest row first so a
+    // not-yet-moved source is never clobbered by an earlier write; shifting
+    // up (by < 0, e.g. row deletion) needs the opposite order for the same
+    // reason — the lowest row's destination is always already vacated.
+    const rows = by >= 0
+      ? Array.from({ length: toRowExclusive - fromRow }, (_, i) => toRowExclusive - 1 - i)
+      : Array.from({ length: toRowExclusive - fromRow }, (_, i) => fromRow + i);
+    for (const r of rows) {
       for (let c = 0; c < cols; c++) {
         const key = styleKey(r, c);
         const val = map.get(key);
         if (val === undefined) continue;
         map.delete(key);
         const dest = r + by;
-        if (dest <= NUM_ROWS - 1) map.set(styleKey(dest, c), val);
+        if (dest >= 0 && dest <= NUM_ROWS - 1) map.set(styleKey(dest, c), val);
       }
     }
   }
@@ -1831,13 +1927,68 @@ export function WorkbookView() {
     cols: number,
   ): void {
     if (!set || set.size === 0) return;
-    for (let r = toRowExclusive - 1; r >= fromRow; r--) {
+    const rows = by >= 0
+      ? Array.from({ length: toRowExclusive - fromRow }, (_, i) => toRowExclusive - 1 - i)
+      : Array.from({ length: toRowExclusive - fromRow }, (_, i) => fromRow + i);
+    for (const r of rows) {
       for (let c = 0; c < cols; c++) {
         const key = styleKey(r, c);
         if (!set.has(key)) continue;
         set.delete(key);
         const dest = r + by;
-        if (dest <= NUM_ROWS - 1) set.add(styleKey(dest, c));
+        if (dest >= 0 && dest <= NUM_ROWS - 1) set.add(styleKey(dest, c));
+      }
+    }
+  }
+
+  /** Column analogue of shiftRowKeyedEntries — used by insert/delete column (Q
+   *  onward only; A–P have fixed structural meaning and never shift). `maxCol` is
+   *  the current sheet's own column count (columns are per-sheet, not shared like
+   *  NUM_ROWS — see growColsTo). */
+  function shiftColKeyedEntries<T>(
+    map: Map<string, T> | undefined,
+    fromCol: number,
+    toColExclusive: number,
+    by: number,
+    rows: number,
+    maxCol: number,
+  ): void {
+    if (!map || map.size === 0) return;
+    const cols = by >= 0
+      ? Array.from({ length: toColExclusive - fromCol }, (_, i) => toColExclusive - 1 - i)
+      : Array.from({ length: toColExclusive - fromCol }, (_, i) => fromCol + i);
+    for (const c of cols) {
+      for (let r = 0; r < rows; r++) {
+        const key = styleKey(r, c);
+        const val = map.get(key);
+        if (val === undefined) continue;
+        map.delete(key);
+        const dest = c + by;
+        if (dest >= 0 && dest <= maxCol - 1) map.set(styleKey(r, dest), val);
+      }
+    }
+  }
+
+  /** Set-based column analogue of shiftColKeyedEntries. */
+  function shiftColKeyedSet(
+    set: Set<string> | undefined,
+    fromCol: number,
+    toColExclusive: number,
+    by: number,
+    rows: number,
+    maxCol: number,
+  ): void {
+    if (!set || set.size === 0) return;
+    const cols = by >= 0
+      ? Array.from({ length: toColExclusive - fromCol }, (_, i) => toColExclusive - 1 - i)
+      : Array.from({ length: toColExclusive - fromCol }, (_, i) => fromCol + i);
+    for (const c of cols) {
+      for (let r = 0; r < rows; r++) {
+        const key = styleKey(r, c);
+        if (!set.has(key)) continue;
+        set.delete(key);
+        const dest = c + by;
+        if (dest >= 0 && dest <= maxCol - 1) set.add(styleKey(r, dest));
       }
     }
   }
@@ -2023,54 +2174,168 @@ export function WorkbookView() {
   /** Right-click on a linked C:Quantity / D:Unit cell offers "Show dimension group". */
   /** Right-click on any cell offers "New Named Cell"; a linked C:Quantity / D:Unit
    *  cell additionally offers "Show dimension group". */
+  /** Deletes rows `[from..to]` (inclusive), confirming first if any of them hold
+   *  a real line item — deletion also permanently drops that row's sub-sheets. */
+  function requestDeleteRows(hot: Handsontable, from: number, to: number) {
+    const data = captureSourceData(hot);
+    let hasContent = false;
+    for (let r = from; r <= to; r++) { if (isLineItemRow(data[r])) { hasContent = true; break; } }
+    if (hasContent) { setPendingDelete({ kind: "row", from, to }); return; }
+    const path = curSheetPath();
+    for (let r = to; r >= from; r--) deleteRowAt(hot, path, r);
+    scheduleSaveRef.current();
+    hot.render();
+  }
+
+  /** Deletes columns `[from..to]` (inclusive; both must be >= BASE_NUMERIC_COL_COUNT),
+   *  confirming first if any of them hold data. */
+  function requestDeleteCols(hot: Handsontable, from: number, to: number) {
+    const data = captureSourceData(hot);
+    let hasContent = false;
+    outer:
+    for (let c = from; c <= to; c++) {
+      for (const row of data) { if (row[c] != null && row[c] !== "") { hasContent = true; break outer; } }
+    }
+    if (hasContent) { setPendingDelete({ kind: "col", from, to }); return; }
+    const path = curSheetPath();
+    for (let c = to; c >= from; c--) deleteColAt(hot, path, c);
+    scheduleSaveRef.current();
+    hot.render();
+  }
+
   function handleGridContextMenu(event: React.MouseEvent<HTMLDivElement>) {
     const hot = hotRef.current?.hotInstance;
     if (!hot) return;
-    const td = (event.target as HTMLElement | null)?.closest("td");
-    if (!td) return;
-    const coords = hot.getCoords(td);
-    if (!coords || coords.row < 0 || coords.col < 0) return;
+    const cellEl = (event.target as HTMLElement | null)?.closest("td, th");
+    if (!cellEl) return;
+    const coords = hot.getCoords(cellEl);
+    if (!coords) return;
+    const isRowHeader = coords.col < 0 && coords.row >= 0;
+    const isColHeader = coords.row < 0 && coords.col >= 0;
+    const isCell = coords.row >= 0 && coords.col >= 0;
+    if (!isRowHeader && !isColHeader && !isCell) return;
     event.preventDefault();
 
-    const items: { label: string; action: () => void; danger?: boolean }[] = [];
-    if (coords.col === COL_QTY || coords.col === COL_UNIT) {
-      const link = getCellLink(curSheetPath(), coords.row, COL_QTY);
-      if (link) {
+    const path = curSheetPath();
+    const items: ContextMenuEntry[] = [];
+
+    if (isRowHeader) hot.selectRows(coords.row);
+    if (isColHeader) hot.selectColumns(coords.col);
+    if (isCell) {
+      // Right-clicking outside the live selection collapses it to just this cell
+      // (Excel/Sheets convention) — a click inside a multi-cell selection leaves
+      // it alone so row/col-range actions below still act on the whole range.
+      const ranges = hot.getSelectedRange();
+      const inSelection = ranges?.some(r => {
+        const fromRow = Math.min(r.from.row, r.to.row), toRow = Math.max(r.from.row, r.to.row);
+        const fromCol = Math.min(r.from.col, r.to.col), toCol = Math.max(r.from.col, r.to.col);
+        return coords.row >= fromRow && coords.row <= toRow && coords.col >= fromCol && coords.col <= toCol;
+      });
+      if (!inSelection) hot.selectCell(coords.row, coords.col);
+
+      // Cut/Copy/Paste/Delete always come first, at a fixed position, on
+      // purpose: the items below (Show dimension group / Project Total /
+      // etc.) only appear for some cells, and having them ABOVE the clipboard
+      // block meant its row position shifted depending on which cell was
+      // clicked — muscle-memory clicking "where Paste was last time" would
+      // then land on whatever variable-position item took its place (usually
+      // Delete, immediately below it). Keeping this block first makes its
+      // position depend only on the menu being open, never on cell content.
+      // Kick off the (retrying) clipboard read now, at menu-open time, so it's
+      // almost always already resolved by the time the user clicks Paste —
+      // Paste's handler below reads whichever settles first: the prefetch, or
+      // (if the user clicks faster than that) its own fresh retrying read.
+      pendingPasteTextRef.current = null;
+      void readClipboardWithRetry().then(text => { pendingPasteTextRef.current = text; });
+
+      items.push({ label: "Cut", action: () => (hot.getPlugin("copyPaste") as unknown as { cut: () => void }).cut() });
+      items.push({ label: "Copy", action: () => (hot.getPlugin("copyPaste") as unknown as { copy: () => void }).copy() });
+      items.push({
+        label: "Paste",
+        action: () => {
+          const cp = hot.getPlugin("copyPaste") as unknown as { paste: (text?: string) => void };
+          // Unlike copy()/cut() — which set an internal isTriggeredBy* flag that
+          // bypasses the focus check — paste() routes straight into onPaste,
+          // which silently drops the event unless `hot.isListening()`. Clicking
+          // this menu (a portal outside the grid) leaves the grid unlistened,
+          // so re-arm it first or the paste is discarded without any error.
+          const doPaste = (text: string) => { hot.listen(); cp.paste(text); };
+          if (pendingPasteTextRef.current != null) {
+            doPaste(pendingPasteTextRef.current);
+          } else {
+            void readClipboardWithRetry().then(doPaste);
+          }
+        },
+      });
+      items.push({ label: "Delete", action: () => hot.emptySelectedCells() });
+      items.push({ separator: true });
+
+      if (coords.col === COL_QTY || coords.col === COL_UNIT) {
+        const link = getCellLink(path, coords.row, COL_QTY);
+        if (link) {
+          items.push({
+            label: "Show dimension group",
+            action: () => { void goToDimensionGroup(link.groupId); },
+          });
+        }
+      }
+      items.push({
+        label: "New Named Cell…",
+        action: () => setNamedCellDialog({ row: coords.row, col: coords.col }),
+      });
+
+      // L1's H:Total column is where a workbook author designates the single cell
+      // that holds the project grand total. Bound via the reserved "PROJECT_TOTAL"
+      // named cell so it can be read back without the workbook being open.
+      if (path === "L1" && coords.col === COL_TOTAL) {
+        const pt = namedCellMap.current.get(PROJECT_TOTAL_NAME);
+        const isCurrent = pt?.row === coords.row && pt?.col === coords.col;
         items.push({
-          label: "Show dimension group",
-          action: () => { void goToDimensionGroup(link.groupId); },
+          label: isCurrent ? "Project Total ✓" : "Set as Project Total",
+          action: () => { void defineNamedCell(PROJECT_TOTAL_NAME, "L1", coords.row, coords.col); },
         });
       }
-    }
-    items.push({
-      label: "New Named Cell…",
-      action: () => setNamedCellDialog({ row: coords.row, col: coords.col }),
-    });
 
-    // L1's H:Total column is where a workbook author designates the single cell
-    // that holds the project grand total. Bound via the reserved "PROJECT_TOTAL"
-    // named cell so it can be read back without the workbook being open.
-    if (curSheetPath() === "L1" && coords.col === COL_TOTAL) {
-      const pt = namedCellMap.current.get(PROJECT_TOTAL_NAME);
-      const isCurrent = pt?.row === coords.row && pt?.col === coords.col;
+      // "Exclude/re-enable auto-calculation" — operates on the live selection.
+      const targetCells = getSelectedCells();
+      const allExcluded = targetCells.every(({ row, col }) => isCellExcluded(path, row, col));
       items.push({
-        label: isCurrent ? "Project Total ✓" : "Set as Project Total",
-        action: () => { void defineNamedCell(PROJECT_TOTAL_NAME, "L1", coords.row, coords.col); },
+        label: allExcluded ? "Re-enable auto-calculation" : "Exclude from auto-calculation",
+        action: () => toggleExclusionForSelection(!allExcluded),
       });
     }
 
-    // "Exclude/re-enable auto-calculation" — operates on the live selection (falls
-    // back to the right-clicked cell when nothing is selected). Lets a template
-    // author switch off the F:Subtotal/G:Factor/H:Total auto-derivation for a
-    // hand-built summary block that overwrites those columns with its own formulas.
-    const selection = getSelectedCells();
-    const targetCells = selection.length > 0 ? selection : [{ row: coords.row, col: coords.col }];
-    const path = curSheetPath();
-    const allExcluded = targetCells.every(({ row, col }) => isCellExcluded(path, row, col));
-    items.push({
-      label: allExcluded ? "Re-enable auto-calculation" : "Exclude from auto-calculation",
-      action: () => toggleExclusionForSelection(!allExcluded),
-    });
+    // Row insert/delete — available from a cell click (acts on the selected row
+    // range, falling back to the clicked row) or a row-header click.
+    if (isCell || isRowHeader) {
+      const rows = getSelectedCells().map(c => c.row);
+      const fromRow = rows.length > 0 ? Math.min(...rows) : coords.row;
+      const toRow   = rows.length > 0 ? Math.max(...rows) : coords.row;
+      items.push({ separator: true });
+      items.push({ label: "Insert Row Above", action: () => gridApiImplRef.current.insertAbove() });
+      items.push({ label: "Insert Row Below", action: () => gridApiImplRef.current.insertBelow() });
+      items.push({ label: "Delete Row", danger: true, action: () => requestDeleteRows(hot, fromRow, toRow) });
+    }
+
+    // Column insert/delete — disabled within A–P (fixed structural columns; see
+    // BASE_NUMERIC_COL_COUNT / the derivation matrix in CLAUDE.md).
+    if (isCell || isColHeader) {
+      const col = coords.col;
+      const disabled = col < BASE_NUMERIC_COL_COUNT;
+      items.push({ separator: true });
+      items.push({
+        label: "Insert Column Left", disabled,
+        action: () => insertBlankColAt(hot, path, col),
+      });
+      items.push({
+        label: "Insert Column Right", disabled,
+        action: () => insertBlankColAt(hot, path, col + 1),
+      });
+      items.push({
+        label: "Delete Column", danger: !disabled, disabled,
+        action: () => requestDeleteCols(hot, col, col),
+      });
+    }
 
     setGridContextMenu({ x: event.clientX, y: event.clientY, items });
   }
@@ -2417,6 +2682,227 @@ export function WorkbookView() {
 
     // Regenerate row-relative formula cells at their new positions.
     deriveLevelFormulas(hot, levelRef.current, isAutoUpdatingRef, sheetKindForPath(path), cellExclusionMap.current.get(path));
+  }
+
+  /**
+   * Delete the row at `deleteAt`, shifting every row below it up by one and
+   * clearing the vacated last row — the mirror image of `insertBlankRowAt`.
+   * The deleted row's own sub-sheets (Rate/Quantity Build-up, if any) are
+   * permanently removed via `delete_workbook_sheet_subtree`; callers are
+   * expected to confirm with the user first when the row holds real content
+   * (see handleGridContextMenu).
+   */
+  function deleteRowAt(hot: Handsontable, path: string, deleteAt: number): void {
+    const data = captureSourceData(hot);
+    const cols = hot.countCols();
+    let lastOccupied = -1;
+    for (let r = NUM_ROWS - 1; r >= deleteAt; r--) {
+      if (isLineItemRow(data[r])) { lastOccupied = r; break; }
+    }
+
+    const lv = levelRef.current;
+    const subPrefixes = lv === 1 ? ["R"] : lv === 2 ? ["R", "Q"] : [];
+    const revId = revIdRef.current;
+
+    // Permanently remove the deleted row's own sub-sheets before anything else
+    // shifts into its slot — mirrors pruneOrphansUnder's cleanup of a cleared line item.
+    for (const prefix of subPrefixes) {
+      const deletedSub = `${path}/${prefix}${deleteAt}`;
+      purgeCachedSubtree(deletedSub);
+      if (revId != null) {
+        invoke("delete_workbook_sheet_subtree", { revisionId: revId, sheetPath: deletedSub }).catch(() => {/* non-fatal */});
+      }
+    }
+
+    // Drop this row's own link/style/exclusion entries — the row is gone, not shifted.
+    const linkMap  = cellLinkMap.current.get(path);
+    const styleMap = cellStyleMap.current.get(path);
+    const exclSet  = cellExclusionMap.current.get(path);
+    for (let c = 0; c < cols; c++) {
+      linkMap?.delete(styleKey(deleteAt, c));
+      styleMap?.delete(styleKey(deleteAt, c));
+      exclSet?.delete(styleKey(deleteAt, c));
+    }
+
+    isAutoUpdatingRef.current = true;
+    try {
+      const batch: Array<[number, number, string]> = [];
+      if (lastOccupied >= deleteAt) {
+        for (let r = deleteAt + 1; r <= lastOccupied; r++) {
+          const dest = r - 1;
+          for (let c = 0; c < cols; c++) batch.push([dest, c, data[r][c] ?? ""]);
+        }
+        for (let c = 0; c < cols; c++) batch.push([lastOccupied, c, ""]);
+      } else {
+        for (let c = 0; c < cols; c++) batch.push([deleteAt, c, ""]);
+      }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      if (batch.length) hot.setDataAtCell(batch as any);
+    } finally {
+      isAutoUpdatingRef.current = false;
+    }
+
+    // Named cells bound to the deleted row are gone; ones below shift up by one.
+    for (const nc of Array.from(namedCellMap.current.values())) {
+      if (nc.path !== path) continue;
+      if (nc.row === deleteAt) { void removeNamedCell(nc.name); continue; }
+      if (nc.row < deleteAt) continue;
+      nc.row -= 1;
+      registerNamedExpression(nc);
+      if (revId != null) {
+        invoke("save_workbook_named_cell", {
+          revisionId: revId, name: nc.name, sheetPath: nc.path, row: nc.row, col: nc.col,
+        }).catch(() => {/* non-fatal */});
+      }
+    }
+
+    if (lastOccupied >= deleteAt) {
+      shiftRowKeyedEntries(cellLinkMap.current.get(path), deleteAt + 1, lastOccupied + 1, -1, cols);
+      shiftRowKeyedEntries(cellStyleMap.current.get(path), deleteAt + 1, lastOccupied + 1, -1, cols);
+      shiftRowKeyedSet(cellExclusionMap.current.get(path), deleteAt + 1, lastOccupied + 1, -1, cols);
+
+      // Remap in-memory sub-sheet caches (top-down to avoid collisions — see
+      // shiftRowKeyedEntries' comment on why up-shifts need ascending order).
+      if (subPrefixes.length > 0) {
+        for (let r = deleteAt + 1; r <= lastOccupied; r++) {
+          for (const prefix of subPrefixes) {
+            const oldSub = `${path}/${prefix}${r}`;
+            const newSub = `${path}/${prefix}${r - 1}`;
+            function remapMapKey<V>(map: Map<string, V>) {
+              if (map.has(oldSub)) { map.set(newSub, map.get(oldSub)!); map.delete(oldSub); }
+              const subPrefix = `${oldSub}/`;
+              for (const key of Array.from(map.keys())) {
+                if (key.startsWith(subPrefix)) { map.set(newSub + key.slice(oldSub.length), map.get(key)!); map.delete(key); }
+              }
+            }
+            remapMapKey(sheetDataMap.current as Map<string, unknown>);
+            remapMapKey(sheetComputedMap.current as Map<string, unknown>);
+            remapMapKey(cellLinkMap.current);
+            remapMapKey(cellStyleMap.current);
+            remapMapKey(cellExclusionMap.current);
+            function remapSetKey(set: Set<string>) {
+              if (set.has(oldSub)) { set.add(newSub); set.delete(oldSub); }
+              const subPrefix = `${oldSub}/`;
+              for (const key of Array.from(set)) {
+                if (key.startsWith(subPrefix)) { set.add(newSub + key.slice(oldSub.length)); set.delete(key); }
+              }
+            }
+            remapSetKey(loadedLinkPathsRef.current);
+            remapSetKey(loadedStylePathsRef.current);
+            remapSetKey(loadedExclusionPathsRef.current);
+          }
+        }
+
+        if (revId != null) {
+          for (let r = deleteAt + 1; r <= lastOccupied; r++) {
+            for (const prefix of subPrefixes) {
+              const oldSub = `${path}/${prefix}${r}`;
+              const newSub = `${path}/${prefix}${r - 1}`;
+              invoke("rename_workbook_sheet_subtree", {
+                revisionId: revId, oldPath: oldSub, newPath: newSub,
+              }).catch(() => {/* non-fatal */});
+            }
+          }
+        }
+      }
+    }
+
+    deriveLevelFormulas(hot, levelRef.current, isAutoUpdatingRef, sheetKindForPath(path), cellExclusionMap.current.get(path));
+  }
+
+  /**
+   * Insert a blank column at `insertAt` (must be >= BASE_NUMERIC_COL_COUNT — A–P
+   * are structural and never shift). Grows the current sheet's column count by
+   * one first (via growColsTo) so nothing at the right edge is lost, then shifts
+   * columns [insertAt..] right by one, mirroring insertBlankRowAt.
+   */
+  function insertBlankColAt(hot: Handsontable, path: string, insertAt: number): void {
+    if (insertAt < BASE_NUMERIC_COL_COUNT) return;
+    const targetCols = hot.countCols() + 1;
+    growColsTo(hot, targetCols);
+    const cols = hot.countCols();
+    const rows = NUM_ROWS;
+    const data = captureSourceData(hot);
+
+    isAutoUpdatingRef.current = true;
+    try {
+      const batch: Array<[number, number, string]> = [];
+      for (let c = cols - 2; c >= insertAt; c--) {
+        for (let r = 0; r < rows; r++) batch.push([r, c + 1, data[r][c] ?? ""]);
+      }
+      for (let r = 0; r < rows; r++) batch.push([r, insertAt, ""]);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      if (batch.length) hot.setDataAtCell(batch as any);
+    } finally {
+      isAutoUpdatingRef.current = false;
+    }
+
+    for (const nc of namedCellMap.current.values()) {
+      if (nc.path !== path || nc.col < insertAt) continue;
+      nc.col += 1;
+      registerNamedExpression(nc);
+      const revId = revIdRef.current;
+      if (revId != null) {
+        invoke("save_workbook_named_cell", {
+          revisionId: revId, name: nc.name, sheetPath: nc.path, row: nc.row, col: nc.col,
+        }).catch(() => {/* non-fatal */});
+      }
+    }
+
+    shiftColKeyedEntries(cellLinkMap.current.get(path), insertAt, cols - 1, 1, rows, cols);
+    shiftColKeyedEntries(cellStyleMap.current.get(path), insertAt, cols - 1, 1, rows, cols);
+    shiftColKeyedSet(cellExclusionMap.current.get(path), insertAt, cols - 1, 1, rows, cols);
+  }
+
+  /**
+   * Delete the column at `deleteAt` (must be >= BASE_NUMERIC_COL_COUNT). Shifts
+   * every column to its right left by one and clears the vacated rightmost column.
+   */
+  function deleteColAt(hot: Handsontable, path: string, deleteAt: number): void {
+    if (deleteAt < BASE_NUMERIC_COL_COUNT) return;
+    const cols = hot.countCols();
+    const rows = NUM_ROWS;
+    const data = captureSourceData(hot);
+
+    const linkMap  = cellLinkMap.current.get(path);
+    const styleMap = cellStyleMap.current.get(path);
+    const exclSet  = cellExclusionMap.current.get(path);
+    for (let r = 0; r < rows; r++) {
+      linkMap?.delete(styleKey(r, deleteAt));
+      styleMap?.delete(styleKey(r, deleteAt));
+      exclSet?.delete(styleKey(r, deleteAt));
+    }
+
+    isAutoUpdatingRef.current = true;
+    try {
+      const batch: Array<[number, number, string]> = [];
+      for (let c = deleteAt + 1; c < cols; c++) {
+        for (let r = 0; r < rows; r++) batch.push([r, c - 1, data[r][c] ?? ""]);
+      }
+      for (let r = 0; r < rows; r++) batch.push([r, cols - 1, ""]);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      if (batch.length) hot.setDataAtCell(batch as any);
+    } finally {
+      isAutoUpdatingRef.current = false;
+    }
+
+    for (const nc of Array.from(namedCellMap.current.values())) {
+      if (nc.path !== path) continue;
+      if (nc.col === deleteAt) { void removeNamedCell(nc.name); continue; }
+      if (nc.col < deleteAt) continue;
+      nc.col -= 1;
+      registerNamedExpression(nc);
+      const revId = revIdRef.current;
+      if (revId != null) {
+        invoke("save_workbook_named_cell", {
+          revisionId: revId, name: nc.name, sheetPath: nc.path, row: nc.row, col: nc.col,
+        }).catch(() => {/* non-fatal */});
+      }
+    }
+
+    shiftColKeyedEntries(cellLinkMap.current.get(path), deleteAt + 1, cols, -1, rows, cols);
+    shiftColKeyedEntries(cellStyleMap.current.get(path), deleteAt + 1, cols, -1, rows, cols);
+    shiftColKeyedSet(cellExclusionMap.current.get(path), deleteAt + 1, cols, -1, rows, cols);
   }
 
   gridApiImplRef.current = {
@@ -3946,14 +4432,67 @@ export function WorkbookView() {
     },
 
     // Standard text-format shortcuts: Ctrl+B / Ctrl+U / Ctrl+I toggle bold,
-    // underline and italic on the current selection.
+    // underline and italic on the current selection. Also the interception
+    // point for the in-cell formula autocomplete dropdown (Up/Down/Tab/Enter/
+    // Escape) — this hook fires before Handsontable's own key handling.
+    // Reads from refs, not the `cellCompletions*` state directly, since this
+    // whole settings object is memoised once (deps: []).
     beforeKeyDown(event: KeyboardEvent) {
+      const active = cellCompletionsRef.current;
+      if (active.length > 0) {
+        if (event.key === "ArrowDown") {
+          event.preventDefault(); stopHotShortcut(event);
+          setCellCompletionIdx(i => (i + 1) % active.length);
+          return;
+        }
+        if (event.key === "ArrowUp") {
+          event.preventDefault(); stopHotShortcut(event);
+          setCellCompletionIdx(i => (i - 1 + active.length) % active.length);
+          return;
+        }
+        if (event.key === "Tab" || event.key === "Enter") {
+          const name = active[cellCompletionIdxRef.current];
+          if (name) {
+            event.preventDefault(); stopHotShortcut(event);
+            insertCellCompletion(name);
+            return;
+          }
+        }
+        if (event.key === "Escape") {
+          stopHotShortcut(event);
+          setCellCompletions([]);
+          setCellCompletionPos(null);
+          return;
+        }
+      }
+
       if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
       const key = event.key.toLowerCase();
       const api = formatApiRef.current;
       if (key === "b") { event.preventDefault(); api.toggleBold(); }
       else if (key === "u") { event.preventDefault(); api.toggleUnderline(); }
       else if (key === "i") { event.preventDefault(); api.toggleItalic(); }
+    },
+
+    // Attaches the in-cell autocomplete's input/blur listeners to the editor's
+    // own textarea the moment editing begins. Handsontable creates that
+    // textarea synchronously as part of opening the editor, but a tick's delay
+    // (requestAnimationFrame) keeps this robust against any editor-positioning
+    // work Handsontable itself still has queued.
+    afterBeginEditing() {
+      requestAnimationFrame(() => {
+        const hot = hotRef.current?.hotInstance;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const editor = (hot as any)?.getActiveEditor?.();
+        const textarea: HTMLTextAreaElement | undefined = editor?.TEXTAREA;
+        if (!textarea) return;
+        cellEditorTextareaRef.current = textarea;
+        textarea.addEventListener("input", handleCellEditorInput);
+        textarea.addEventListener("blur", handleCellEditorBlur);
+        // Seed immediately in case editing began on an existing formula (F2 /
+        // double-click), rather than waiting for the next keystroke.
+        updateCellCompletionsFromTextarea();
+      });
     },
 
     afterGetColHeader(col: number, TH: HTMLTableCellElement) {
@@ -3971,12 +4510,12 @@ export function WorkbookView() {
   function updateCompletions(value: string, cursorPos: number) {
     if (!value.startsWith("=")) { setCompletions([]); return; }
     const token = currentAlphaToken(value, cursorPos);
-    const matches = matchingFunctions(token);
+    const matches = matchingCompletions(token, namedCellMap.current);
     setCompletions(matches.slice(0, 8));
     setCompletionIdx(0);
   }
 
-  function insertCompletion(fnName: string) {
+  function insertCompletion(name: string) {
     const input = formulaBarRef.current;
     if (!input) return;
     const cursorPos = input.selectionStart ?? activeCellValue.length;
@@ -3986,8 +4525,12 @@ export function WorkbookView() {
     const tokenMatch = before.match(/([A-Za-z]+)$/);
     if (!tokenMatch) return;
     const tokenStart = cursorPos - tokenMatch[1].length;
-    const newValue   = val.slice(0, tokenStart) + fnName + "(" + after;
-    const newCursor  = tokenStart + fnName.length + 1;
+    // Functions get an opening paren to invite arguments; a named cell is a
+    // complete reference on its own, so it's inserted verbatim.
+    const isFunction = FORMULA_FUNCTIONS[name] != null;
+    const insertText = isFunction ? `${name}(` : name;
+    const newValue   = val.slice(0, tokenStart) + insertText + after;
+    const newCursor  = tokenStart + insertText.length;
 
     setActiveCellValue(newValue);
     const hot = hotRef.current?.hotInstance as Handsontable | undefined;
@@ -4001,6 +4544,66 @@ export function WorkbookView() {
       input.focus();
       input.setSelectionRange(newCursor, newCursor);
     });
+  }
+
+  // ── In-cell formula autocomplete ───────────────────────────────────────
+  // Same dropdown/matching as the formula bar, but triggered while typing
+  // directly into a cell's own editor textarea (see afterBeginEditing and
+  // beforeKeyDown in hotSettings, which wire these in).
+
+  function updateCellCompletionsFromTextarea() {
+    const textarea = cellEditorTextareaRef.current;
+    if (!textarea) return;
+    const value = textarea.value;
+    const cursorPos = textarea.selectionStart ?? value.length;
+    if (!value.startsWith("=")) { setCellCompletions([]); return; }
+    const token = currentAlphaToken(value, cursorPos);
+    const matches = matchingCompletions(token, namedCellMap.current);
+    setCellCompletions(matches.slice(0, 8));
+    setCellCompletionIdx(0);
+    const rect = textarea.getBoundingClientRect();
+    setCellCompletionPos({ top: rect.bottom, left: rect.left });
+  }
+
+  function handleCellEditorInput() {
+    updateCellCompletionsFromTextarea();
+  }
+
+  function handleCellEditorBlur() {
+    const textarea = cellEditorTextareaRef.current;
+    if (textarea) {
+      textarea.removeEventListener("input", handleCellEditorInput);
+      textarea.removeEventListener("blur", handleCellEditorBlur);
+    }
+    cellEditorTextareaRef.current = null;
+    setCellCompletions([]);
+    setCellCompletionPos(null);
+  }
+
+  /** Splices `name` into the live editor textarea at the current token, mirroring
+   *  insertCompletion but writing straight to the DOM textarea Handsontable's
+   *  editor owns — a synthetic "input" event tells the editor to pick up the
+   *  new value (it doesn't poll the textarea; it listens for that event). */
+  function insertCellCompletion(name: string) {
+    const textarea = cellEditorTextareaRef.current;
+    if (!textarea) return;
+    const cursorPos = textarea.selectionStart ?? textarea.value.length;
+    const val = textarea.value;
+    const before = val.slice(0, cursorPos);
+    const after  = val.slice(cursorPos);
+    const tokenMatch = before.match(/([A-Za-z]+)$/);
+    if (!tokenMatch) return;
+    const tokenStart = cursorPos - tokenMatch[1].length;
+    const isFunction = FORMULA_FUNCTIONS[name] != null;
+    const insertText = isFunction ? `${name}(` : name;
+    const newValue   = val.slice(0, tokenStart) + insertText + after;
+    const newCursor  = tokenStart + insertText.length;
+
+    textarea.value = newValue;
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    textarea.setSelectionRange(newCursor, newCursor);
+    setCellCompletions([]);
+    setCellCompletionPos(null);
   }
 
   // ── Formula bar change ─────────────────────────────────────────────────
@@ -4273,6 +4876,7 @@ export function WorkbookView() {
             selectedIndex={completionIdx}
             onSelect={insertCompletion}
             onHover={setCompletionIdx}
+            namedCells={namedCellMap.current}
           />
         </div>
 
@@ -4319,6 +4923,33 @@ export function WorkbookView() {
           confirmLabel={confirmAction === "clean" ? "Clean" : "Clear workbook"}
           onCancel={() => setConfirmAction(null)}
           onConfirm={() => runConfirmedAction(confirmAction)}
+        />
+      )}
+
+      {pendingDelete && (
+        <ConfirmDialog
+          title={pendingDelete.kind === "row" ? "Delete row" : "Delete column"}
+          body={
+            pendingDelete.kind === "row"
+              ? `This permanently deletes ${pendingDelete.to > pendingDelete.from ? `rows ${pendingDelete.from + 1}–${pendingDelete.to + 1}` : `row ${pendingDelete.from + 1}`} and any build-up sheets they own. This cannot be undone.\n\nContinue?`
+              : `This permanently deletes ${pendingDelete.to > pendingDelete.from ? `columns ${colLetter(pendingDelete.from)}–${colLetter(pendingDelete.to)}` : `column ${colLetter(pendingDelete.from)}`}. This cannot be undone.\n\nContinue?`
+          }
+          confirmLabel="Delete"
+          onCancel={() => setPendingDelete(null)}
+          onConfirm={() => {
+            const hot = hotRef.current?.hotInstance;
+            const pd = pendingDelete;
+            setPendingDelete(null);
+            if (!hot || !pd) return;
+            const path = curSheetPath();
+            if (pd.kind === "row") {
+              for (let r = pd.to; r >= pd.from; r--) deleteRowAt(hot, path, r);
+            } else {
+              for (let c = pd.to; c >= pd.from; c--) deleteColAt(hot, path, c);
+            }
+            scheduleSaveRef.current();
+            hot.render();
+          }}
         />
       )}
 
@@ -4406,6 +5037,20 @@ export function WorkbookView() {
           items={gridContextMenu.items}
           onClose={() => setGridContextMenu(null)}
         />
+      )}
+
+      {/* In-cell formula autocomplete — portaled since the editing cell can be
+          anywhere on screen; positioned under the editor's own textarea. */}
+      {cellCompletionPos && createPortal(
+        <FormulaAutocomplete
+          completions={cellCompletions}
+          selectedIndex={cellCompletionIdx}
+          onSelect={insertCellCompletion}
+          onHover={setCellCompletionIdx}
+          namedCells={namedCellMap.current}
+          fixedPosition={cellCompletionPos}
+        />,
+        document.body,
       )}
 
       {namedCellDialog && (
