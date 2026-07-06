@@ -2580,80 +2580,98 @@ async fn create_workbook_revision_from_template(
     .map_err(|e| format!("Failed to create workbook revision: {e}"))?;
     let revision_id = result.last_insert_rowid();
 
-    // Copy the template's master Level 1 (takeoff), Level 2 (takeoff), Level 3
-    // (rate build-up), and Quantity Build-up sheets into the new revision — "L1"
-    // seeds the takeoff sheet directly, while TEMPLATE_MASTER_L2 / TEMPLATE_MASTER_L3 /
-    // TEMPLATE_MASTER_LQ travel along as the seeds for any future Level 2 / Level 3 /
-    // Quantity Build-up sheet respectively (see WorkbookView's drillDown /
-    // TEMPLATE_MASTER_L2_PATH / TEMPLATE_MASTER_L3_PATH / TEMPLATE_MASTER_LQ_PATH constants).
-    for sheet_path in ["L1", "TEMPLATE_MASTER_L2", "TEMPLATE_MASTER_L3", "TEMPLATE_MASTER_LQ"] {
-        let data_json: Option<String> = sqlx::query_scalar(
-            "SELECT data_json FROM workbook_sheet_data WHERE revision_id = ? AND sheet_path = ?",
+    // Copy every sheet in the template (not just the master seed set) — a template
+    // can accumulate real drill-down sheets (e.g. a Level 2 build-up filled in under
+    // a specific Preliminary & General row) whenever the template author drills into
+    // a row while editing it, and those live at ordinary paths like "L1/R2", not at
+    // the TEMPLATE_MASTER_* paths. TEMPLATE_MASTER_L2 / TEMPLATE_MASTER_L3 /
+    // TEMPLATE_MASTER_LQ are included in this same sweep (data_json rows for those
+    // paths still exist if the author edited them), and continue to travel along as
+    // the seeds for any future Level 2 / Level 3 / Quantity Build-up sheet created
+    // fresh in the new revision (see WorkbookView's drillDown / TEMPLATE_MASTER_L2_PATH
+    // / TEMPLATE_MASTER_L3_PATH / TEMPLATE_MASTER_LQ_PATH constants).
+    let sheet_data: Vec<(String, String)> = sqlx::query_as(
+        "SELECT sheet_path, data_json FROM workbook_sheet_data WHERE revision_id = ?",
+    )
+    .bind(template_revision_id)
+    .fetch_all(&db)
+    .await
+    .map_err(|e| format!("Failed to read template sheet data: {e}"))?;
+    for (sheet_path, data_json) in sheet_data {
+        sqlx::query(
+            "INSERT INTO workbook_sheet_data (revision_id, sheet_path, data_json) VALUES (?, ?, ?)",
         )
-        .bind(template_revision_id)
-        .bind(sheet_path)
-        .fetch_optional(&db)
+        .bind(revision_id)
+        .bind(&sheet_path)
+        .bind(&data_json)
+        .execute(&db)
         .await
-        .map_err(|e| format!("Failed to read template sheet '{sheet_path}': {e}"))?;
+        .map_err(|e| format!("Failed to seed sheet '{sheet_path}': {e}"))?;
+    }
 
-        if let Some(data_json) = data_json {
-            sqlx::query(
-                "INSERT INTO workbook_sheet_data (revision_id, sheet_path, data_json) VALUES (?, ?, ?)",
-            )
-            .bind(revision_id)
-            .bind(sheet_path)
-            .bind(&data_json)
-            .execute(&db)
-            .await
-            .map_err(|e| format!("Failed to seed sheet '{sheet_path}': {e}"))?;
-        }
-
-        // Carry the template's per-cell text formatting along with its data —
-        // otherwise bold/italic/underline applied in the template is lost on import.
-        let styles_json: Option<String> = sqlx::query_scalar(
-            "SELECT styles_json FROM workbook_sheet_styles WHERE revision_id = ? AND sheet_path = ?",
+    // Carry the template's per-cell text formatting along with its data —
+    // otherwise bold/italic/underline applied in the template is lost on import.
+    let sheet_styles: Vec<(String, String)> = sqlx::query_as(
+        "SELECT sheet_path, styles_json FROM workbook_sheet_styles WHERE revision_id = ?",
+    )
+    .bind(template_revision_id)
+    .fetch_all(&db)
+    .await
+    .map_err(|e| format!("Failed to read template sheet styles: {e}"))?;
+    for (sheet_path, styles_json) in sheet_styles {
+        sqlx::query(
+            "INSERT INTO workbook_sheet_styles (revision_id, sheet_path, styles_json) VALUES (?, ?, ?)",
         )
-        .bind(template_revision_id)
-        .bind(sheet_path)
-        .fetch_optional(&db)
+        .bind(revision_id)
+        .bind(&sheet_path)
+        .bind(&styles_json)
+        .execute(&db)
         .await
-        .map_err(|e| format!("Failed to read template sheet styles '{sheet_path}': {e}"))?;
+        .map_err(|e| format!("Failed to seed sheet styles '{sheet_path}': {e}"))?;
+    }
 
-        if let Some(styles_json) = styles_json {
-            sqlx::query(
-                "INSERT INTO workbook_sheet_styles (revision_id, sheet_path, styles_json) VALUES (?, ?, ?)",
-            )
-            .bind(revision_id)
-            .bind(sheet_path)
-            .bind(&styles_json)
-            .execute(&db)
-            .await
-            .map_err(|e| format!("Failed to seed sheet styles '{sheet_path}': {e}"))?;
-        }
-
-        // Carry the template's auto-calc exclusions along too — e.g. a summary
-        // block whose F/G/H cells are hand-built must stay excluded in every
-        // project created from this template.
-        let exclusions_json: Option<String> = sqlx::query_scalar(
-            "SELECT exclusions_json FROM workbook_sheet_exclusions WHERE revision_id = ? AND sheet_path = ?",
+    // Carry the template's auto-calc exclusions along too — e.g. a summary
+    // block whose F/G/H cells are hand-built must stay excluded in every
+    // project created from this template.
+    let sheet_exclusions: Vec<(String, String)> = sqlx::query_as(
+        "SELECT sheet_path, exclusions_json FROM workbook_sheet_exclusions WHERE revision_id = ?",
+    )
+    .bind(template_revision_id)
+    .fetch_all(&db)
+    .await
+    .map_err(|e| format!("Failed to read template sheet exclusions: {e}"))?;
+    for (sheet_path, exclusions_json) in sheet_exclusions {
+        sqlx::query(
+            "INSERT INTO workbook_sheet_exclusions (revision_id, sheet_path, exclusions_json) VALUES (?, ?, ?)",
         )
-        .bind(template_revision_id)
-        .bind(sheet_path)
-        .fetch_optional(&db)
+        .bind(revision_id)
+        .bind(&sheet_path)
+        .bind(&exclusions_json)
+        .execute(&db)
         .await
-        .map_err(|e| format!("Failed to read template sheet exclusions '{sheet_path}': {e}"))?;
+        .map_err(|e| format!("Failed to seed sheet exclusions '{sheet_path}': {e}"))?;
+    }
 
-        if let Some(exclusions_json) = exclusions_json {
-            sqlx::query(
-                "INSERT INTO workbook_sheet_exclusions (revision_id, sheet_path, exclusions_json) VALUES (?, ?, ?)",
-            )
-            .bind(revision_id)
-            .bind(sheet_path)
-            .bind(&exclusions_json)
-            .execute(&db)
-            .await
-            .map_err(|e| format!("Failed to seed sheet exclusions '{sheet_path}': {e}"))?;
-        }
+    // Carry sheet-to-sheet cell links too, for parity with copy_workbook_revision —
+    // a template's drilled-in sheets can carry live C:Quantity links same as any
+    // ordinary workbook.
+    let sheet_links: Vec<(String, String)> = sqlx::query_as(
+        "SELECT sheet_path, links_json FROM workbook_sheet_links WHERE revision_id = ?",
+    )
+    .bind(template_revision_id)
+    .fetch_all(&db)
+    .await
+    .map_err(|e| format!("Failed to read template sheet links: {e}"))?;
+    for (sheet_path, links_json) in sheet_links {
+        sqlx::query(
+            "INSERT INTO workbook_sheet_links (revision_id, sheet_path, links_json) VALUES (?, ?, ?)",
+        )
+        .bind(revision_id)
+        .bind(&sheet_path)
+        .bind(&links_json)
+        .execute(&db)
+        .await
+        .map_err(|e| format!("Failed to seed sheet links '{sheet_path}': {e}"))?;
     }
 
     // Carry the template's named cells along too — they're revision-scoped (not
@@ -3114,11 +3132,6 @@ async fn write_binary_file(path: String, data_base64: String) -> Result<(), Stri
     std::fs::write(&path, bytes).map_err(|e| format!("Failed to write file: {e}"))
 }
 
-/// The sheet paths that make up a template's master sheets — see
-/// `create_workbook_revision_from_template` for why these four are special.
-const TEMPLATE_SHEET_PATHS: [&str; 4] =
-    ["L1", "TEMPLATE_MASTER_L2", "TEMPLATE_MASTER_L3", "TEMPLATE_MASTER_LQ"];
-
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct TemplateSheetExport {
     data_json: Option<String>,
@@ -3167,13 +3180,44 @@ async fn export_template(
     let description: Option<String> = row.try_get("description").map_err(|e: sqlx::Error| e.to_string())?;
     let revision_id: i64 = row.try_get("revision_id").map_err(|e: sqlx::Error| e.to_string())?;
 
+    // Export every sheet path present in the template revision (not just the
+    // TEMPLATE_MASTER_* seed set) — a template can carry real drill-down sheets
+    // (e.g. a Level 2 build-up filled in under a specific row) at ordinary paths
+    // like "L1/R2", and those must round-trip through export/import same as the
+    // master seed sheets (see create_workbook_revision_from_template).
+    let mut sheet_paths: std::collections::HashSet<String> = sqlx::query_scalar(
+        "SELECT sheet_path FROM workbook_sheet_data WHERE revision_id = ?",
+    )
+    .bind(revision_id)
+    .fetch_all(&db)
+    .await
+    .map_err(|e| format!("Failed to list sheet paths: {e}"))?
+    .into_iter()
+    .collect();
+    let style_paths: Vec<String> = sqlx::query_scalar(
+        "SELECT sheet_path FROM workbook_sheet_styles WHERE revision_id = ?",
+    )
+    .bind(revision_id)
+    .fetch_all(&db)
+    .await
+    .map_err(|e| format!("Failed to list sheet style paths: {e}"))?;
+    sheet_paths.extend(style_paths);
+    let exclusion_paths: Vec<String> = sqlx::query_scalar(
+        "SELECT sheet_path FROM workbook_sheet_exclusions WHERE revision_id = ?",
+    )
+    .bind(revision_id)
+    .fetch_all(&db)
+    .await
+    .map_err(|e| format!("Failed to list sheet exclusion paths: {e}"))?;
+    sheet_paths.extend(exclusion_paths);
+
     let mut sheets = std::collections::HashMap::new();
-    for sheet_path in TEMPLATE_SHEET_PATHS {
+    for sheet_path in sheet_paths {
         let data_json: Option<String> = sqlx::query_scalar(
             "SELECT data_json FROM workbook_sheet_data WHERE revision_id = ? AND sheet_path = ?",
         )
         .bind(revision_id)
-        .bind(sheet_path)
+        .bind(&sheet_path)
         .fetch_optional(&db)
         .await
         .map_err(|e| format!("Failed to read sheet '{sheet_path}': {e}"))?;
@@ -3182,7 +3226,7 @@ async fn export_template(
             "SELECT styles_json FROM workbook_sheet_styles WHERE revision_id = ? AND sheet_path = ?",
         )
         .bind(revision_id)
-        .bind(sheet_path)
+        .bind(&sheet_path)
         .fetch_optional(&db)
         .await
         .map_err(|e| format!("Failed to read sheet styles '{sheet_path}': {e}"))?;
@@ -3191,14 +3235,14 @@ async fn export_template(
             "SELECT exclusions_json FROM workbook_sheet_exclusions WHERE revision_id = ? AND sheet_path = ?",
         )
         .bind(revision_id)
-        .bind(sheet_path)
+        .bind(&sheet_path)
         .fetch_optional(&db)
         .await
         .map_err(|e| format!("Failed to read sheet exclusions '{sheet_path}': {e}"))?;
 
         if data_json.is_some() || styles_json.is_some() || exclusions_json.is_some() {
             sheets.insert(
-                sheet_path.to_string(),
+                sheet_path,
                 TemplateSheetExport { data_json, styles_json, exclusions_json },
             );
         }
@@ -3287,9 +3331,9 @@ async fn import_template(src_path: String, state: State<'_, AppState>) -> Result
     .map_err(|e| format!("Failed to create template revision: {e}"))?;
     let revision_id = rev_result.last_insert_rowid();
 
-    for sheet_path in TEMPLATE_SHEET_PATHS {
-        let Some(sheet) = import.sheets.get(sheet_path) else { continue };
-
+    // Import every sheet path the export carried (not just the TEMPLATE_MASTER_*
+    // seed set) — see the matching comment in export_template.
+    for (sheet_path, sheet) in &import.sheets {
         if let Some(data_json) = &sheet.data_json {
             sqlx::query(
                 "INSERT INTO workbook_sheet_data (revision_id, sheet_path, data_json) VALUES (?, ?, ?)",

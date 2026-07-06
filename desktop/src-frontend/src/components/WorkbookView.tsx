@@ -29,7 +29,13 @@ import {
 
 registerAllModules();
 
-// ─── Column definitions A–P ───────────────────────────────────────────────
+// ─── Column definitions A–Z ───────────────────────────────────────────────
+// Q–Z are plain freeform data columns (no fixed meaning, blank label — header
+// shows just the letter). Beyond Z the sheet grows into double letters (AA,
+// AB, …) exactly as rows grow past the bottom — see `growColsTo` / `colLetterForIndex`.
+
+const EXTRA_COLUMN_WIDTH = 90;
+const EXTRA_COLUMN_LETTERS = ["Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"] as const;
 
 const COLUMNS = [
   { letter: "A", label: "Code",         width: 80  },
@@ -48,12 +54,14 @@ const COLUMNS = [
   { letter: "N", label: "Sub - Total",  width: 95  },
   { letter: "O", label: "Sum",          width: 75  },
   { letter: "P", label: "Sum - Total",  width: 95  },
+  ...EXTRA_COLUMN_LETTERS.map(letter => ({ letter, label: "", width: EXTRA_COLUMN_WIDTH })),
 ] as const;
 
 // Column layout for "Quantity Build-up" sub-sheets (drilled into from a Level 2
 // takeoff row's C:Quantity). A–H differ from the standard layout (Count/Length/
 // Width/Height/Factor/Quantity, with H = product of C×D×E×F×G); I–P (Lab/Mat/Sub/Sum
-// and their totals) are unchanged so the same pull-through machinery applies.
+// and their totals) are unchanged so the same pull-through machinery applies. Q–Z
+// are the same blank freeform columns as the standard layout.
 const QTY_COLUMNS = [
   { letter: "A", label: "Code",         width: 80  },
   { letter: "B", label: "Description",  width: 220 },
@@ -71,9 +79,22 @@ const QTY_COLUMNS = [
   { letter: "N", label: "Sub - Total",  width: 95  },
   { letter: "O", label: "Sum",          width: 75  },
   { letter: "P", label: "Sum - Total",  width: 95  },
+  ...EXTRA_COLUMN_LETTERS.map(letter => ({ letter, label: "", width: EXTRA_COLUMN_WIDTH })),
 ] as const;
 
-const NUM_COLS     = COLUMNS.length;   // 16
+// Number of columns is dynamic *per sheet* — every sheet starts with columns A–Z
+// (26) and grows into double-letter columns (AA, AB, …) independently, as the user
+// fills that particular sheet's rightmost columns (see `growColsTo` / hotSettings'
+// afterChange) or as that sheet's own previously-grown data loads back in (see
+// `padData`, which never truncates real saved data). Unlike `NUM_ROWS` below (a
+// single bound shared by every sheet), column count is deliberately NOT a shared
+// global — widening one sheet (e.g. a Level 1 trade summary) must never widen any
+// other sheet or a different workbook revision. `BASE_NUM_COLS` is just the
+// starting point for a brand-new sheet; each sheet's actual width is always derived
+// from its own data array (see `loadLevelData`, `growColsTo`).
+const BASE_NUM_COLS = COLUMNS.length;   // 26 (A–Z)
+const COL_GROWTH_CHUNK     = 1;
+const COL_GROWTH_THRESHOLD = 2;  // grow once an edit lands within this many columns of the right edge
 // Row count is dynamic, not fixed — every sheet starts at 100 rows and grows in
 // chunks as the user fills the bottom of the grid (see `growRowsTo` / hotSettings'
 // afterChange) or as a previously-grown sheet loads back in (see `padData`, which
@@ -105,8 +126,47 @@ const PROJECT_TOTAL_NAME = "PROJECT_TOTAL";
 // Must match hotSettings.rowHeaderWidth so breadcrumb boxes align with grid columns.
 const ROW_HDR_W = 50;
 
-const COL_HEADERS = COLUMNS.map(c => `${c.letter}:${c.label}`);
-const COL_WIDTHS  = COLUMNS.map(c => c.width);
+/** "AA"-style Excel column letter for a 0-based index beyond the predefined
+ *  `COLUMNS`/`QTY_COLUMNS` arrays — used once the sheet has grown past Z. */
+function colLetterForIndex(index: number): string {
+  let n = index + 1;
+  let s = "";
+  while (n > 0) {
+    const rem = (n - 1) % 26;
+    s = String.fromCharCode(65 + rem) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
+}
+
+/** Column letter for any column index — predefined letter for A–Z, computed
+ *  double-letter (AA, AB, …) beyond that. Use this instead of `COLUMNS[col]?.letter`
+ *  wherever `col` may point past the end of the predefined column arrays. */
+function colLetter(col: number): string {
+  return col < COLUMNS.length ? COLUMNS[col].letter : colLetterForIndex(col);
+}
+
+function columnHeaderLabel(c: { letter: string; label: string }): string {
+  return c.label ? `${c.letter}:${c.label}` : c.letter;
+}
+
+/** Builds the full colHeaders array for `numCols` columns (that specific sheet's
+ *  own width — never a shared global), extending past `base` with computed
+ *  double-letter headers once the sheet has grown beyond Z. */
+function buildColHeaders(base: readonly { letter: string; label: string }[], numCols: number): string[] {
+  const headers = base.map(columnHeaderLabel);
+  for (let i = base.length; i < numCols; i++) headers.push(colLetterForIndex(i));
+  return headers;
+}
+
+/** Builds the full colWidths array for `numCols` columns (that specific sheet's
+ *  own width), extending past `base` with `EXTRA_COLUMN_WIDTH` once the sheet has
+ *  grown beyond Z. */
+function buildColWidths(base: readonly { width: number }[], numCols: number): number[] {
+  const widths = base.map(c => c.width);
+  for (let i = base.length; i < numCols; i++) widths.push(EXTRA_COLUMN_WIDTH);
+  return widths;
+}
 
 // Quantity Build-up sheets reuse the same column *indices* with different A–H meanings:
 // C=Count, D=Length, E=Width, F=Height, G=Factor (still index 6), H=Quantity (still index 7).
@@ -114,14 +174,15 @@ const COL_COUNT  = 2;                  // C
 const COL_LENGTH = 3;                  // D
 const COL_WIDTH  = 4;                  // E
 const COL_HEIGHT = 5;                  // F
-const QTY_COL_HEADERS = QTY_COLUMNS.map(c => `${c.letter}:${c.label}`);
-const QTY_COL_WIDTHS  = QTY_COLUMNS.map(c => c.width);
 
 // Numeric value columns — everything except Code/Description/Unit, which hold
 // text. These are displayed to a fixed number of decimal places with 1000's
-// separation (default 2dp; adjustable per cell via the Format toolbar).
+// separation (default 2dp; adjustable per cell via the Format toolbar). Q–Z (and
+// any further grown columns) are freeform — not included, so they stay plain text.
+const BASE_NUMERIC_COL_COUNT = 16;  // A–P
 const NUMERIC_COLS = new Set<number>(
-  COLUMNS.map((_, i) => i).filter(i => i !== COL_CODE && i !== COL_DESC && i !== 3 /* D:Unit */)
+  Array.from({ length: BASE_NUMERIC_COL_COUNT }, (_, i) => i)
+    .filter(i => i !== COL_CODE && i !== COL_DESC && i !== COL_UNIT)
 );
 
 // Drill-down colour: F:Subtotal is the drill column at Level 1; E:Rate and C:Quantity
@@ -194,7 +255,7 @@ function isValidNamedCellName(name: string): boolean {
 
 /** "A1"-style label for a grid cell — used in the New Named Cell dialog prompt. */
 function cellRefLabel(row: number, col: number): string {
-  return `${COLUMNS[col]?.letter ?? "A"}${row + 1}`;
+  return `${colLetter(col)}${row + 1}`;
 }
 
 /** Renders a cell value as a HyperFormula named-expression formula — numbers and
@@ -300,8 +361,8 @@ interface BreadcrumbCtx {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
-function createEmptyData(): (string | null)[][] {
-  return Array.from({ length: NUM_ROWS }, () => Array<string | null>(NUM_COLS).fill(null));
+function createEmptyData(cols: number = BASE_NUM_COLS): (string | null)[][] {
+  return Array.from({ length: NUM_ROWS }, () => Array<string | null>(cols).fill(null));
 }
 
 /** Deep-clone a sheet's source data so each new sheet gets independent rows/cells. */
@@ -314,16 +375,20 @@ function cloneStyleMap(map: Map<string, CellStyle> | undefined): Map<string, Cel
   return new Map(Array.from(map.entries(), ([key, style]) => [key, { ...style }]));
 }
 
-/** Ensure loaded JSON has at least NUM_ROWS × NUM_COLS, padding with nulls as needed.
- *  Never truncates — a sheet saved with more rows than the current NUM_ROWS (grown in
- *  an earlier session, before this one's `NUM_ROWS` reset to its initial value) grows
- *  the shared bound to fit instead of silently dropping its bottom rows. */
+/** Ensure loaded JSON has at least NUM_ROWS rows and `BASE_NUM_COLS` columns,
+ *  padding with nulls as needed. Never truncates — a sheet saved with more rows
+ *  than the current NUM_ROWS (grown in an earlier session, before this one's bound
+ *  reset to its initial value) grows the shared row bound to fit instead of
+ *  silently dropping its bottom rows. Column width, by contrast, is derived purely
+ *  from `raw` itself (this specific sheet's own stored width) — never from a shared
+ *  global — so one sheet's earlier growth never bleeds into another. */
 function padData(raw: (string | null)[][]): (string | null)[][] {
   if (raw.length > NUM_ROWS) NUM_ROWS = raw.length;
-  const result = createEmptyData();
+  const cols = Math.max(BASE_NUM_COLS, raw.reduce((m, row) => Math.max(m, row?.length ?? 0), 0));
+  const result = createEmptyData(cols);
   for (let r = 0; r < Math.min(raw.length, NUM_ROWS); r++) {
     const row = raw[r] ?? [];
-    for (let c = 0; c < Math.min(row.length, NUM_COLS); c++) {
+    for (let c = 0; c < Math.min(row.length, cols); c++) {
       const v = row[c];
       result[r][c] = (v != null && v !== "") ? String(v) : null;
     }
@@ -331,14 +396,29 @@ function padData(raw: (string | null)[][]): (string | null)[][] {
   return result;
 }
 
-/** Pads `data` up to `rows` rows (appending blank rows) without touching existing
- *  content — used to keep an already-cached sheet in sync when `NUM_ROWS` grows
- *  elsewhere, so `0..NUM_ROWS` loops never index past a stale-sized cached array. */
+/** Pads `data` up to `rows` rows (appending blank rows, each matching `data`'s own
+ *  current column width) without touching existing content — used to keep an
+ *  already-cached sheet in sync when the shared `NUM_ROWS` grows elsewhere, so
+ *  `0..NUM_ROWS` loops never index past a stale-sized cached array. */
 function padRowsTo(data: (string | null)[][], rows: number): (string | null)[][] {
   if (data.length >= rows) return data;
+  const cols = data[0]?.length ?? BASE_NUM_COLS;
   const grown = data.slice();
-  while (grown.length < rows) grown.push(Array<string | null>(NUM_COLS).fill(null));
+  while (grown.length < rows) grown.push(Array<string | null>(cols).fill(null));
   return grown;
+}
+
+/** Pads every row of `data` up to `cols` columns (appending blank cells) without
+ *  touching existing content — the column-axis counterpart to `padRowsTo`, used by
+ *  `growColsTo` to widen one specific sheet's cached data in place. */
+function padColsTo(data: (string | null)[][], cols: number): (string | null)[][] {
+  if ((data[0]?.length ?? 0) >= cols) return data;
+  return data.map(row => {
+    if (row.length >= cols) return row;
+    const grown = row.slice();
+    while (grown.length < cols) grown.push(null);
+    return grown;
+  });
 }
 
 /**
@@ -566,7 +646,10 @@ function deriveLevelFormulas(
  * Also swaps `colHeaders`/`colWidths` to match the target sheet's `kind` (derived from
  * `path` via `sheetKindForPath`) — Quantity Build-up sheets have a different A–H column
  * layout (Count/Length/Width/Height/Factor/Quantity) to standard takeoff/rate-build-up
- * sheets, so the grid's headers must follow whichever sheet is being displayed.
+ * sheets, so the grid's headers must follow whichever sheet is being displayed. Column
+ * *count* is likewise derived from `data`'s own width (this sheet's own, possibly
+ * grown-past-Z, width) — never a shared global — so a sheet that's been widened never
+ * widens any other sheet or a different workbook revision.
  */
 function loadLevelData(
   hot: Handsontable,
@@ -578,9 +661,11 @@ function loadLevelData(
   reRegisterNamed?: () => void,
 ): void {
   const kind = sheetKindForPath(path);
+  const base = kind === "qty" ? QTY_COLUMNS : COLUMNS;
+  const cols = Math.max(BASE_NUM_COLS, data.reduce((m, row) => Math.max(m, row?.length ?? 0), 0));
   hot.updateSettings({
-    colHeaders: kind === "qty" ? QTY_COL_HEADERS : COL_HEADERS,
-    colWidths:  kind === "qty" ? QTY_COL_WIDTHS  : COL_WIDTHS,
+    colHeaders: buildColHeaders(base, cols),
+    colWidths:  buildColWidths(base, cols),
   });
   try {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1226,7 +1311,7 @@ export function WorkbookView() {
    *    literal is refreshed by `syncNamedExpressions` whenever sheets change. */
   function namedExprFormula(nc: NamedCell): string {
     if (nc.path === curSheetPath()) {
-      const letter = COLUMNS[nc.col]?.letter ?? "A";
+      const letter = colLetter(nc.col);
       return `=Sheet1!$${letter}$${nc.row + 1}`;
     }
     return namedExprFromValue(readCellValue(nc.path, nc.row, nc.col));
@@ -1617,10 +1702,11 @@ export function WorkbookView() {
     fromRow: number,
     toRowExclusive: number,
     by: number,
+    cols: number,
   ): void {
     if (!map || map.size === 0) return;
     for (let r = toRowExclusive - 1; r >= fromRow; r--) {
-      for (let c = 0; c < NUM_COLS; c++) {
+      for (let c = 0; c < cols; c++) {
         const key = styleKey(r, c);
         const val = map.get(key);
         if (val === undefined) continue;
@@ -1638,10 +1724,11 @@ export function WorkbookView() {
     fromRow: number,
     toRowExclusive: number,
     by: number,
+    cols: number,
   ): void {
     if (!set || set.size === 0) return;
     for (let r = toRowExclusive - 1; r >= fromRow; r--) {
-      for (let c = 0; c < NUM_COLS; c++) {
+      for (let c = 0; c < cols; c++) {
         const key = styleKey(r, c);
         if (!set.has(key)) continue;
         set.delete(key);
@@ -1665,6 +1752,7 @@ export function WorkbookView() {
    *  essentially never fill all 100 rows, and losing trailing blank rows is harmless. */
   function shiftStandardRowsDown(hot: Handsontable, path: string, fromRow: number, lastRow: number, by: number): void {
     const data = captureSourceData(hot);
+    const cols = hot.countCols();
     const verbatimCols = [COL_CODE, COL_DESC, COL_QTY, COL_UNIT, COL_RATE, COL_FACTOR, COL_LAB, COL_MAT, COL_SUB, COL_SUM];
     const formulaCols  = [COL_SUBTOTAL, COL_TOTAL, COL_LAB_TOTAL, COL_MAT_TOTAL, COL_SUB_TOTAL, COL_SUM_TOTAL];
 
@@ -1680,7 +1768,7 @@ export function WorkbookView() {
       // Clear the rows the new line items will occupy — their old contents have
       // already been copied onward to fromRow+by.. and won't be touched above.
       for (let r = fromRow; r < fromRow + by; r++) {
-        for (let c = 0; c < NUM_COLS; c++) batch.push([r, c, ""]);
+        for (let c = 0; c < cols; c++) batch.push([r, c, ""]);
       }
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       if (batch.length) hot.setDataAtCell(batch as any);
@@ -1688,9 +1776,9 @@ export function WorkbookView() {
       isAutoUpdatingRef.current = false;
     }
 
-    shiftRowKeyedEntries(cellLinkMap.current.get(path), fromRow, lastRow + 1, by);
-    shiftRowKeyedEntries(cellStyleMap.current.get(path), fromRow, lastRow + 1, by);
-    shiftRowKeyedSet(cellExclusionMap.current.get(path), fromRow, lastRow + 1, by);
+    shiftRowKeyedEntries(cellLinkMap.current.get(path), fromRow, lastRow + 1, by, cols);
+    shiftRowKeyedEntries(cellStyleMap.current.get(path), fromRow, lastRow + 1, by, cols);
+    shiftRowKeyedSet(cellExclusionMap.current.get(path), fromRow, lastRow + 1, by, cols);
 
     // Regenerate F/H/J/L/N/P for every row (cheap, idempotent) now that the moved
     // rows' inputs sit at their new positions.
@@ -2042,10 +2130,11 @@ export function WorkbookView() {
   function captureSourceData(hot: Handsontable): (string | null)[][] {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const raw = hot.getSourceData() as any[][];
-    const result = createEmptyData();
+    const cols = hot.countCols();
+    const result = createEmptyData(cols);
     for (let r = 0; r < Math.min(raw.length, NUM_ROWS); r++) {
       const row = raw[r] ?? [];
-      for (let c = 0; c < Math.min(row.length, NUM_COLS); c++) {
+      for (let c = 0; c < Math.min(row.length, cols); c++) {
         const cell = row[c];
         result[r][c] = (cell != null && cell !== "") ? String(cell) : null;
       }
@@ -2065,6 +2154,31 @@ export function WorkbookView() {
     hot.alter("insert_row_below", insertAfter, additional);
     for (const [path, data] of sheetDataMap.current) {
       if (data.length < NUM_ROWS) sheetDataMap.current.set(path, padRowsTo(data, NUM_ROWS));
+    }
+  }
+
+  /** Grows *only the currently displayed sheet's* column count to `targetCols` (a
+   *  no-op if it's already that wide): adds the extra columns to the live grid
+   *  (with computed double-letter headers/widths past Z) and widens that one
+   *  sheet's cached data to match. Deliberately scoped to the current path — unlike
+   *  `growRowsTo` (rows are a shared bound across every sheet), widening one sheet
+   *  (e.g. a Level 1 trade summary) must never widen any other sheet or a different
+   *  workbook revision. */
+  function growColsTo(hot: Handsontable, targetCols: number): void {
+    const curCols = hot.countCols();
+    if (targetCols <= curCols) return;
+    const insertAfter = curCols - 1;
+    hot.alter("insert_col_end", insertAfter, targetCols - curCols);
+    const path = curSheetPath();
+    const kind = sheetKindForPath(path);
+    const base = kind === "qty" ? QTY_COLUMNS : COLUMNS;
+    hot.updateSettings({
+      colHeaders: buildColHeaders(base, targetCols),
+      colWidths:  buildColWidths(base, targetCols),
+    });
+    const cached = sheetDataMap.current.get(path);
+    if (cached && (cached[0]?.length ?? 0) < targetCols) {
+      sheetDataMap.current.set(path, padColsTo(cached, targetCols));
     }
   }
 
@@ -2102,6 +2216,7 @@ export function WorkbookView() {
    */
   function insertBlankRowAt(hot: Handsontable, path: string, insertAt: number): void {
     const data = captureSourceData(hot);
+    const cols = hot.countCols();
     let lastOccupied = -1;
     for (let r = NUM_ROWS - 1; r >= insertAt; r--) {
       if (isLineItemRow(data[r])) { lastOccupied = r; break; }
@@ -2114,10 +2229,10 @@ export function WorkbookView() {
         for (let r = lastOccupied; r >= insertAt; r--) {
           const dest = r + 1;
           if (dest > NUM_ROWS - 1) continue;
-          for (let c = 0; c < NUM_COLS; c++) batch.push([dest, c, data[r][c] ?? ""]);
+          for (let c = 0; c < cols; c++) batch.push([dest, c, data[r][c] ?? ""]);
         }
       }
-      for (let c = 0; c < NUM_COLS; c++) batch.push([insertAt, c, ""]);
+      for (let c = 0; c < cols; c++) batch.push([insertAt, c, ""]);
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       if (batch.length) hot.setDataAtCell(batch as any);
     } finally {
@@ -2140,9 +2255,9 @@ export function WorkbookView() {
     }
 
     if (lastOccupied >= insertAt) {
-      shiftRowKeyedEntries(cellLinkMap.current.get(path), insertAt, lastOccupied + 1, 1);
-      shiftRowKeyedEntries(cellStyleMap.current.get(path), insertAt, lastOccupied + 1, 1);
-      shiftRowKeyedSet(cellExclusionMap.current.get(path), insertAt, lastOccupied + 1, 1);
+      shiftRowKeyedEntries(cellLinkMap.current.get(path), insertAt, lastOccupied + 1, 1, cols);
+      shiftRowKeyedEntries(cellStyleMap.current.get(path), insertAt, lastOccupied + 1, 1, cols);
+      shiftRowKeyedSet(cellExclusionMap.current.get(path), insertAt, lastOccupied + 1, 1, cols);
 
       // Remap in-memory sub-sheet caches (bottom-up to avoid collisions).
       // At Level 1 sub-sheets are "<path>/R{r}"; at Level 2 also "<path>/Q{r}".
@@ -2343,14 +2458,15 @@ export function WorkbookView() {
       const hot = hotRef.current?.hotInstance;
       if (!hot) return;
       const kind = sheetKindForPath(curSheetPath());
-      const cols = kind === "qty" ? QTY_COLUMNS : COLUMNS;
+      const base = kind === "qty" ? QTY_COLUMNS : COLUMNS;
       const rawData: unknown[][] = hot.getData() as unknown[][];
 
-      const headerCells = cols.map(c => `<th>${c.letter}:${c.label}</th>`).join("");
+      const headers = buildColHeaders(base, hot.countCols());
+      const headerCells = headers.map(h => `<th>${h}</th>`).join("");
       const dataRows = rawData
         .filter(row => row.some(cell => cell != null && cell !== ""))
         .map(row => {
-          const cells = cols.map((_c, i) => {
+          const cells = headers.map((_h, i) => {
             const val = row[i];
             const s = (val != null && val !== "") ? String(val) : "";
             return `<td>${s.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</td>`;
@@ -3378,8 +3494,8 @@ export function WorkbookView() {
     data: createEmptyData(),
     rowHeaders: true,
     rowHeaderWidth: ROW_HDR_W,
-    colHeaders: COL_HEADERS,
-    colWidths: COL_WIDTHS,
+    colHeaders: buildColHeaders(COLUMNS, BASE_NUM_COLS),
+    colWidths: buildColWidths(COLUMNS, BASE_NUM_COLS),
     manualColumnResize: true,
     manualRowResize: true,
     contextMenu: false,
@@ -3402,7 +3518,7 @@ export function WorkbookView() {
     afterSelection(row: number, col: number, row2: number, col2: number) {
       if (row < 0 || col < 0) return;
       lastSelectedCellRef.current = { row, col };
-      const letter = COLUMNS[col]?.letter ?? "A";
+      const letter = colLetter(col);
       setActiveCell(`${letter}${row + 1}`);
       // Show formula string (source data), not the computed value
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -3512,6 +3628,16 @@ export function WorkbookView() {
         const maxEditedRow = Math.max(...changes.map(ch => ch[0]));
         if (maxEditedRow >= NUM_ROWS - ROW_GROWTH_THRESHOLD) {
           growRowsTo(hot, NUM_ROWS + ROW_GROWTH_CHUNK);
+        }
+
+        // Same idea on the column axis — editing near the right edge (e.g. Y or Z)
+        // of *this* sheet appends another column (AA, AB, …) to it, scoped to this
+        // sheet only (see growColsTo) rather than capping the sheet at Z or bleeding
+        // the extra column into any other sheet/revision.
+        const maxEditedCol = Math.max(...changes.map(ch => typeof ch[1] === "number" ? ch[1] : -1));
+        const curCols = hot.countCols();
+        if (maxEditedCol >= curCols - COL_GROWTH_THRESHOLD) {
+          growColsTo(hot, curCols + COL_GROWTH_CHUNK);
         }
 
         // Remove stale cell links when a linked C:Quantity cell is cleared by the user.
