@@ -137,7 +137,10 @@ function pageToScreen(
   };
 }
 
-const MEASURE_LINE_WIDTH = 2.5;
+const MEASURE_LINE_WIDTH = 7;
+// Timber-framing plate outlines intentionally use their own weight — framing has its own
+// stud/plate line hierarchy and shouldn't track the general measurement line weight.
+const FRAMING_LINE_WIDTH = 2.5;
 const VERTEX_RADIUS = 4;
 
 type PagePoint = { x: number; y: number };
@@ -176,15 +179,21 @@ function isAreaType(measurementType: string) {
   return measurementType !== "length" && measurementType !== "count" && measurementType !== "timber_framing" && measurementType !== "array";
 }
 
-/** Canvas dash pattern for a CostX line style. */
-function lineDash(style: string | undefined): number[] {
+// Dash/dot/dash-dot segment lengths below are tuned at this reference stroke width;
+// lineDash() scales them proportionally to whatever width is actually being stroked,
+// so thicker lines get proportionally longer dashes/gaps instead of a fixed tiny pattern.
+const DASH_REFERENCE_WIDTH = 2.5;
+
+/** Canvas dash pattern for a CostX line style, scaled to the given stroke width. */
+function lineDash(style: string | undefined, width: number = DASH_REFERENCE_WIDTH): number[] {
+  const scale = width / DASH_REFERENCE_WIDTH;
   switch (style) {
     case "dashed":
-      return [9, 6];
+      return [9 * scale, 6 * scale];
     case "dotted":
-      return [2, 5];
+      return [2 * scale, 5 * scale];
     case "dash_dot":
-      return [9, 5, 2, 5];
+      return [9 * scale, 5 * scale, 2 * scale, 5 * scale];
     default:
       return [];
   }
@@ -212,8 +221,9 @@ function drawCountMarker(ctx: CanvasRenderingContext2D, x: number, y: number, co
 function drawCustomCountShape(ctx: CanvasRenderingContext2D, x: number, y: number, halfW: number, halfH: number, colour: string, selected = false, style?: string) {
   ctx.save();
   ctx.strokeStyle = colour;
-  ctx.lineWidth = selected ? 3 : 2;
-  ctx.setLineDash(lineDash(style));
+  const shapeWidth = selected ? 3 : 2;
+  ctx.lineWidth = shapeWidth;
+  ctx.setLineDash(lineDash(style, shapeWidth));
   ctx.strokeRect(x - halfW, y - halfH, halfW * 2, halfH * 2);
   ctx.restore();
 }
@@ -274,8 +284,9 @@ function drawFraming(
     if (points.length >= 2) {
       const sp = points.map(toScreen);
       ctx.strokeStyle = colour;
-      ctx.lineWidth = selected ? MEASURE_LINE_WIDTH + 1 : MEASURE_LINE_WIDTH;
-      ctx.setLineDash(lineDash(style));
+      const centreWidth = selected ? FRAMING_LINE_WIDTH + 1 : FRAMING_LINE_WIDTH;
+      ctx.lineWidth = centreWidth;
+      ctx.setLineDash(lineDash(style, centreWidth));
       ctx.beginPath();
       ctx.moveTo(sp[0].x, sp[0].y);
       for (const s of sp.slice(1)) ctx.lineTo(s.x, s.y);
@@ -289,7 +300,7 @@ function drawFraming(
 
   // Plate outlines — solid, but the section spanning a door/window opening is drawn as a thin
   // dashed line so the opening reads clearly. Build per-path-segment opening arc-length ranges.
-  const baseWidth = selected ? MEASURE_LINE_WIDTH + 1 : MEASURE_LINE_WIDTH;
+  const baseWidth = selected ? FRAMING_LINE_WIDTH + 1 : FRAMING_LINE_WIDTH;
   // The dashed span covers the whole opening assembly (king-to-king), so the solid plate stops
   // outside the kings rather than running over the jamb studs.
   const segRanges: { lo: number; hi: number }[][] = points.map(() => []);
@@ -318,7 +329,7 @@ function drawFraming(
         if (t1 - t0 < 1e-6) return;
         const p0 = lerp(t0);
         const p1 = lerp(t1);
-        ctx.setLineDash(dashed ? [5, 4] : lineDash(style));
+        ctx.setLineDash(dashed ? [5, 4] : lineDash(style, baseWidth));
         ctx.lineWidth = dashed ? 1 : baseWidth;
         ctx.beginPath();
         ctx.moveTo(p0.x, p0.y);
@@ -481,8 +492,9 @@ function drawOverlays(
     const screenPts = points.map((point) => pageToScreen(point.x, point.y, page.height_pts, pan, zoom));
 
     ctx.strokeStyle = colour;
-    ctx.lineWidth = selected ? MEASURE_LINE_WIDTH + 1.5 : MEASURE_LINE_WIDTH;
-    ctx.setLineDash(lineDash(style));
+    const strokeWidth = selected ? MEASURE_LINE_WIDTH + 1.5 : MEASURE_LINE_WIDTH;
+    ctx.lineWidth = strokeWidth;
+    ctx.setLineDash(lineDash(style, strokeWidth));
     ctx.beginPath();
     ctx.moveTo(screenPts[0].x, screenPts[0].y);
     for (const screen of screenPts.slice(1)) {
@@ -525,7 +537,7 @@ function drawDraft(
   ctx.lineCap = "round";
   ctx.strokeStyle = colour;
   ctx.lineWidth = MEASURE_LINE_WIDTH;
-  ctx.setLineDash(lineDash(style));
+  ctx.setLineDash(lineDash(style, MEASURE_LINE_WIDTH));
   ctx.beginPath();
   ctx.moveTo(screenPts[0].x, screenPts[0].y);
   for (const screen of screenPts.slice(1)) {
@@ -883,8 +895,9 @@ function drawArray(
   const absTrimsList = absTrims(meta.trims, baseline[0]);
   ctx.save();
   ctx.strokeStyle = colour;
-  ctx.lineWidth = selected ? MEASURE_LINE_WIDTH + 1.5 : MEASURE_LINE_WIDTH;
-  ctx.setLineDash(lineDash(style));
+  const arrayWidth = selected ? MEASURE_LINE_WIDTH + 1.5 : MEASURE_LINE_WIDTH;
+  ctx.lineWidth = arrayWidth;
+  ctx.setLineDash(lineDash(style, arrayWidth));
   ctx.lineCap = "round";
 
   for (const member of members) {
