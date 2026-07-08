@@ -1,17 +1,43 @@
-// Timber Framing — 3D members (M9). Thin adapter over `wallMembers` (the single member model shared
-// with the 2D takeoff, so the 3D view and the quantities always agree). World: metres, Y up, the PDF
-// page is the floor; each member is a box rotated `yaw` about Y and `pitch` about its across-axis.
+// 3D geometry builders (M9+). Timber framing goes through `wallMembers` (the single member model
+// shared with the 2D takeoff, so the 3D view and the quantities always agree); count/length/area
+// groups go through the generic builders below. World: metres, Y up, the PDF page is the floor;
+// world X = page x * S, world Z = -page y * S (S = mm-per-point / 1000) — matching PageGround's
+// "PDF Y → world -Z" convention. Each box member is rotated `yaw` about Y and `pitch` about its
+// across-axis.
 
 import type { PagePoint } from "./quantity";
 import { wallMembers, type FramingComponentKind, type FramingSettings, type WallFraming } from "./framing";
 
 export interface Member3D {
-  kind: FramingComponentKind;
+  kind: FramingComponentKind | "generic";
   position: [number, number, number];
   size: [number, number, number];
   yaw: number;
   pitch: number;
   wedge?: { quad: [number, number][]; depthM: number };
+  /** Explicit colour override — used by generic (non-framing) members, which are coloured by
+   *  their owning dimension group rather than by member kind. */
+  color?: string;
+}
+
+/** A flat or volumetric extrusion of an area-group polygon (world X/Z footprint, extruded up
+ *  from `baseY` by `heightM`). Rendered by `AreaMeshItem` in Framing3DView. */
+export interface AreaMesh3D {
+  /** World [x, z] polygon vertices, metres, not repeating the closing point. */
+  points: [number, number][];
+  baseY: number;
+  heightM: number;
+  color: string;
+}
+
+const MIN_GENERIC_SIZE_M = 0.1;
+const MIN_AREA_HEIGHT_M = 0.02;
+/** Thickness used for a dimension a length group's `default_display` doesn't actually measure —
+ *  thin enough to read as a flat face rather than a box, thick enough to stay visible/pickable. */
+const MIN_FACE_THICKNESS_M = 0.02;
+
+function pageToWorld(p: PagePoint, S: number): [number, number] {
+  return [p.x * S, -p.y * S];
 }
 
 /** Member colours, loosely matching docs/window makeup.png + the 3D references. */
@@ -51,4 +77,107 @@ export function offsetMembers(members: Member3D[], offsetM: number): Member3D[] 
     ...m,
     position: [m.position[0], m.position[1] + offsetM, m.position[2]],
   }));
+}
+
+/** Shifts an area mesh's base up by `offsetM` along world Y. */
+export function offsetArea(area: AreaMesh3D, offsetM: number): AreaMesh3D {
+  if (!offsetM) return area;
+  return { ...area, baseY: area.baseY + offsetM };
+}
+
+/** A "count" measurement's 3D marker: a small cube at the point, offset up by `offsetM`. Sized
+ *  by the group's default width/height when `countType === "custom"` (matching the 2D custom-count
+ *  rectangle), else a fixed small marker cube. */
+export function computeCountMarker3D(
+  point: PagePoint,
+  mmPerPoint: number | null,
+  opts: { widthM: number; heightM: number; countType: string; offsetM: number; color: string },
+): Member3D | null {
+  if (!mmPerPoint || !(mmPerPoint > 0)) return null;
+  const S = mmPerPoint / 1000;
+  const [x, z] = pageToWorld(point, S);
+  const custom = opts.countType === "custom" && opts.widthM > 0 && opts.heightM > 0;
+  const w = custom ? opts.widthM : MIN_GENERIC_SIZE_M;
+  const h = custom ? opts.heightM : MIN_GENERIC_SIZE_M;
+  return {
+    kind: "generic",
+    position: [x, opts.offsetM + h / 2, z],
+    size: [w, h, w],
+    yaw: 0,
+    pitch: 0,
+    color: opts.color,
+  };
+}
+
+/** A "length" measurement's 3D extrusion: one box per segment, offset up by `offsetM`. The
+ *  cross-section follows which of width/height the group's `default_display` actually measures
+ *  (see `deriveQuantity` in quantity.ts) — a dimension the 2D quantity ignores is rendered as a
+ *  thin face rather than a wide extrusion, so e.g. a "wall_area" run (length × height only, no
+ *  width) shows as a vertical face, and a plan "area" run (length × width only, no height) shows
+ *  as a flat ribbon. Only "volume" (length × width × height) gets a genuine box. */
+export function computeLengthMembers3D(
+  points: PagePoint[],
+  mmPerPoint: number | null,
+  opts: { widthM: number; heightM: number; offsetM: number; color: string; display: string },
+): Member3D[] {
+  if (!mmPerPoint || !(mmPerPoint > 0) || points.length < 2) return [];
+  const S = mmPerPoint / 1000;
+  let w: number;
+  let h: number;
+  switch (opts.display) {
+    case "wall_area":
+      w = MIN_FACE_THICKNESS_M;
+      h = opts.heightM > 0 ? opts.heightM : MIN_GENERIC_SIZE_M;
+      break;
+    case "area":
+      w = opts.widthM > 0 ? opts.widthM : MIN_GENERIC_SIZE_M;
+      h = MIN_FACE_THICKNESS_M;
+      break;
+    case "volume":
+      w = opts.widthM > 0 ? opts.widthM : MIN_GENERIC_SIZE_M;
+      h = opts.heightM > 0 ? opts.heightM : MIN_GENERIC_SIZE_M;
+      break;
+    default:
+      // Plain "length" (or deferred "weight") — neither width nor height is meaningful: a thin line.
+      w = MIN_FACE_THICKNESS_M;
+      h = MIN_FACE_THICKNESS_M;
+      break;
+  }
+  const members: Member3D[] = [];
+  for (let i = 1; i < points.length; i += 1) {
+    const [x1, z1] = pageToWorld(points[i - 1], S);
+    const [x2, z2] = pageToWorld(points[i], S);
+    const dx = x2 - x1;
+    const dz = z2 - z1;
+    const segLen = Math.hypot(dx, dz);
+    if (segLen <= 0) continue;
+    const yaw = Math.atan2(dx, dz);
+    members.push({
+      kind: "generic",
+      position: [(x1 + x2) / 2, opts.offsetM + h / 2, (z1 + z2) / 2],
+      size: [w, h, segLen],
+      yaw,
+      pitch: 0,
+      color: opts.color,
+    });
+  }
+  return members;
+}
+
+/** An "area" measurement's 3D extrusion: the polygon footprint extruded up from `offsetM` by the
+ *  group's default height (or a thin slab when unset, so a flat area group still renders as a
+ *  visible floor plate rather than nothing). */
+export function computeAreaMesh3D(
+  points: PagePoint[],
+  mmPerPoint: number | null,
+  opts: { heightM: number; offsetM: number; color: string },
+): AreaMesh3D | null {
+  if (!mmPerPoint || !(mmPerPoint > 0) || points.length < 3) return null;
+  const S = mmPerPoint / 1000;
+  return {
+    points: points.map((p) => pageToWorld(p, S)),
+    baseY: opts.offsetM,
+    heightM: Math.max(opts.heightM, MIN_AREA_HEIGHT_M),
+    color: opts.color,
+  };
 }

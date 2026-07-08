@@ -56,13 +56,20 @@ export interface PageMeta {
   height_pts: number;
 }
 
-/** A single timber-framing dimension group's contribution to a page in the multi-page 3D setup. */
+/** A single dimension group's contribution to a page in the multi-page 3D setup. */
 export interface MultiPage3DGroupEntry {
   groupId: number;
   name: string;
   included: boolean;
+  measurementType: string;
+  defaultDisplay: string;
   framingPropsJson: string | null;
   defaultOffsetM: number;
+  defaultWidthM: number;
+  defaultHeightM: number;
+  countType: string;
+  posColour: string;
+  negColour: string;
   measurements: MeasurementDto[];
 }
 
@@ -446,8 +453,8 @@ export function drawingPageNodeId(drawingId: number, pageIndex: number) {
 }
 
 /** Recursively walks the dimension-group tree (fetching uncached folder children as needed)
- *  and returns every "timber_framing" dimension group node. */
-async function collectFramingGroups(
+ *  and returns every dimension group node, of any measurement type. */
+async function collectDimensionGroups(
   roots: TreeNodeDto[],
   childCache: Record<number, TreeNodeDto[]>,
 ): Promise<TreeNodeDto[]> {
@@ -456,7 +463,7 @@ async function collectFramingGroups(
   async function walk(nodes: TreeNodeDto[]) {
     for (const node of nodes) {
       if (node.node_type === "dimension_group") {
-        if (node.measurement_type === "timber_framing") result.push(node);
+        result.push(node);
         continue;
       }
       if (node.node_type === "folder") {
@@ -898,7 +905,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
     const { activeDrawingId, currentDocument } = state;
     if (activeDrawingId === null || !currentDocument) return [];
 
-    const groupNodes = await collectFramingGroups(state.dimensionRoots, state.childCache);
+    const groupNodes = await collectDimensionGroups(state.dimensionRoots, state.childCache);
     const groupData = await Promise.all(
       groupNodes.map(async (node) => {
         const [measurements, props] = await Promise.all([
@@ -907,17 +914,36 @@ export const useAppStore = create<AppStore>((set, get) => ({
         ]);
         return {
           node,
+          measurementType: props.measurement_type,
+          defaultDisplay: props.default_display,
           framingPropsJson: props.framing_props_json ?? null,
           defaultOffsetM: props.default_offset ?? 0,
+          defaultWidthM: props.default_width ?? 0,
+          defaultHeightM: props.default_height ?? 0,
+          countType: props.count_type,
+          posColour: props.pos_colour,
+          negColour: props.neg_colour,
           measurements: measurements.filter(
-            (m) => m.drawing_id === activeDrawingId && m.measurement_type === "timber_framing",
+            (m) => m.drawing_id === activeDrawingId && m.measurement_type === props.measurement_type,
           ),
         };
       }),
     );
 
     const pageGroups = new Map<number, MultiPage3DGroupEntry[]>();
-    for (const { node, measurements, framingPropsJson, defaultOffsetM } of groupData) {
+    for (const {
+      node,
+      measurements,
+      measurementType,
+      defaultDisplay,
+      framingPropsJson,
+      defaultOffsetM,
+      defaultWidthM,
+      defaultHeightM,
+      countType,
+      posColour,
+      negColour,
+    } of groupData) {
       const byPage = new Map<number, MeasurementDto[]>();
       for (const m of measurements) {
         const arr = byPage.get(m.page_index) ?? [];
@@ -926,7 +952,21 @@ export const useAppStore = create<AppStore>((set, get) => ({
       }
       for (const [pageIndex, ms] of byPage) {
         const arr = pageGroups.get(pageIndex) ?? [];
-        arr.push({ groupId: node.id, name: node.name, included: true, framingPropsJson, defaultOffsetM, measurements: ms });
+        arr.push({
+          groupId: node.id,
+          name: node.name,
+          included: true,
+          measurementType,
+          defaultDisplay,
+          framingPropsJson,
+          defaultOffsetM,
+          defaultWidthM,
+          defaultHeightM,
+          countType,
+          posColour,
+          negColour,
+          measurements: ms,
+        });
         pageGroups.set(pageIndex, arr);
       }
     }

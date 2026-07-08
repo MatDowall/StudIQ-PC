@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Canvas } from "@react-three/fiber";
 import { OrbitControls } from "@react-three/drei";
 import * as THREE from "three";
-import { MEMBER_COLOURS, type Member3D } from "../lib/framing3d";
+import { MEMBER_COLOURS, type AreaMesh3D, type Member3D } from "../lib/framing3d";
 
 /** Compose the member's yaw (about world-up) and pitch (about its local across-axis) into a quaternion. */
 function quaternionFor(yaw: number, pitch: number): [number, number, number, number] {
@@ -37,7 +37,51 @@ function WedgeMesh({ mem }: { mem: Member3D }) {
   const geometry = useMemo(() => wedgeGeometry(mem.wedge!.quad, mem.wedge!.depthM), [mem.wedge]);
   return (
     <mesh position={mem.position} rotation={[0, mem.yaw, 0]} geometry={geometry}>
-      <meshLambertMaterial color={MEMBER_COLOURS[mem.kind] ?? "#999999"} side={THREE.DoubleSide} />
+      <meshLambertMaterial color={mem.color ?? MEMBER_COLOURS[mem.kind] ?? "#999999"} side={THREE.DoubleSide} />
+    </mesh>
+  );
+}
+
+/** Builds a polygon footprint (world X/Z, `points`) extruded up from `baseY` by `heightM` — the
+ *  top/bottom caps are triangulated with `THREE.ShapeUtils` (simple, non-self-intersecting
+ *  polygons only, which is all a takeoff area measurement ever is) and the side walls are one
+ *  quad per edge. */
+function extrudedPolygonGeometry(points: [number, number][], baseY: number, heightM: number): THREE.BufferGeometry {
+  const shapePts = points.map(([x, z]) => new THREE.Vector2(x, z));
+  const triangles = THREE.ShapeUtils.triangulateShape(shapePts, []);
+  const positions: number[] = [];
+  const pushTri = (ia: number, ib: number, ic: number, y: number, flip: boolean) => {
+    const seq = flip ? [ic, ib, ia] : [ia, ib, ic];
+    for (const idx of seq) {
+      const [x, z] = points[idx];
+      positions.push(x, y, z);
+    }
+  };
+  for (const [ia, ib, ic] of triangles) {
+    pushTri(ia, ib, ic, baseY + heightM, false);
+    pushTri(ia, ib, ic, baseY, true);
+  }
+  const n = points.length;
+  for (let i = 0; i < n; i += 1) {
+    const [x1, z1] = points[i];
+    const [x2, z2] = points[(i + 1) % n];
+    positions.push(x1, baseY, z1, x2, baseY, z2, x2, baseY + heightM, z2);
+    positions.push(x1, baseY, z1, x2, baseY + heightM, z2, x1, baseY + heightM, z1);
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(positions), 3));
+  geometry.computeVertexNormals();
+  return geometry;
+}
+
+function AreaMeshItem({ area }: { area: AreaMesh3D }) {
+  const geometry = useMemo(
+    () => extrudedPolygonGeometry(area.points, area.baseY, area.heightM),
+    [area],
+  );
+  return (
+    <mesh geometry={geometry}>
+      <meshLambertMaterial color={area.color} side={THREE.DoubleSide} transparent opacity={0.85} />
     </mesh>
   );
 }
@@ -47,10 +91,12 @@ function WedgeMesh({ mem }: { mem: Member3D }) {
 function InstancedMembers({
   kind,
   size,
+  color,
   members,
 }: {
   kind: Member3D["kind"];
   size: [number, number, number];
+  color?: string;
   members: Member3D[];
 }) {
   const ref = useRef<THREE.InstancedMesh>(null);
@@ -71,7 +117,7 @@ function InstancedMembers({
   return (
     <instancedMesh ref={ref} args={[undefined, undefined, members.length]}>
       <boxGeometry args={size} />
-      <meshLambertMaterial color={MEMBER_COLOURS[kind] ?? "#999999"} />
+      <meshLambertMaterial color={color ?? MEMBER_COLOURS[kind] ?? "#999999"} />
     </instancedMesh>
   );
 }
@@ -80,19 +126,22 @@ function InstancedMembers({
  *  this is by far the common case (studs, plates, dwangs, etc.) and collapses what would
  *  otherwise be hundreds of individual draw calls into a handful. Wedges (rake/plumb cuts)
  *  are comparatively rare and each get their own mesh since their geometry is unique. */
-function Members({ members }: { members: Member3D[] }) {
+function Members({ members, areas }: { members: Member3D[]; areas?: AreaMesh3D[] }) {
   const { wedges, groups } = useMemo(() => {
     const wedges: Member3D[] = [];
-    const map = new Map<string, { kind: Member3D["kind"]; size: [number, number, number]; members: Member3D[] }>();
+    const map = new Map<
+      string,
+      { kind: Member3D["kind"]; size: [number, number, number]; color?: string; members: Member3D[] }
+    >();
     for (const mem of members) {
       if (mem.wedge) {
         wedges.push(mem);
         continue;
       }
-      const key = `${mem.kind}|${mem.size.join(",")}`;
+      const key = `${mem.kind}|${mem.size.join(",")}|${mem.color ?? ""}`;
       let group = map.get(key);
       if (!group) {
-        group = { kind: mem.kind, size: mem.size, members: [] };
+        group = { kind: mem.kind, size: mem.size, color: mem.color, members: [] };
         map.set(key, group);
       }
       group.members.push(mem);
@@ -106,7 +155,10 @@ function Members({ members }: { members: Member3D[] }) {
         <WedgeMesh key={i} mem={mem} />
       ))}
       {groups.map((g, i) => (
-        <InstancedMembers key={i} kind={g.kind} size={g.size} members={g.members} />
+        <InstancedMembers key={i} kind={g.kind} size={g.size} color={g.color} members={g.members} />
+      ))}
+      {areas?.map((area, i) => (
+        <AreaMeshItem key={i} area={area} />
       ))}
     </group>
   );
@@ -193,6 +245,8 @@ function PageGround({ widthM, heightM, url }: { widthM: number; heightM: number;
  *  page rendered as a ground plane, translated up by `offsetM` along world Y. */
 export interface Framing3DPage {
   members: Member3D[];
+  /** Area-group extrusions (flat or volumetric polygons) for this page. */
+  areas?: AreaMesh3D[];
   offsetM: number;
   pageWidthM?: number;
   pageHeightM?: number;
@@ -203,6 +257,8 @@ export interface Framing3DPage {
 
 interface Framing3DViewProps {
   members: Member3D[];
+  /** Area-group extrusions for the single-page view. */
+  areas?: AreaMesh3D[];
   /** PDF page width in world metres — when provided with pageHeightM and previewUrl, renders the page as ground. */
   pageWidthM?: number;
   pageHeightM?: number;
@@ -212,13 +268,14 @@ interface Framing3DViewProps {
   pages?: Framing3DPage[];
 }
 
-/** Renders timber-framing members as 3D boxes with orbit/pan/zoom. Members come from
- *  `computeWall3D` (world metres, Y up, the PDF page as the floor). */
-export function Framing3DView({ members, pageWidthM, pageHeightM, previewUrl, pages }: Framing3DViewProps) {
+/** Renders a dimension group's measurements as 3D geometry with orbit/pan/zoom — timber-framing
+ *  boxes from `computeWall3D`, and generic markers/extrusions/meshes from the count/length/area
+ *  builders in lib/framing3d.ts (world metres, Y up, the PDF page as the floor). */
+export function Framing3DView({ members, areas, pageWidthM, pageHeightM, previewUrl, pages }: Framing3DViewProps) {
   const effectivePages: Framing3DPage[] = useMemo(() => {
     if (pages && pages.length > 0) return pages;
-    return [{ members, offsetM: 0, pageWidthM, pageHeightM, previewUrl, showGround: true }];
-  }, [pages, members, pageWidthM, pageHeightM, previewUrl]);
+    return [{ members, areas, offsetM: 0, pageWidthM, pageHeightM, previewUrl, showGround: true }];
+  }, [pages, members, areas, pageWidthM, pageHeightM, previewUrl]);
 
   const { center, radius, camPos } = useMemo(() => {
     const box = new THREE.Box3();
@@ -238,6 +295,12 @@ export function Framing3DView({ members, pageWidthM, pageHeightM, previewUrl, pa
         const h = Math.max(...mem.size) / 2 + 0.05;
         box.expandByPoint(v.set(mem.position[0] - h, mem.position[1] - h + page.offsetM, mem.position[2] - h));
         box.expandByPoint(v.set(mem.position[0] + h, mem.position[1] + h + page.offsetM, mem.position[2] + h));
+      }
+      for (const area of page.areas ?? []) {
+        for (const [x, z] of area.points) {
+          box.expandByPoint(v.set(x, area.baseY + page.offsetM, z));
+          box.expandByPoint(v.set(x, area.baseY + area.heightM + page.offsetM, z));
+        }
       }
     }
     if (box.isEmpty()) box.set(new THREE.Vector3(-1, 0, -1), new THREE.Vector3(1, 2, 1));
@@ -266,7 +329,7 @@ export function Framing3DView({ members, pageWidthM, pageHeightM, previewUrl, pa
         return (
           <group key={i} position={[0, page.offsetM, 0]}>
             {showPage && <PageGround widthM={page.pageWidthM!} heightM={page.pageHeightM!} url={page.previewUrl!} />}
-            <Members members={page.members} />
+            <Members members={page.members} areas={page.areas} />
           </group>
         );
       })}

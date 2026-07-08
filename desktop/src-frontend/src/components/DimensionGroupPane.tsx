@@ -348,6 +348,8 @@ export function DimensionGroupPane() {
   const listDimensionFolders = useAppStore((state) => state.listDimensionFolders);
   const copyDimensionGroup = useAppStore((state) => state.copyDimensionGroup);
   const dgPaneCommand = useAppStore((state) => state.dgPaneCommand);
+  const setView3d = useAppStore((state) => state.setView3d);
+  const setView3dMulti = useAppStore((state) => state.setView3dMulti);
   const [selectedFolderId, setSelectedFolderId] = useState<number | null>(null);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; node: TreeNodeDto } | null>(null);
   const [pendingAddGroupPath, setPendingAddGroupPath] = useState<string | null>(null);
@@ -458,6 +460,12 @@ export function DimensionGroupPane() {
     event.preventDefault();
     if (node.node_type !== "folder" && node.node_type !== "dimension_group") return;
     setContextMenu({ x: event.clientX, y: event.clientY, node });
+  }
+
+  async function handleViewIn3D(node: TreeNodeDto) {
+    await handleNodeClick(node);
+    setView3dMulti(false);
+    setView3d(true);
   }
 
   async function confirmAddGroup(folderPath: string, name: string, colour: string, measurementType: string) {
@@ -767,6 +775,12 @@ export function DimensionGroupPane() {
                     label: "Select Group",
                     action: () => {
                       void handleNodeClick(contextMenu.node);
+                    },
+                  },
+                  {
+                    label: "View in 3D",
+                    action: () => {
+                      void handleViewIn3D(contextMenu.node);
                     },
                   },
                   {

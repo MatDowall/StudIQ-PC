@@ -20,7 +20,15 @@ import {
   type OpeningTemplate,
   type WallFraming,
 } from "../lib/framing";
-import { computeWall3D, offsetMembers } from "../lib/framing3d";
+import {
+  computeAreaMesh3D,
+  computeCountMarker3D,
+  computeLengthMembers3D,
+  computeWall3D,
+  offsetMembers,
+  type AreaMesh3D,
+  type Member3D,
+} from "../lib/framing3d";
 import { ContextMenu, type ContextMenuItem } from "./ContextMenu";
 import { OpeningDialog } from "./OpeningDialog";
 import { RakingDialog } from "./RakingDialog";
@@ -2517,9 +2525,10 @@ export function ViewerCanvas({
             items.push({ label: "Add point", action: () => addVertex(id, segment.segmentIndex, segment.point) });
           }
         }
-        // Timber-framing extras (3D view, raking frames).
+        // View in 3D — any measurement type (marker/extrusion/mesh built from the group's
+        // measurement_type; timber framing additionally gets raking-frame/double-stud extras below).
+        items.push({ label: "View in 3D", action: () => setWall3dId(id) });
         if (measurement.measurement_type === "timber_framing") {
-          items.push({ label: "View wall in 3D", action: () => setWall3dId(id) });
           const seg = hitTestSegment(event.clientX, event.clientY, id);
           if (seg) {
             const framing = parseWallFraming(measurement.framing_json);
@@ -3706,7 +3715,7 @@ export function ViewerCanvas({
       <div style={{ position: "fixed", inset: 0, zIndex: 1300, display: "grid", placeItems: "center", background: "rgba(0,0,0,0.55)" }} onClick={() => setWall3dId(null)}>
         <div onClick={(e) => e.stopPropagation()} style={{ width: "82vw", height: "82vh", background: "#dfe4ea", border: "1px solid var(--border-divider)", boxShadow: "0 18px 48px rgba(0,0,0,0.5)", display: "flex", flexDirection: "column", overflow: "hidden" }}>
           <div style={{ height: 34, display: "flex", alignItems: "center", padding: "0 12px", background: "var(--bg-ribbon)", color: "var(--text-primary)", fontSize: 13, fontWeight: 600 }}>
-            Wall in 3D
+            View in 3D
             <button onClick={() => setWall3dId(null)} style={{ marginLeft: "auto", width: 24, height: 24, background: "transparent", color: "var(--text-primary)", border: "none", cursor: "pointer", fontSize: 16 }}>×</button>
           </div>
           <div style={{ flex: 1, minHeight: 0 }}>
@@ -3718,11 +3727,38 @@ export function ViewerCanvas({
               } catch {
                 pts = null;
               }
-              if (!m || !Array.isArray(pts)) return null;
-              const settings = parseFramingSettings(groupProps[m.dimension_group_id]?.framing_props_json ?? null);
+              if (!m || !Array.isArray(pts) || pts.length < 1) return null;
+              const props = groupProps[m.dimension_group_id];
               const mmpp = pageScale?.mm_per_point ?? null;
-              const offsetM = groupProps[m.dimension_group_id]?.default_offset ?? 0;
-              const members = offsetMembers(computeWall3D(pts, settings, mmpp, parseWallFraming(m.framing_json)), offsetM);
+              const offsetM = props?.default_offset ?? 0;
+              const negative = (m.polarity ?? 1) < 0;
+              const color = negative ? props?.neg_colour ?? "#FF0000" : props?.pos_colour ?? "#4A9EFF";
+              let members: Member3D[] = [];
+              let areas: AreaMesh3D[] = [];
+              if (m.measurement_type === "timber_framing" && pts.length >= 2) {
+                const settings = parseFramingSettings(props?.framing_props_json ?? null);
+                members = offsetMembers(computeWall3D(pts, settings, mmpp, parseWallFraming(m.framing_json)), offsetM);
+              } else if (m.measurement_type === "count") {
+                const marker = computeCountMarker3D(pts[0], mmpp, {
+                  widthM: props?.default_width ?? 0,
+                  heightM: props?.default_height ?? 0,
+                  countType: props?.count_type ?? "marker",
+                  offsetM,
+                  color,
+                });
+                if (marker) members = [marker];
+              } else if (m.measurement_type === "area" && pts.length >= 3) {
+                const mesh = computeAreaMesh3D(pts, mmpp, { heightM: props?.default_height ?? 0, offsetM, color });
+                if (mesh) areas = [mesh];
+              } else if ((m.measurement_type === "length" || m.measurement_type === "array") && pts.length >= 2) {
+                members = computeLengthMembers3D(pts, mmpp, {
+                  widthM: props?.default_width ?? 0,
+                  heightM: props?.default_height ?? 0,
+                  offsetM,
+                  color,
+                  display: props?.default_display ?? "length",
+                });
+              }
               const page3d = doc?.pages[m.page_index] ?? null;
               const S = mmpp ? mmpp / 1000 : null;
               const pageWidthM = S && page3d ? page3d.width_pts * S : undefined;
@@ -3734,7 +3770,7 @@ export function ViewerCanvas({
               const previewUrl = previewEntry?.image_path
                 ? convertFileSrc(previewEntry.image_path)
                 : undefined;
-              return <Framing3DView members={members} pageWidthM={pageWidthM} pageHeightM={pageHeightM} previewUrl={previewUrl} />;
+              return <Framing3DView members={members} areas={areas} pageWidthM={pageWidthM} pageHeightM={pageHeightM} previewUrl={previewUrl} />;
             })()}
           </div>
         </div>

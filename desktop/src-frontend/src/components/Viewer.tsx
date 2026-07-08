@@ -7,7 +7,15 @@ import { FramingBreakdownPanel } from "./FramingBreakdownPanel";
 import { OpeningDialog } from "./OpeningDialog";
 import { Framing3DView, type Framing3DPage } from "./Framing3DView";
 import { DEFAULT_DOOR, DEFAULT_WINDOW, parseFramingSettings, parseWallFraming, type OpeningTemplate } from "../lib/framing";
-import { computeWall3D, offsetMembers, type Member3D } from "../lib/framing3d";
+import {
+  computeAreaMesh3D,
+  computeCountMarker3D,
+  computeLengthMembers3D,
+  computeWall3D,
+  offsetMembers,
+  type AreaMesh3D,
+  type Member3D,
+} from "../lib/framing3d";
 
 export function Viewer() {
   const [doc, setDoc] = useState<DocumentMeta | null>(null);
@@ -59,27 +67,59 @@ export function Viewer() {
   const pageWidthM3d = S3d && currentPage3d ? currentPage3d.width_pts * S3d : undefined;
   const pageHeightM3d = S3d && currentPage3d ? currentPage3d.height_pts * S3d : undefined;
 
-  // 3D members for the framing walls on the displayed page.
-  const members3d = useMemo<Member3D[]>(() => {
-    if (!view3d) return [];
+  // 3D geometry for every measurement on the displayed page — timber-framing walls go through
+  // computeWall3D (the shared 2D/3D member model); count/length/area groups go through the
+  // generic builders, coloured by the group's own positive/negative colour (same colours the
+  // 2D canvas uses for that measurement).
+  const { members3d, areas3d } = useMemo(() => {
+    if (!view3d) return { members3d: [] as Member3D[], areas3d: [] as AreaMesh3D[] };
     const mmpp = pageScale?.mm_per_point ?? null;
-    const out: Member3D[] = [];
+    const members: Member3D[] = [];
+    const areas: AreaMesh3D[] = [];
     for (const mz of overlayMeasurements) {
-      if (mz.measurement_type !== "timber_framing" || mz.page_index !== pageIndex) continue;
+      if (mz.page_index !== pageIndex) continue;
       let pts: { x: number; y: number }[];
       try {
         pts = JSON.parse(mz.geometry_json);
       } catch {
         continue;
       }
-      if (!Array.isArray(pts) || pts.length < 2) continue;
-      const settings = parseFramingSettings(groupProps[mz.dimension_group_id]?.framing_props_json ?? null);
-      const offsetM = groupProps[mz.dimension_group_id]?.default_offset ?? 0;
-      out.push(...offsetMembers(computeWall3D(pts, settings, mmpp, parseWallFraming(mz.framing_json)), offsetM));
+      if (!Array.isArray(pts) || pts.length < 1) continue;
+      const props = groupProps[mz.dimension_group_id];
+      const offsetM = props?.default_offset ?? 0;
+      const negative = (mz.polarity ?? 1) < 0;
+      const color = negative ? props?.neg_colour ?? "#FF0000" : props?.pos_colour ?? "#4A9EFF";
+      if (mz.measurement_type === "timber_framing") {
+        if (pts.length < 2) continue;
+        const settings = parseFramingSettings(props?.framing_props_json ?? null);
+        members.push(...offsetMembers(computeWall3D(pts, settings, mmpp, parseWallFraming(mz.framing_json)), offsetM));
+      } else if (mz.measurement_type === "count") {
+        const marker = computeCountMarker3D(pts[0], mmpp, {
+          widthM: props?.default_width ?? 0,
+          heightM: props?.default_height ?? 0,
+          countType: props?.count_type ?? "marker",
+          offsetM,
+          color,
+        });
+        if (marker) members.push(marker);
+      } else if (mz.measurement_type === "area") {
+        const mesh = computeAreaMesh3D(pts, mmpp, { heightM: props?.default_height ?? 0, offsetM, color });
+        if (mesh) areas.push(mesh);
+      } else if (mz.measurement_type === "length" || mz.measurement_type === "array") {
+        members.push(
+          ...computeLengthMembers3D(pts, mmpp, {
+            widthM: props?.default_width ?? 0,
+            heightM: props?.default_height ?? 0,
+            offsetM,
+            color,
+            display: props?.default_display ?? "length",
+          }),
+        );
+      }
     }
-    return out;
+    return { members3d: members, areas3d: areas };
   }, [view3d, overlayMeasurements, groupProps, pageScale, pageIndex]);
-  // 3D scene pages for the multi-page view: each included page's framing members, offset
+  // 3D scene pages for the multi-page view: each included page's measurement geometry, offset
   // along world Y by its configured Z-offset. The PDF page is never rendered as a ground
   // plane here — with no offset specified every page sits at world Y=0, so any ground
   // plane would Z-fight with every other page's ground plane at that same level.
@@ -88,7 +128,8 @@ export function Viewer() {
     return multiPage3DConfig.pages
       .filter((p) => p.included)
       .map((p) => {
-        const out: Member3D[] = [];
+        const members: Member3D[] = [];
+        const areas: AreaMesh3D[] = [];
         for (const g of p.groups) {
           if (!g.included) continue;
           const settings = parseFramingSettings(g.framingPropsJson);
@@ -99,12 +140,40 @@ export function Viewer() {
             } catch {
               continue;
             }
-            if (!Array.isArray(pts) || pts.length < 2) continue;
-            out.push(...offsetMembers(computeWall3D(pts, settings, p.mmPerPoint, parseWallFraming(mz.framing_json)), g.defaultOffsetM));
+            if (!Array.isArray(pts) || pts.length < 1) continue;
+            const negative = (mz.polarity ?? 1) < 0;
+            const color = negative ? g.negColour : g.posColour;
+            if (g.measurementType === "timber_framing") {
+              if (pts.length < 2) continue;
+              members.push(...offsetMembers(computeWall3D(pts, settings, p.mmPerPoint, parseWallFraming(mz.framing_json)), g.defaultOffsetM));
+            } else if (g.measurementType === "count") {
+              const marker = computeCountMarker3D(pts[0], p.mmPerPoint, {
+                widthM: g.defaultWidthM,
+                heightM: g.defaultHeightM,
+                countType: g.countType,
+                offsetM: g.defaultOffsetM,
+                color,
+              });
+              if (marker) members.push(marker);
+            } else if (g.measurementType === "area") {
+              const mesh = computeAreaMesh3D(pts, p.mmPerPoint, { heightM: g.defaultHeightM, offsetM: g.defaultOffsetM, color });
+              if (mesh) areas.push(mesh);
+            } else if (g.measurementType === "length" || g.measurementType === "array") {
+              members.push(
+                ...computeLengthMembers3D(pts, p.mmPerPoint, {
+                  widthM: g.defaultWidthM,
+                  heightM: g.defaultHeightM,
+                  offsetM: g.defaultOffsetM,
+                  color,
+                  display: g.defaultDisplay,
+                }),
+              );
+            }
           }
         }
         return {
-          members: out,
+          members,
+          areas,
           offsetM: p.offsetM,
           showGround: false,
         };
@@ -366,18 +435,24 @@ export function Viewer() {
       <div style={{ flex: 1, minHeight: 0, position: "relative", display: "flex", flexDirection: "column" }}>
         {view3d ? (
           view3dMulti && multiPage3DConfig ? (
-            pages3d.some((p) => p.members.length > 0) ? (
+            pages3d.some((p) => p.members.length > 0 || (p.areas?.length ?? 0) > 0) ? (
               <Framing3DView members={[]} pages={pages3d} />
             ) : (
               <div style={{ flex: 1, display: "grid", placeItems: "center", background: "#dfe4ea", color: "#5a636c", fontSize: 13 }}>
-                No timber framing found on the selected pages.
+                No measurements found on the selected pages.
               </div>
             )
-          ) : members3d.length > 0 ? (
-            <Framing3DView members={members3d} pageWidthM={pageWidthM3d} pageHeightM={pageHeightM3d} previewUrl={previewUrl3d} />
+          ) : members3d.length > 0 || areas3d.length > 0 ? (
+            <Framing3DView
+              members={members3d}
+              areas={areas3d}
+              pageWidthM={pageWidthM3d}
+              pageHeightM={pageHeightM3d}
+              previewUrl={previewUrl3d}
+            />
           ) : (
             <div style={{ flex: 1, display: "grid", placeItems: "center", background: "#dfe4ea", color: "#5a636c", fontSize: 13 }}>
-              No timber framing on this page to show in 3D (draw a wall on a scaled page).
+              No measurements on this page to show in 3D (draw a measurement on a scaled page).
             </div>
           )
         ) : (

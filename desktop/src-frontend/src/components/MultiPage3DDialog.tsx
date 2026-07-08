@@ -14,9 +14,9 @@ const inputStyle: React.CSSProperties = {
   fontSize: 12,
 };
 
-/** Setup dialog for "View Multiple Pages...": pick which pages (and which timber-framing
- *  dimension groups on each) to combine into one 3D scene, with a per-page Z-offset
- *  (storey height) and a drag-and-drop draw order. */
+/** Setup dialog for "View Multiple Pages...": pick which pages (and which dimension groups
+ *  on each) to combine into one 3D scene, with a per-page Z-offset (storey height) and a
+ *  drag-and-drop draw order. */
 export function MultiPage3DDialog({ onCancel }: { onCancel: () => void }) {
   const loadMultiPage3DSetup = useAppStore((state) => state.loadMultiPage3DSetup);
   const setMultiPage3DConfig = useAppStore((state) => state.setMultiPage3DConfig);
@@ -105,16 +105,16 @@ export function MultiPage3DDialog({ onCancel }: { onCancel: () => void }) {
     >
       <div style={{ overflowY: "auto", padding: 14, flex: 1, minHeight: 0 }}>
         {pages === null ? (
-          <div style={{ color: theme.text.secondary, fontSize: 12 }}>Scanning drawing for timber framing…</div>
+          <div style={{ color: theme.text.secondary, fontSize: 12 }}>Scanning drawing for measurements…</div>
         ) : pages.length === 0 ? (
           <div style={{ color: theme.text.secondary, fontSize: 12 }}>
-            No timber framing dimension groups were found on any page of this drawing.
+            No dimension groups with measurements were found on any page of this drawing.
           </div>
         ) : (
           <>
             <div style={{ color: theme.text.secondary, fontSize: 11, marginBottom: 10 }}>
               Drag rows to set the stacking order (top = highest). Set a Z-offset per page to position each
-              storey's framing — pages at offset 0 also show the drawing as a floor plan; pages above 0 hide it.
+              storey's measurements — pages at offset 0 also show the drawing as a floor plan; pages above 0 hide it.
             </div>
             <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
               {pages.map((page, index) => (
@@ -146,7 +146,7 @@ export function MultiPage3DDialog({ onCancel }: { onCancel: () => void }) {
                     />
                     <span style={{ fontSize: 12, fontWeight: 600, minWidth: 64 }}>{page.label}</span>
                     <span style={{ flex: 1, fontSize: 11, color: theme.text.secondary }}>
-                      {page.groups.length} framing group{page.groups.length === 1 ? "" : "s"}
+                      {page.groups.length} group{page.groups.length === 1 ? "" : "s"}
                     </span>
                     <span style={{ fontSize: 11, color: theme.text.secondary }}>Z offset</span>
                     <input
