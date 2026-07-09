@@ -1,16 +1,18 @@
+use lru::LruCache;
 use parking_lot::Mutex;
 use pdf_core::pdf::document::DocumentMeta;
 use pdf_core::pdf::tile_manager::{TileData, TileKey, TileManager, TileQueueState, TILE_SIZE_PX};
-use pdf_core::render::worker::{create_tile_manager_with_workers, PreviewData};
+use pdf_core::render::worker::{create_tile_manager, PreviewData};
 use pdf_core::viewport::state::ViewportState;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
-use std::io::{BufRead, BufReader, Write};
+use std::collections::HashSet;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 use tokio::sync::mpsc;
 
 mod bridge;
@@ -29,14 +31,133 @@ pub struct AppState {
     pub startup_file: Option<String>,
     pub open_document: Arc<Mutex<Option<DocumentMeta>>>,
     pub tile_manager: Arc<TileManager>,
-    pub render_context: Arc<Mutex<Option<(u32, u8)>>>,
     pub active_project: Arc<Mutex<Option<ActiveProject>>>,
     pub recent_projects: Arc<Mutex<Vec<RecentProject>>>,
     pub registry_db: SqlitePool,
+    /// Dedicated to meta/preview/vectors — kept off the tile pool so a vector-extraction
+    /// request (fired on every page open) can't stall the tile pipeline behind it.
     pub renderer: Arc<Mutex<Option<RendererService>>>,
+    /// Pool of renderer processes dedicated to tile rendering; jobs are distributed
+    /// round-robin by `run_tile_render_worker`. Sized by TILE_RENDERER_POOL_SIZE.
+    pub tile_renderer_pool: Vec<Arc<Mutex<Option<RendererService>>>>,
     pub tile_render_tx: mpsc::UnboundedSender<TileRenderJob>,
     pub next_tile_batch: AtomicU64,
+    pub tile_store: Arc<TileStore>,
+    /// Keys from the most recent `update_viewport` call. The tile worker drops a
+    /// popped job whose key has fallen out of this set — the user has panned away
+    /// from it — instead of spending a render on a tile nothing wants anymore.
+    pub visible_tile_keys: Arc<Mutex<HashSet<TileKey>>>,
+    pub settle_store: Arc<SettleStore>,
     pub bridge: SharedBridge,
+}
+
+/// Holds the single most recent Bluebeam-parity "settle pass" image — a pixel-exact
+/// render of the current viewport at `zoom * devicePixelRatio` DPI, requested once
+/// pan/zoom has been idle for a beat (see `render_settle_view` and
+/// `ViewerCanvas.tsx`'s settle effect). Unlike `TileStore` there's only ever one
+/// current entry: a new settle render fully replaces the old one rather than being
+/// cached alongside it, since a stale settle image is worthless the moment the
+/// viewport moves again.
+pub struct SettleStore {
+    entry: Mutex<Option<(String, Arc<Vec<u8>>)>>,
+}
+
+impl SettleStore {
+    pub fn new() -> Self {
+        Self {
+            entry: Mutex::new(None),
+        }
+    }
+
+    pub fn insert(&self, key: String, bytes: Vec<u8>) {
+        *self.entry.lock() = Some((key, Arc::new(bytes)));
+    }
+
+    pub fn get(&self, key: &str) -> Option<Arc<Vec<u8>>> {
+        self.entry
+            .lock()
+            .as_ref()
+            .filter(|(existing_key, _)| existing_key == key)
+            .map(|(_, bytes)| Arc::clone(bytes))
+    }
+
+    pub fn clear(&self) {
+        *self.entry.lock() = None;
+    }
+}
+
+impl Default for SettleStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// In-memory store of rendered tile PNGs, keyed by the tile id carried in
+/// `TileData::image_path`. The frontend fetches entries through the `tile` URI
+/// scheme (`http://tile.localhost/<key>` in WebView2), so tiles never touch disk.
+///
+/// Bounded by total byte size rather than entry count: tile PNGs vary from a few KB
+/// (blank/sparse areas) to ~150 KB (dense linework), so a fixed entry cap either wastes
+/// memory or evicts too early depending on drawing content. `update_viewport` re-queues
+/// on a store miss, so an entry aged out of `TileStore` but still present in the
+/// `TileManager` metadata LRU just costs a re-render, not a correctness bug.
+pub struct TileStore {
+    entries: Mutex<LruCache<String, Arc<Vec<u8>>>>,
+    total_bytes: Mutex<usize>,
+}
+
+const MAX_STORE_BYTES: usize = 200 * 1024 * 1024;
+
+impl TileStore {
+    pub fn new() -> Self {
+        Self {
+            // `LruCache::new(cap)` pre-reserves a HashMap of that capacity — passing a
+            // large number as a stand-in for "unbounded" tries to allocate room for
+            // billions of entries upfront. `unbounded()` skips that reservation; `insert`
+            // enforces the real, byte-budget limit instead of an entry-count cap.
+            entries: Mutex::new(LruCache::unbounded()),
+            total_bytes: Mutex::new(0),
+        }
+    }
+
+    pub fn insert(&self, key: String, bytes: Vec<u8>) {
+        let size = bytes.len();
+        let mut entries = self.entries.lock();
+        let mut total = self.total_bytes.lock();
+
+        if let Some(replaced) = entries.put(key, Arc::new(bytes)) {
+            *total -= replaced.len();
+        }
+        *total += size;
+
+        while *total > MAX_STORE_BYTES {
+            let Some((_, evicted)) = entries.pop_lru() else {
+                break;
+            };
+            *total -= evicted.len();
+        }
+    }
+
+    pub fn get(&self, key: &str) -> Option<Arc<Vec<u8>>> {
+        self.entries.lock().get(key).cloned()
+    }
+
+    /// Checks presence and refreshes LRU recency, keeping store eviction order
+    /// aligned with the TileManager metadata cache on hits.
+    pub fn contains(&self, key: &str) -> bool {
+        self.entries.lock().get(key).is_some()
+    }
+
+    pub fn clear(&self) {
+        self.entries.lock().clear();
+        *self.total_bytes.lock() = 0;
+    }
+}
+
+impl Default for TileStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Delivers a frontend reply back to the awaiting Excel-bridge HTTP request.
@@ -52,7 +173,6 @@ pub struct TileRenderJob {
     generation: u64,
     dpi: f32,
     pdf_path: String,
-    cache_dir: String,
     batch_id: u64,
     order: usize,
 }
@@ -99,7 +219,13 @@ impl RendererService {
         })
     }
 
-    pub fn request(&mut self, mut payload: serde_json::Value) -> Result<serde_json::Value, String> {
+    /// Sends a request and returns the response `data` plus an optional binary
+    /// payload. When the response line carries a `bin` byte count, exactly that
+    /// many raw bytes follow the newline on the renderer's stdout.
+    pub fn request(
+        &mut self,
+        mut payload: serde_json::Value,
+    ) -> Result<(serde_json::Value, Option<Vec<u8>>), String> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         payload["id"] = serde_json::json!(id);
 
@@ -124,9 +250,19 @@ impl RendererService {
 
             let response: serde_json::Value = serde_json::from_str(response_line.trim())
                 .map_err(|e| format!("Response parse error: {e}"))?;
+            let binary = match response["bin"].as_u64() {
+                Some(len) => {
+                    let mut bytes = vec![0u8; len as usize];
+                    self.stdout
+                        .read_exact(&mut bytes)
+                        .map_err(|e| format!("Renderer binary read error: {e}"))?;
+                    Some(bytes)
+                }
+                None => None,
+            };
             if response["id"].as_u64() == Some(id) {
                 if response["ok"].as_bool() == Some(true) {
-                    return Ok(response["data"].clone());
+                    return Ok((response["data"].clone(), binary));
                 }
                 return Err(response["error"]
                     .as_str()
@@ -366,7 +502,7 @@ fn load_document_meta_via_renderer(
         "pdf_path": document_path,
     });
 
-    let data = {
+    let (data, _) = {
         let mut renderer = renderer.lock();
         renderer
             .as_mut()
@@ -499,8 +635,9 @@ async fn close_project(state: State<'_, AppState>) -> Result<(), String> {
     }
     *state.active_project.lock() = None;
     *state.open_document.lock() = None;
-    *state.render_context.lock() = None;
     state.tile_manager.clear();
+    state.tile_store.clear();
+    state.settle_store.clear();
     let _ = std::fs::remove_dir_all(&state.tile_cache_dir);
     let _ = std::fs::create_dir_all(&state.tile_cache_dir);
     refresh_recent_projects(state.inner()).await?;
@@ -866,8 +1003,9 @@ fn open_document(path: String, state: State<'_, AppState>) -> Result<DocumentMet
     *state.open_document.lock() = Some(meta.clone());
     let _ = std::fs::remove_dir_all(&state.tile_cache_dir);
     let _ = std::fs::create_dir_all(&state.tile_cache_dir);
-    *state.render_context.lock() = None;
     state.tile_manager.clear();
+    state.tile_store.clear();
+    state.settle_store.clear();
     Ok(meta)
 }
 
@@ -884,7 +1022,7 @@ async fn get_page_vectors(
     };
     let renderer = Arc::clone(&state.renderer);
 
-    let data = tauri::async_runtime::spawn_blocking(move || {
+    let (data, _) = tauri::async_runtime::spawn_blocking(move || {
         let request = serde_json::json!({
             "cmd": "vectors",
             "pdf_path": doc_path,
@@ -920,12 +1058,14 @@ async fn render_preview(
     };
     let renderer = Arc::clone(&state.renderer);
 
-    let data = tauri::async_runtime::spawn_blocking(move || {
+    let (data, _) = tauri::async_runtime::spawn_blocking(move || {
         let request = serde_json::json!({
             "cmd": "preview",
             "pdf_path": doc_path,
             "page": page_index,
-            "max_dim": 1200,
+            // Cheap after R1 (document/page caching removed the reparse-per-call cost);
+            // a bigger underlay means less visible upscale smear while tiles fill in.
+            "max_dim": 2400,
             "output_path": output_path,
         });
 
@@ -958,15 +1098,12 @@ fn update_viewport(
         .pages
         .get(viewport.page_index as usize)
         .ok_or("Page not found")?;
+    // Note: generation only advances on document change (open_document/close_project).
+    // A TileKey already encodes (page, zoom_level, x, y), so switching page or crossing
+    // a zoom-bucket boundary does not invalidate any cached tile's pixel content —
+    // advancing generation here used to throw away and re-render valid in-flight and
+    // cached work every time the user zoomed through a bucket edge.
     let zoom_level = ViewportState::zoom_bucket(viewport.zoom);
-    {
-        let mut render_context = state.render_context.lock();
-        let next_context = (viewport.page_index, zoom_level);
-        if render_context.as_ref() != Some(&next_context) {
-            state.tile_manager.advance_generation();
-            *render_context = Some(next_context);
-        }
-    }
 
     let bucket_zoom = ViewportState::bucket_zoom(zoom_level);
     let display_scale = viewport.zoom / bucket_zoom;
@@ -981,14 +1118,24 @@ fn update_viewport(
     let page_width_px = bucket_viewport.page_width_px(page.width_pts);
     let page_height_px = bucket_viewport.page_height_px(page.height_pts);
 
-    state.tile_manager.drain_completed();
-
     let keys = bucket_viewport.visible_tiles(page_width_px, page_height_px);
+    *state.visible_tile_keys.lock() = keys.iter().copied().collect();
     let batch_id = state.next_tile_batch.fetch_add(1, Ordering::SeqCst);
 
     let mut tiles = Vec::new();
     for (order, key) in keys.into_iter().enumerate() {
-        match state.tile_manager.get_cached_or_mark_queued(key) {
+        let mut queue_state = state.tile_manager.get_cached_or_mark_queued(key);
+        if let TileQueueState::Cached(tile) = &queue_state {
+            // Metadata and byte store can age out independently; a cached TileData
+            // without backing bytes is a dead reference — evict and re-queue.
+            if state.tile_store.contains(&tile.image_path) {
+                tiles.push(tile.clone());
+                continue;
+            }
+            state.tile_manager.evict(&key);
+            queue_state = state.tile_manager.get_cached_or_mark_queued(key);
+        }
+        match queue_state {
             TileQueueState::Cached(tile) => tiles.push(tile),
             TileQueueState::Queued { generation, dpi }
             | TileQueueState::AlreadyQueued { generation, dpi } => {
@@ -997,7 +1144,6 @@ fn update_viewport(
                     generation,
                     dpi,
                     pdf_path: doc.path.clone(),
-                    cache_dir: state.tile_cache_dir.clone(),
                     batch_id,
                     order,
                 });
@@ -1008,23 +1154,141 @@ fn update_viewport(
     Ok(tiles)
 }
 
+/// Viewport state for a settle-pass request. Mirrors `ViewportState` (page/zoom/pan/
+/// size) plus the device pixel ratio the tile-based `ViewportState` doesn't need,
+/// since tiles are rendered at bucketed, dpr-independent DPIs.
+#[derive(serde::Deserialize)]
+struct SettleViewportState {
+    page_index: u32,
+    zoom: f64,
+    pan_x: f64,
+    pan_y: f64,
+    width: u32,
+    height: u32,
+    device_pixel_ratio: f64,
+}
+
+const SETTLE_VIEW_STORE_KEY: &str = "settle_view";
+
+#[derive(serde::Serialize)]
+struct SettleViewMeta {
+    key: String,
+    width: u32,
+    height: u32,
+    crop_x: u32,
+    crop_y: u32,
+    dpi: f32,
+}
+
+/// Bluebeam-parity settle pass: a pixel-exact render of the current viewport at
+/// `zoom * devicePixelRatio` DPI, requested once pan/zoom/page has been idle for a
+/// beat. Returns `None` when the page isn't actually visible in the viewport (fully
+/// panned off-screen) — nothing to render or show in that case.
+#[tauri::command]
+async fn render_settle_view(
+    viewport: SettleViewportState,
+    state: State<'_, AppState>,
+) -> Result<Option<SettleViewMeta>, String> {
+    let doc = state
+        .open_document
+        .lock()
+        .as_ref()
+        .ok_or("No document open")?
+        .clone();
+    let page = doc
+        .pages
+        .get(viewport.page_index as usize)
+        .ok_or("Page not found")?;
+
+    let dpi = (96.0 * viewport.zoom * viewport.device_pixel_ratio) as f32;
+    let scale = dpi as f64 / 72.0;
+    let page_width_px = (page.width_pts * scale).ceil().max(1.0);
+    let page_height_px = (page.height_pts * scale).ceil().max(1.0);
+
+    let vp_left = viewport.pan_x * viewport.device_pixel_ratio;
+    let vp_top = viewport.pan_y * viewport.device_pixel_ratio;
+    let vp_right = vp_left + viewport.width as f64 * viewport.device_pixel_ratio;
+    let vp_bottom = vp_top + viewport.height as f64 * viewport.device_pixel_ratio;
+
+    let crop_left = vp_left.max(0.0).min(page_width_px);
+    let crop_top = vp_top.max(0.0).min(page_height_px);
+    let crop_right = vp_right.max(0.0).min(page_width_px);
+    let crop_bottom = vp_bottom.max(0.0).min(page_height_px);
+
+    if crop_right <= crop_left || crop_bottom <= crop_top {
+        return Ok(None);
+    }
+
+    let crop_x = crop_left.floor() as u32;
+    let crop_y = crop_top.floor() as u32;
+    let crop_w = (crop_right.ceil() - crop_left.floor()).max(1.0) as u32;
+    let crop_h = (crop_bottom.ceil() - crop_top.floor()).max(1.0) as u32;
+
+    // Routed through the tile pool (not the dedicated meta/preview/vectors renderer)
+    // so a settle request never contends with vector extraction on page open; by the
+    // time a settle pass fires (after a pan/zoom pause), tiles for this page have
+    // typically already warmed that slot's R1 document/page cache.
+    let renderer = Arc::clone(&state.tile_renderer_pool[0]);
+    let pdf_path = doc.path.clone();
+    let page_index = viewport.page_index;
+
+    let (data, binary) = tauri::async_runtime::spawn_blocking(move || {
+        let request = serde_json::json!({
+            "cmd": "view",
+            "pdf_path": pdf_path,
+            "page": page_index,
+            "dpi": dpi,
+            "crop_x": crop_x,
+            "crop_y": crop_y,
+            "crop_w": crop_w,
+            "crop_h": crop_h,
+        });
+        let mut renderer = renderer.lock();
+        renderer
+            .as_mut()
+            .ok_or("Renderer not running")?
+            .request(request)
+    })
+    .await
+    .map_err(|e| format!("Settle view worker failed: {e}"))??;
+
+    let png_bytes = binary.ok_or("Settle view response missing binary payload")?;
+    let width = data["width"].as_u64().unwrap_or(crop_w as u64) as u32;
+    let height = data["height"].as_u64().unwrap_or(crop_h as u64) as u32;
+
+    state
+        .settle_store
+        .insert(SETTLE_VIEW_STORE_KEY.to_string(), png_bytes);
+
+    Ok(Some(SettleViewMeta {
+        key: SETTLE_VIEW_STORE_KEY.to_string(),
+        width,
+        height,
+        crop_x,
+        crop_y,
+        dpi,
+    }))
+}
+
+/// Stable store key for a tile. Generation is deliberately excluded: a TileKey fully
+/// determines pixel content for a given document, and the store is cleared whenever
+/// the open document changes.
+fn tile_store_key(key: &TileKey) -> String {
+    format!(
+        "p{}_z{}_x{}_y{}.png",
+        key.page, key.zoom_level, key.tile_x, key.tile_y
+    )
+}
+
 fn render_tile_via_renderer(
     renderer: Arc<Mutex<Option<RendererService>>>,
     key: TileKey,
     generation: u64,
     dpi: f32,
     pdf_path: String,
-    cache_dir: String,
-) -> Result<TileData, String> {
+) -> Result<(TileData, Vec<u8>), String> {
     let tile_px_x = key.tile_x * TILE_SIZE_PX;
     let tile_px_y = key.tile_y * TILE_SIZE_PX;
-    let image_path = Path::new(&cache_dir)
-        .join(format!(
-            "g{}_p{}_z{}_x{}_y{}.png",
-            generation, key.page, key.zoom_level, key.tile_x, key.tile_y
-        ))
-        .to_string_lossy()
-        .to_string();
 
     let request = serde_json::json!({
         "cmd": "tile",
@@ -1033,33 +1297,47 @@ fn render_tile_via_renderer(
         "dpi": dpi,
         "tile_x": key.tile_x,
         "tile_y": key.tile_y,
-        "output_path": image_path,
         "generation": generation,
     });
 
-    {
+    let (_, binary) = {
         let mut renderer = renderer.lock();
         renderer
             .as_mut()
             .ok_or("Renderer not running")?
-            .request(request)?;
-    }
+            .request(request)?
+    };
+    let png_bytes = binary.ok_or("Tile response missing binary payload")?;
 
-    Ok(TileData {
-        key,
-        image_path,
-        x: tile_px_x,
-        y: tile_px_y,
-        generation,
-    })
+    Ok((
+        TileData {
+            key,
+            image_path: tile_store_key(&key),
+            x: tile_px_x,
+            y: tile_px_y,
+            generation,
+        },
+        png_bytes,
+    ))
 }
 
+/// Dispatches tile jobs across a pool of renderer processes. This stays a single
+/// consumer of `rx` (so the existing dedup/priority logic in `upsert_pending_tile_job`
+/// / `pop_next_tile_job` keeps working on one coherent queue), but the render itself is
+/// spawned as its own task against a round-robin pool slot instead of being awaited
+/// inline — so the dispatcher immediately moves on to the next job instead of blocking
+/// the whole pipeline behind one render. Total concurrency is naturally capped at the
+/// pool size, since jobs assigned to the same slot still queue on that slot's mutex.
 async fn run_tile_render_worker(
     mut rx: mpsc::UnboundedReceiver<TileRenderJob>,
-    renderer: Arc<Mutex<Option<RendererService>>>,
+    renderer_pool: Vec<Arc<Mutex<Option<RendererService>>>>,
     tile_manager: Arc<TileManager>,
+    tile_store: Arc<TileStore>,
+    visible_tile_keys: Arc<Mutex<HashSet<TileKey>>>,
+    app_handle: tauri::AppHandle,
 ) {
     let mut pending = Vec::<TileRenderJob>::new();
+    let mut next_slot = 0usize;
 
     loop {
         if pending.is_empty() {
@@ -1087,30 +1365,45 @@ async fn run_tile_render_worker(
             continue;
         }
 
-        let renderer = Arc::clone(&renderer);
+        // The viewport may have moved on since this job was queued; don't spend a
+        // render on a tile nothing currently wants.
+        if !visible_tile_keys.lock().contains(&job.key) {
+            tile_manager.fail_render(&job.key);
+            continue;
+        }
+
+        let renderer = Arc::clone(&renderer_pool[next_slot % renderer_pool.len()]);
+        next_slot = next_slot.wrapping_add(1);
         let key = job.key;
         let generation = job.generation;
-        let result = tauri::async_runtime::spawn_blocking(move || {
-            render_tile_via_renderer(
-                renderer,
-                key,
-                generation,
-                job.dpi,
-                job.pdf_path,
-                job.cache_dir,
-            )
-        })
-        .await
-        .map_err(|e| format!("Tile worker failed: {e}"))
-        .and_then(|result| result);
+        let tile_manager = Arc::clone(&tile_manager);
+        let tile_store = Arc::clone(&tile_store);
+        let app_handle = app_handle.clone();
 
-        match result {
-            Ok(tile) => tile_manager.complete_render(tile),
-            Err(error) => {
-                tile_manager.fail_render(&key);
-                tracing::error!("Tile render failed: {}", error);
+        tauri::async_runtime::spawn(async move {
+            let result = tauri::async_runtime::spawn_blocking(move || {
+                render_tile_via_renderer(renderer, key, generation, job.dpi, job.pdf_path)
+            })
+            .await
+            .map_err(|e| format!("Tile worker failed: {e}"))
+            .and_then(|result| result);
+
+            match result {
+                Ok((tile, png_bytes)) => {
+                    // Bytes must land in the store before the frontend hears about the
+                    // tile, or its fetch would race a missing entry.
+                    tile_store.insert(tile.image_path.clone(), png_bytes);
+                    tile_manager.complete_render(tile.clone());
+                    if let Err(error) = app_handle.emit("tile-rendered", &tile) {
+                        tracing::error!("Tile event emit failed: {}", error);
+                    }
+                }
+                Err(error) => {
+                    tile_manager.fail_render(&key);
+                    tracing::error!("Tile render failed: {}", error);
+                }
             }
-        }
+        });
     }
 }
 
@@ -1143,11 +1436,6 @@ fn pop_next_tile_job(pending: &mut Vec<TileRenderJob>) -> Option<TileRenderJob> 
     }
 
     best_index.map(|index| pending.swap_remove(index))
-}
-
-#[tauri::command]
-fn poll_tiles(state: State<'_, AppState>) -> Result<Vec<TileData>, String> {
-    Ok(state.tile_manager.drain_completed())
 }
 
 #[tauri::command]
@@ -4510,6 +4798,55 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        // Serves rendered tile PNGs from the in-memory store. The webview fetches
+        // http://tile.localhost/<key> (WebView2 maps custom schemes to
+        // http://<scheme>.localhost), so tiles never touch disk. The ACAO header is
+        // required because the app origin differs from the tile origin.
+        .register_uri_scheme_protocol("tile", |ctx, request| {
+            let not_found = || {
+                tauri::http::Response::builder()
+                    .status(404)
+                    .header("Access-Control-Allow-Origin", "*")
+                    .body(Vec::new())
+                    .unwrap()
+            };
+            let Some(state) = ctx.app_handle().try_state::<AppState>() else {
+                return not_found();
+            };
+            let key = request.uri().path().trim_start_matches('/');
+            match state.tile_store.get(key) {
+                Some(bytes) => tauri::http::Response::builder()
+                    .status(200)
+                    .header("Content-Type", "image/png")
+                    .header("Access-Control-Allow-Origin", "*")
+                    .body(bytes.as_ref().clone())
+                    .unwrap(),
+                None => not_found(),
+            }
+        })
+        // Serves the current settle-pass PNG (see SettleStore / render_settle_view).
+        .register_uri_scheme_protocol("settle", |ctx, request| {
+            let not_found = || {
+                tauri::http::Response::builder()
+                    .status(404)
+                    .header("Access-Control-Allow-Origin", "*")
+                    .body(Vec::new())
+                    .unwrap()
+            };
+            let Some(state) = ctx.app_handle().try_state::<AppState>() else {
+                return not_found();
+            };
+            let key = request.uri().path().trim_start_matches('/');
+            match state.settle_store.get(key) {
+                Some(bytes) => tauri::http::Response::builder()
+                    .status(200)
+                    .header("Content-Type", "image/png")
+                    .header("Access-Control-Allow-Origin", "*")
+                    .body(bytes.as_ref().clone())
+                    .unwrap(),
+                None => not_found(),
+            }
+        })
         .setup(|app| {
             let resource_dir = app
                 .path()
@@ -4559,17 +4896,41 @@ pub fn run() {
 
             tracing::info!("pdfium path: {}", pdfium_lib_path);
 
-            let worker_count = 1;
             let startup_renderer = RendererService::spawn(&renderer_path, &pdfium_lib_path)
                 .expect("Failed to start renderer on startup");
             let renderer = Arc::new(Mutex::new(Some(startup_renderer)));
-            let tile_manager = Arc::new(create_tile_manager_with_workers(worker_count));
+            let tile_manager = Arc::new(create_tile_manager());
+            let tile_store = Arc::new(TileStore::new());
+            let settle_store = Arc::new(SettleStore::new());
+            let visible_tile_keys = Arc::new(Mutex::new(HashSet::new()));
             let (tile_render_tx, tile_render_rx) = mpsc::unbounded_channel();
+
+            // Separate process pool for tiles (see AppState::renderer doc comment) —
+            // PDFium itself is single-threaded per process, so this is the only way to
+            // get real render parallelism. Size is a knob: more processes means more
+            // concurrent renders but more RAM (each holds its own R1 document/page
+            // cache); tune via env var without a rebuild.
+            const DEFAULT_TILE_RENDERER_POOL_SIZE: usize = 3;
+            let tile_pool_size = std::env::var("TILE_RENDERER_POOL_SIZE")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|&n| n >= 1)
+                .unwrap_or(DEFAULT_TILE_RENDERER_POOL_SIZE);
+            let tile_renderer_pool: Vec<Arc<Mutex<Option<RendererService>>>> = (0..tile_pool_size)
+                .map(|_| {
+                    let svc = RendererService::spawn(&renderer_path, &pdfium_lib_path)
+                        .expect("Failed to start tile renderer on startup");
+                    Arc::new(Mutex::new(Some(svc)))
+                })
+                .collect();
 
             tauri::async_runtime::spawn(run_tile_render_worker(
                 tile_render_rx,
-                Arc::clone(&renderer),
+                tile_renderer_pool.clone(),
                 Arc::clone(&tile_manager),
+                Arc::clone(&tile_store),
+                Arc::clone(&visible_tile_keys),
+                app.handle().clone(),
             ));
 
             // Excel bridge: HTTPS server that proxies takeoff queries to the frontend.
@@ -4585,13 +4946,16 @@ pub fn run() {
                 startup_file,
                 open_document: Arc::new(Mutex::new(None)),
                 tile_manager,
-                render_context: Arc::new(Mutex::new(None)),
                 active_project: Arc::new(Mutex::new(None)),
                 recent_projects: Arc::new(Mutex::new(recent_projects)),
                 registry_db,
                 renderer,
+                tile_renderer_pool,
                 tile_render_tx,
                 next_tile_batch: AtomicU64::new(1),
+                tile_store,
+                visible_tile_keys,
+                settle_store,
                 bridge,
             });
             Ok(())
@@ -4613,7 +4977,7 @@ pub fn run() {
             get_page_vectors,
             render_preview,
             update_viewport,
-            poll_tiles,
+            render_settle_view,
             get_root_nodes,
             get_children,
             create_folder,

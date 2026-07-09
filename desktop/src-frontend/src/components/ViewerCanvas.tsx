@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { useAppStore, type SnapPoint, type SnapType } from "../store/appStore";
 import { deriveQuantity, formatQuantity, parseArrayMeta, serializeArrayMeta, type ArrayMeta, type ArrayTrim, type BoxTrim, type GroupProps } from "../lib/quantity";
 import {
@@ -72,6 +73,27 @@ interface PreviewData {
   image_path: string;
 }
 
+// Bluebeam-parity settle pass: a pixel-exact render of the current viewport at
+// zoom*devicePixelRatio DPI, fetched once pan/zoom/page has been idle for a beat.
+interface SettleViewMeta {
+  key: string;
+  width: number;
+  height: number;
+  crop_x: number;
+  crop_y: number;
+  dpi: number;
+}
+
+interface SettleViewState {
+  page: number;
+  zoom: number;
+  panX: number;
+  panY: number;
+  dpr: number;
+  cropX: number;
+  cropY: number;
+}
+
 interface ViewportState {
   page_index: number;
   zoom: number;
@@ -108,7 +130,8 @@ function zoomBucket(zoom: number) {
   if (zoom <= 0.6) return 1;
   if (zoom <= 1.25) return 2;
   if (zoom <= 2.5) return 3;
-  return 4;
+  if (zoom <= 5.0) return 4;
+  return 5;
 }
 
 function bucketZoom(zoomLevel: number) {
@@ -1182,6 +1205,12 @@ export function ViewerCanvas({
   const [tiles, setTiles] = useState<Map<string, TileData>>(new Map());
   const [previews, setPreviews] = useState<Map<number, PreviewData>>(new Map());
   const [imageVersion, setImageVersion] = useState(0);
+  // Settle-pass state: only drawn when it exactly matches the current pan/zoom/page/dpr
+  // (checked at draw time) — any subsequent input makes it stale and it's simply not
+  // drawn until a fresh one lands, falling back to the tile layer in the meantime.
+  const [settleView, setSettleView] = useState<SettleViewState | null>(null);
+  const settleImageRef = useRef<ImageBitmap | null>(null);
+  const settleRequestIdRef = useRef(0);
 
   // --- Linear measure tool (M2) ---
   const [draftPoints, setDraftPoints] = useState<PagePoint[]>([]);
@@ -1256,7 +1285,7 @@ export function ViewerCanvas({
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const overlayCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const imageCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
+  const imageCacheRef = useRef<Map<string, HTMLImageElement | ImageBitmap>>(new Map());
   const loadingImagesRef = useRef<Set<string>>(new Set());
   const dragRef = useRef<{ pointerId: number; startX: number; startY: number; panX: number; panY: number } | null>(null);
   const snapFrameRef = useRef<number | null>(null);
@@ -1328,6 +1357,19 @@ export function ViewerCanvas({
   const preview = previews.get(pageIndex) ?? null;
   const pageSize = useMemo(() => (page ? pagePixelSize(page, zoom) : { width: 0, height: 0 }), [page, zoom]);
   const activeZoomBucket = zoomBucket(zoom);
+
+  // Read by mergeTiles (a stable-identity callback held by the tile-event listener)
+  // to evict against the *current* page/bucket without resubscribing the listener.
+  const pageIndexRef = useRef(pageIndex);
+  const activeZoomBucketRef = useRef(activeZoomBucket);
+  // 0 so the very first viewport update after a document/page load fires immediately.
+  const lastViewportRequestRef = useRef(0);
+  useEffect(() => {
+    pageIndexRef.current = pageIndex;
+  }, [pageIndex]);
+  useEffect(() => {
+    activeZoomBucketRef.current = activeZoomBucket;
+  }, [activeZoomBucket]);
 
   // Update draft vertices through one helper so the ref (read synchronously by
   // pointer/keyboard handlers) and the state (drives rendering) never diverge —
@@ -1498,6 +1540,12 @@ export function ViewerCanvas({
     [overlayMeasurements, pageIndex, activeDimensionGroupId, updateMeasurementFraming, onStatusChange],
   );
 
+  // Metadata entries only (tiles map), but each one keeps a decoded ImageBitmap alive
+  // in imageCacheRef (~1 MB uncompressed per 512² tile regardless of PNG size) — so an
+  // unbounded map on a long session is a real memory leak, not just bookkeeping bloat.
+  // Cap it and evict tiles for other pages / far zoom buckets first.
+  const MAX_TILE_ENTRIES = 800;
+
   const mergeTiles = useCallback((incoming: TileData[]) => {
     if (incoming.length === 0) return;
     setTiles((current) => {
@@ -1505,11 +1553,26 @@ export function ViewerCanvas({
       for (const tile of incoming) {
         next.set(tileId(tile.key), tile);
       }
+      if (next.size > MAX_TILE_ENTRIES) {
+        const currentPage = pageIndexRef.current;
+        const currentBucket = activeZoomBucketRef.current;
+        for (const [id, tile] of next) {
+          if (next.size <= MAX_TILE_ENTRIES) break;
+          const keep = tile.key.page === currentPage && Math.abs(tile.key.zoom_level - currentBucket) <= 1;
+          if (keep) continue;
+          next.delete(id);
+          const image = imageCacheRef.current.get(tile.image_path);
+          if (image instanceof ImageBitmap) image.close();
+          imageCacheRef.current.delete(tile.image_path);
+          loadingImagesRef.current.delete(tile.image_path);
+        }
+      }
       return next;
     });
   }, []);
 
-  const loadImage = useCallback((imagePath: string) => {
+  // Previews are still PNG files on disk, loaded through the asset protocol.
+  const loadPreviewImage = useCallback((imagePath: string) => {
     if (imageCacheRef.current.has(imagePath) || loadingImagesRef.current.has(imagePath)) return;
 
     loadingImagesRef.current.add(imagePath);
@@ -1525,11 +1588,43 @@ export function ViewerCanvas({
     image.src = convertFileSrc(imagePath);
   }, []);
 
+  // Tiles live in the backend's in-memory store, served over the custom `tile`
+  // scheme (WebView2 exposes it as http://tile.localhost/). createImageBitmap
+  // decodes off the main thread, unlike <img>. A 404 means the store evicted the
+  // entry; the next update_viewport round re-queues the tile, so just drop it.
+  const loadTileImage = useCallback((key: string) => {
+    if (imageCacheRef.current.has(key) || loadingImagesRef.current.has(key)) return;
+
+    loadingImagesRef.current.add(key);
+    fetch(`http://tile.localhost/${key}`)
+      .then((response) => {
+        if (!response.ok) throw new Error(`tile fetch failed: ${response.status}`);
+        return response.blob();
+      })
+      .then((blob) => createImageBitmap(blob))
+      .then((bitmap) => {
+        imageCacheRef.current.set(key, bitmap);
+        loadingImagesRef.current.delete(key);
+        setImageVersion((version) => version + 1);
+      })
+      .catch(() => {
+        loadingImagesRef.current.delete(key);
+      });
+  }, []);
+
   useEffect(() => {
     setTiles(new Map());
     setPreviews(new Map());
+    for (const image of imageCacheRef.current.values()) {
+      // ImageBitmaps hold GPU-backed memory; release deterministically rather than
+      // waiting for GC.
+      if (image instanceof ImageBitmap) image.close();
+    }
     imageCacheRef.current.clear();
     loadingImagesRef.current.clear();
+    settleImageRef.current?.close();
+    settleImageRef.current = null;
+    setSettleView(null);
     setPan({ x: 0, y: 0 });
     setZoom(1);
   }, [doc?.path]);
@@ -1538,6 +1633,9 @@ export function ViewerCanvas({
     setPan({ x: 0, y: 0 });
     setZoom(1);
     clearSnap();
+    settleImageRef.current?.close();
+    settleImageRef.current = null;
+    setSettleView(null);
   }, [pageIndex]);
 
   useEffect(() => {
@@ -1583,12 +1681,12 @@ export function ViewerCanvas({
 
   useEffect(() => {
     for (const previewData of previews.values()) {
-      loadImage(previewData.image_path);
+      loadPreviewImage(previewData.image_path);
     }
     for (const tile of tiles.values()) {
-      loadImage(tile.image_path);
+      loadTileImage(tile.image_path);
     }
-  }, [loadImage, previews, tiles]);
+  }, [loadPreviewImage, loadTileImage, previews, tiles]);
 
   useEffect(() => {
     if (!doc || previews.has(pageIndex)) return;
@@ -1614,6 +1712,12 @@ export function ViewerCanvas({
     };
   }, [doc, onStatusChange, pageIndex, previews]);
 
+  // Immediate-then-throttle: a plain debounce (fire N ms after the last change) never
+  // actually invokes update_viewport while pan/zoom state is still changing every
+  // pointermove, so a fast drag fetched zero tiles until the user let go — all the
+  // fill-in landed in one visible burst right at release. Firing immediately whenever
+  // the throttle window has elapsed, and otherwise scheduling one trailing call for the
+  // final state, keeps tiles streaming in during the gesture instead of only after it.
   useEffect(() => {
     if (!doc || !page) return;
 
@@ -1626,8 +1730,12 @@ export function ViewerCanvas({
       height: viewportSize.height,
     };
 
+    const THROTTLE_MS = 16;
     let cancelled = false;
-    const timer = window.setTimeout(() => {
+    let timer: number | undefined;
+
+    const fire = () => {
+      lastViewportRequestRef.current = performance.now();
       invoke<TileData[]>("update_viewport", { viewport })
         .then((newTiles) => {
           if (!cancelled) mergeTiles(newTiles);
@@ -1635,28 +1743,100 @@ export function ViewerCanvas({
         .catch((e) => {
           if (!cancelled) onStatusChange(`ERROR: ${e}`);
         });
-    }, 30);
+    };
+
+    const elapsed = performance.now() - lastViewportRequestRef.current;
+    if (elapsed >= THROTTLE_MS) {
+      fire();
+    } else {
+      timer = window.setTimeout(fire, THROTTLE_MS - elapsed);
+    }
 
     return () => {
       cancelled = true;
-      window.clearTimeout(timer);
+      if (timer !== undefined) window.clearTimeout(timer);
     };
   }, [doc, page, pageIndex, pan.x, pan.y, viewportSize.height, viewportSize.width, zoom, mergeTiles, onStatusChange]);
 
+  // Bluebeam-parity settle pass: once pan/zoom/page/dpr has been stable for ~200ms,
+  // request a pixel-exact viewport render (render_settle_view / SettleStore on the
+  // backend) to replace the interactive tile layer's bucketed-DPI/dpr-scaled softness —
+  // this is what makes the settled view read as crisp vector linework instead of a
+  // slightly-off raster, matching Bluebeam Revu. Skipped when the tile layer is already
+  // pixel-exact (dpr 1 and zoom sitting exactly on a bucket's native zoom) — the common
+  // case on first page load at 100% Windows scaling.
   useEffect(() => {
-    if (!doc) return;
+    if (!doc || !page) return;
+    const requestId = ++settleRequestIdRef.current;
 
-    const timer = window.setInterval(() => {
-      invoke<TileData[]>("poll_tiles")
-        .then((newTiles) => {
-          mergeTiles(newTiles);
-          if (newTiles.length > 0) onStatusChange("Rendered tiles");
-        })
-        .catch((e) => onStatusChange(`ERROR: ${e}`));
-    }, 75);
+    const dpr = window.devicePixelRatio || 1;
+    if (dpr === 1 && zoom === bucketZoom(activeZoomBucket)) return;
 
-    return () => window.clearInterval(timer);
-  }, [doc, mergeTiles, onStatusChange]);
+    const timer = window.setTimeout(async () => {
+      try {
+        const meta = await invoke<SettleViewMeta | null>("render_settle_view", {
+          viewport: {
+            page_index: pageIndex,
+            zoom,
+            pan_x: pan.x,
+            pan_y: pan.y,
+            width: viewportSize.width,
+            height: viewportSize.height,
+            device_pixel_ratio: dpr,
+          },
+        });
+        if (requestId !== settleRequestIdRef.current || !meta) return;
+
+        const response = await fetch(`http://settle.localhost/${meta.key}`);
+        if (!response.ok) throw new Error(`settle fetch failed: ${response.status}`);
+        const blob = await response.blob();
+        const bitmap = await createImageBitmap(blob);
+        if (requestId !== settleRequestIdRef.current) {
+          bitmap.close();
+          return;
+        }
+
+        settleImageRef.current?.close();
+        settleImageRef.current = bitmap;
+        setSettleView({
+          page: pageIndex,
+          zoom,
+          panX: pan.x,
+          panY: pan.y,
+          dpr,
+          cropX: meta.crop_x,
+          cropY: meta.crop_y,
+        });
+      } catch (e) {
+        if (requestId === settleRequestIdRef.current) onStatusChange(`ERROR: ${e}`);
+      }
+    }, 200);
+
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [doc, page, pageIndex, pan.x, pan.y, viewportSize.height, viewportSize.width, zoom, activeZoomBucket, onStatusChange]);
+
+  // Completed tiles are pushed from the backend per tile; coalesce bursts into one
+  // merge (and hence one canvas redraw) per animation frame.
+  useEffect(() => {
+    let frame: number | null = null;
+    const queue: TileData[] = [];
+    const unlistenPromise = listen<TileData>("tile-rendered", (event) => {
+      queue.push(event.payload);
+      if (frame === null) {
+        frame = window.requestAnimationFrame(() => {
+          frame = null;
+          mergeTiles(queue.splice(0, queue.length));
+        });
+      }
+    });
+
+    return () => {
+      if (frame !== null) window.cancelAnimationFrame(frame);
+      unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, [mergeTiles]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -1709,27 +1889,88 @@ export function ViewerCanvas({
       }
     }
 
-    const pageTiles = Array.from(tiles.values())
-      .filter((tile) => tile.key.page === pageIndex)
+    const loadedTiles = Array.from(tiles.values()).filter(
+      (tile) => tile.key.page === pageIndex && imageCacheRef.current.has(tile.image_path),
+    );
+
+    // Loaded active-bucket tiles form an exact grid (tile_x/tile_y are already grid
+    // indices, and every zoom bucket's pixel grid is a power-of-two subdivision of the
+    // same page origin) — so a coarser, stale-bucket tile maps onto an exact integer
+    // range of active-bucket cells with no floating-point rounding involved.
+    const activeCells = new Set<string>();
+    for (const tile of loadedTiles) {
+      if (tile.key.zoom_level === activeZoomBucket) {
+        activeCells.add(`${tile.key.tile_x}:${tile.key.tile_y}`);
+      }
+    }
+    const isFullyCoveredByActive = (tile: TileData) => {
+      if (tile.key.zoom_level >= activeZoomBucket || activeCells.size === 0) return false;
+      const ratio = 2 ** (activeZoomBucket - tile.key.zoom_level);
+      const gxStart = tile.key.tile_x * ratio;
+      const gyStart = tile.key.tile_y * ratio;
+      for (let dy = 0; dy < ratio; dy++) {
+        for (let dx = 0; dx < ratio; dx++) {
+          if (!activeCells.has(`${gxStart + dx}:${gyStart + dy}`)) return false;
+        }
+      }
+      return true;
+    };
+
+    const pageTiles = loadedTiles
+      .map((tile) => {
+        const scale = zoom / bucketZoom(tile.key.zoom_level);
+        return {
+          tile,
+          scale,
+          screenLeft: pageLeft + tile.x * scale,
+          screenTop: pageTop + tile.y * scale,
+          screenSize: TILE_SIZE * scale,
+        };
+      })
+      // Offscreen cull: skip tiles whose screen footprint doesn't intersect the viewport.
+      .filter(
+        ({ screenLeft, screenTop, screenSize }) =>
+          screenLeft < width && screenTop < height && screenLeft + screenSize > 0 && screenTop + screenSize > 0,
+      )
+      // A fully-occluded stale tile is invisible either way — skip the draw call.
+      .filter((entry) => !isFullyCoveredByActive(entry.tile))
       .sort((a, b) => {
-        const aDistance = Math.abs(a.key.zoom_level - activeZoomBucket);
-        const bDistance = Math.abs(b.key.zoom_level - activeZoomBucket);
+        const aDistance = Math.abs(a.tile.key.zoom_level - activeZoomBucket);
+        const bDistance = Math.abs(b.tile.key.zoom_level - activeZoomBucket);
         if (aDistance !== bDistance) return bDistance - aDistance;
-        return a.key.zoom_level - b.key.zoom_level;
+        return a.tile.key.zoom_level - b.tile.key.zoom_level;
       });
 
-    for (const tile of pageTiles) {
-      const image = imageCacheRef.current.get(tile.image_path);
-      if (!image) continue;
+    for (const { tile, screenLeft, screenTop, screenSize } of pageTiles) {
+      const image = imageCacheRef.current.get(tile.image_path)!;
+      ctx.drawImage(image, screenLeft, screenTop, screenSize, screenSize);
+    }
 
-      const scale = zoom / bucketZoom(tile.key.zoom_level);
-      ctx.drawImage(
-        image,
-        pageLeft + tile.x * scale,
-        pageTop + tile.y * scale,
-        TILE_SIZE * scale,
-        TILE_SIZE * scale,
-      );
+    // Bluebeam-parity settle pass: only drawn when it exactly matches the live pan/
+    // zoom/page/dpr — any input since it was captured makes it stale, and we simply
+    // fall back to the (already-drawn) tile layer until a fresh settle image lands.
+    // Drawn with an identity (1:1 device-pixel) transform rather than the dpr-scaled
+    // CSS-pixel transform this whole effect otherwise uses, so the browser never
+    // resamples it — that resampling is exactly what makes the tile layer read as "a
+    // raster" at non-bucket-exact zooms or fractional Windows display scaling. The
+    // page-rect clip established above is in device-space already, so it still applies
+    // correctly under the identity transform.
+    const currentDpr = window.devicePixelRatio || 1;
+    if (
+      settleView &&
+      settleImageRef.current &&
+      settleView.page === pageIndex &&
+      settleView.zoom === zoom &&
+      settleView.panX === pan.x &&
+      settleView.panY === pan.y &&
+      settleView.dpr === currentDpr
+    ) {
+      const deviceX = -settleView.panX * settleView.dpr + settleView.cropX;
+      const deviceY = -settleView.panY * settleView.dpr + settleView.cropY;
+      ctx.save();
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.drawImage(settleImageRef.current, Math.round(deviceX), Math.round(deviceY));
+      ctx.restore();
     }
 
     // Dimmer: white overlay over the page linework so measurements stand out.
@@ -1740,7 +1981,7 @@ export function ViewerCanvas({
     }
 
     ctx.restore();
-  }, [activeZoomBucket, doc, drawingDimmer, imageVersion, page, pageIndex, pageSize.height, pageSize.width, pan.x, pan.y, preview, tiles, viewportSize.height, viewportSize.width, zoom]);
+  }, [activeZoomBucket, doc, drawingDimmer, imageVersion, page, pageIndex, pageSize.height, pageSize.width, pan.x, pan.y, preview, settleView, tiles, viewportSize.height, viewportSize.width, zoom]);
 
   useEffect(() => {
     const canvas = overlayCanvasRef.current;

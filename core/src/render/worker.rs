@@ -1,4 +1,3 @@
-use crossbeam_channel::bounded;
 use serde::{Deserialize, Serialize};
 
 use crate::pdf::tile_manager::TileManager;
@@ -12,9 +11,9 @@ pub struct PreviewData {
 }
 
 /// Builds the tile manager used by the desktop app. Rendering itself happens
-/// out-of-process in `pdf_renderer`; this only owns the cache and the
-/// completion channel that the desktop tile worker drains.
-pub fn create_tile_manager_with_workers(_num_threads: usize) -> TileManager {
-    let (completion_tx, completion_rx) = bounded(512);
-    TileManager::new(completion_tx, completion_rx)
+/// out-of-process in `pdf_renderer`; this only owns the tile metadata cache.
+/// Completed tiles are pushed to the frontend via Tauri events by the desktop
+/// tile worker.
+pub fn create_tile_manager() -> TileManager {
+    TileManager::new()
 }

@@ -2,7 +2,7 @@ use crate::pdf::tile_manager::TileKey;
 use serde::{Deserialize, Serialize};
 
 pub const TILE_SIZE_PX: u32 = 512;
-const TILE_PREFETCH_RADIUS: u32 = 1;
+const TILE_PREFETCH_RADIUS: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ViewportState {
@@ -67,7 +67,8 @@ impl ViewportState {
             z if z <= 0.6 => 1,
             z if z <= 1.25 => 2,
             z if z <= 2.5 => 3,
-            _ => 4,
+            z if z <= 5.0 => 4,
+            _ => 5,
         }
     }
 

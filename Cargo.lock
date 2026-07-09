@@ -708,7 +708,6 @@ name = "core"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
- "crossbeam-channel",
  "image",
  "lru",
  "parking_lot",
@@ -1003,6 +1002,7 @@ dependencies = [
  "core",
  "hyper",
  "hyper-util",
+ "lru",
  "parking_lot",
  "rcgen",
  "rustls",

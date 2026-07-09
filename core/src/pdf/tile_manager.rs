@@ -1,4 +1,3 @@
-use crossbeam_channel::{Receiver, Sender};
 use lru::LruCache;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -10,7 +9,10 @@ use std::sync::{
 };
 
 pub const TILE_SIZE_PX: u32 = 512;
-const MAX_CACHED_TILES: usize = 256;
+// Metadata-only entries (a key + a few ints + a short string), so the cap is sized for
+// coverage rather than memory: an A1 sheet at the top zoom bucket is ~450 tiles, and
+// panning can have several zoom buckets' worth of tiles alive across a session.
+const MAX_CACHED_TILES: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TileKey {
@@ -23,6 +25,8 @@ pub struct TileKey {
 #[derive(Debug, Clone, Serialize)]
 pub struct TileData {
     pub key: TileKey,
+    /// Key into the desktop app's in-memory tile store; the frontend fetches the
+    /// PNG bytes through the `tile` URI scheme using this value.
     pub image_path: String,
     pub x: u32,
     pub y: u32,
@@ -33,8 +37,6 @@ pub struct TileManager {
     cache: Arc<Mutex<LruCache<TileKey, TileData>>>,
     queued: Arc<Mutex<HashMap<TileKey, u64>>>,
     generation: Arc<AtomicU64>,
-    completion_tx: Sender<TileData>,
-    pub completion_rx: Receiver<TileData>,
 }
 
 pub enum TileQueueState {
@@ -44,25 +46,14 @@ pub enum TileQueueState {
 }
 
 impl TileManager {
-    pub fn new(completion_tx: Sender<TileData>, completion_rx: Receiver<TileData>) -> Self {
+    pub fn new() -> Self {
         Self {
             cache: Arc::new(Mutex::new(LruCache::new(
                 NonZeroUsize::new(MAX_CACHED_TILES).unwrap(),
             ))),
             queued: Arc::new(Mutex::new(HashMap::new())),
             generation: Arc::new(AtomicU64::new(1)),
-            completion_tx,
-            completion_rx,
         }
-    }
-
-    pub fn insert(&self, tile: TileData) {
-        let current_generation = self.current_generation();
-        self.queued.lock().remove(&tile.key);
-        if tile.generation != current_generation {
-            return;
-        }
-        self.cache.lock().put(tile.key, tile);
     }
 
     pub fn clear(&self) {
@@ -106,14 +97,19 @@ impl TileManager {
         TileQueueState::Queued { generation, dpi }
     }
 
+    /// Removes a cache entry whose backing tile bytes are gone from the store,
+    /// so the tile gets re-queued instead of being served as a dead reference.
+    pub fn evict(&self, key: &TileKey) {
+        self.cache.lock().pop(key);
+    }
+
     pub fn complete_render(&self, tile: TileData) {
         let current_generation = self.current_generation();
         self.queued.lock().remove(&tile.key);
         if tile.generation != current_generation {
             return;
         }
-        self.cache.lock().put(tile.key, tile.clone());
-        let _ = self.completion_tx.try_send(tile);
+        self.cache.lock().put(tile.key, tile);
     }
 
     pub fn fail_render(&self, key: &TileKey) {
@@ -123,17 +119,10 @@ impl TileManager {
     pub fn get_cached(&self, key: &TileKey) -> Option<TileData> {
         self.cache.lock().get(key).cloned()
     }
+}
 
-    pub fn drain_completed(&self) -> Vec<TileData> {
-        let mut results = Vec::new();
-        while let Ok(tile) = self.completion_rx.try_recv() {
-            let current_generation = self.current_generation();
-            self.queued.lock().remove(&tile.key);
-            if tile.generation == current_generation {
-                self.cache.lock().put(tile.key, tile.clone());
-                results.push(tile);
-            }
-        }
-        results
+impl Default for TileManager {
+    fn default() -> Self {
+        Self::new()
     }
 }

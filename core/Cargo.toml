@@ -5,7 +5,6 @@ edition = "2021"
 
 [dependencies]
 pdfium-render = { version = "0.8", features = ["thread_safe"] }
-crossbeam-channel = "0.5"
 parking_lot = "0.12"
 lru = "0.12"
 serde = { version = "1", features = ["derive"] }
