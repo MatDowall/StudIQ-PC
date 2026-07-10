@@ -167,7 +167,7 @@ export function TreeNode({ node, depth, activeNodeId, onNodeClick, onContextMenu
           paddingLeft: depth * theme.treeIndent,
           paddingRight: 6,
           background: isActive ? theme.bg.active : "transparent",
-          color: isActive ? "#FFFFFF" : theme.text.primary,
+          color: theme.text.primary,
           cursor: "default",
           fontSize: 12,
           userSelect: "none",
@@ -191,7 +191,7 @@ export function TreeNode({ node, depth, activeNodeId, onNodeClick, onContextMenu
           {loading ? "..." : expanded ? "v" : ">"}
         </button>
         <NodeIcon node={node} />
-        <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{node.name}</span>
+        <span style={{ overflow: "hidden", textOverflow: "ellipsis", color: theme.text.primary }}>{node.name}</span>
       </div>
       {expanded
         ? children.map((child) => (

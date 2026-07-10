@@ -238,7 +238,7 @@ export function RateConstantsDialog({ onClose }: Props) {
                 disabled={!rateForm.code.trim() || !Number.isFinite(parseFloat(rateForm.rate))}
                 style={{
                   height: 26, padding: "0 12px", fontSize: 12, fontFamily: "inherit",
-                  background: theme.bg.active, color: "#fff",
+                  background: theme.bg.active, color: theme.text.primary,
                   border: `1px solid ${theme.accent}`, cursor: "pointer",
                 }}
               >
@@ -322,7 +322,7 @@ export function RateConstantsDialog({ onClose }: Props) {
                 disabled={!constForm.name.trim() || !Number.isFinite(parseFloat(constForm.value))}
                 style={{
                   height: 26, padding: "0 12px", fontSize: 12, fontFamily: "inherit",
-                  background: theme.bg.active, color: "#fff",
+                  background: theme.bg.active, color: theme.text.primary,
                   border: `1px solid ${theme.accent}`, cursor: "pointer",
                 }}
               >

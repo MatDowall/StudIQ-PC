@@ -236,7 +236,7 @@ export function TemplateManagerDialog() {
                   style={{
                     display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
                     height: 30, padding: "0 12px",
-                    background: theme.bg.active, color: "#FFFFFF",
+                    background: theme.bg.active, color: theme.text.primary,
                     border: `1px solid ${theme.accent}`, cursor: "pointer", fontSize: 12,
                   }}
                 >

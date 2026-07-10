@@ -211,7 +211,7 @@ function DimensionTreeRow({
           minWidth: 360,
           height: theme.rowHeight,
           background: isActive ? theme.bg.active : "transparent",
-          color: isActive ? "#FFFFFF" : theme.text.primary,
+          color: theme.text.primary,
           cursor: "default",
           fontSize: 12,
           userSelect: "none",
@@ -244,10 +244,10 @@ function DimensionTreeRow({
           }}
         >
           <DimensionNodeIcon node={node} measurementType={groupProps[node.id]?.measurement_type} />
-          <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{displayName}</span>
+          <span style={{ overflow: "hidden", textOverflow: "ellipsis", color: theme.text.primary }}>{displayName}</span>
         </div>
-        <div style={{ paddingRight: 8, textAlign: "right", color: isActive ? "#FFFFFF" : theme.text.primary }}>{summary.quantity}</div>
-        <div style={{ paddingLeft: 6, color: isActive ? "#FFFFFF" : theme.text.primary }}>{summary.uom}</div>
+        <div style={{ paddingRight: 8, textAlign: "right", color: theme.text.primary }}>{summary.quantity}</div>
+        <div style={{ paddingLeft: 6, color: theme.text.primary }}>{summary.uom}</div>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "center" }}>
           {node.node_type === "dimension_group" ? (
             <span style={{ width: 16, height: 16, background: node.colour ?? theme.accent, border: `1px solid ${theme.border.divider}` }} />

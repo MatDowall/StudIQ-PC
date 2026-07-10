@@ -159,7 +159,7 @@ export function RakingDialog({
               gable ? num(middlePosition, segLenMm / 2, segLenMm - 1) : undefined,
             )
           }
-          style={{ height: 28, padding: "0 12px", background: theme.bg.active, color: "#FFFFFF", border: `1px solid ${theme.accent}`, cursor: "pointer" }}
+          style={{ height: 28, padding: "0 12px", background: theme.bg.active, color: theme.text.primary, border: `1px solid ${theme.accent}`, cursor: "pointer" }}
         >
           Set Rake
         </button>

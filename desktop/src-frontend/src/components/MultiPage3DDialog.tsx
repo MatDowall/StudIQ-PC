@@ -196,7 +196,7 @@ export function MultiPage3DDialog({ onCancel }: { onCancel: () => void }) {
             height: 28,
             padding: "0 12px",
             background: theme.bg.active,
-            color: "#FFFFFF",
+            color: theme.text.primary,
             border: `1px solid ${theme.accent}`,
             cursor: pages && pages.length > 0 ? "pointer" : "not-allowed",
             opacity: pages && pages.length > 0 ? 1 : 0.6,

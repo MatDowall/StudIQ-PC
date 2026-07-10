@@ -172,7 +172,7 @@ export function OpeningDialog({
         <button onClick={onCancel} style={{ height: 28, padding: "0 12px", background: theme.bg.input, color: theme.text.primary, border: `1px solid ${theme.border.divider}`, cursor: "pointer" }}>
           Cancel
         </button>
-        <button onClick={confirm} style={{ height: 28, padding: "0 12px", background: theme.bg.active, color: "#FFFFFF", border: `1px solid ${theme.accent}`, cursor: "pointer" }}>
+        <button onClick={confirm} style={{ height: 28, padding: "0 12px", background: theme.bg.active, color: theme.text.primary, border: `1px solid ${theme.accent}`, cursor: "pointer" }}>
           {confirmLabel}
         </button>
       </div>

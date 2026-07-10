@@ -83,7 +83,7 @@ export function ColourDialog({ title, initialColour, onCancel, onConfirm }: Colo
             height: 28,
             padding: "0 12px",
             background: theme.bg.active,
-            color: "#FFFFFF",
+            color: theme.text.primary,
             border: `1px solid ${theme.accent}`,
             cursor: "pointer",
           }}
