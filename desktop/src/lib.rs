@@ -18,6 +18,9 @@ use tokio::sync::mpsc;
 mod bridge;
 use bridge::{BridgeState, SharedBridge};
 
+mod excel_export;
+use excel_export::export_workbook_excel;
+
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
@@ -5030,6 +5033,7 @@ pub fn run() {
             write_text_file,
             read_text_file,
             write_binary_file,
+            export_workbook_excel,
             rename_workbook_sheet_subtree,
             bridge_respond,
             list_rates,

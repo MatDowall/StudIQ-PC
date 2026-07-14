@@ -154,6 +154,10 @@ export interface WorkbookFormatSnapshot {
 export interface FlattenExportLevels {
   l1: boolean;
   l2: boolean;
+  /** Adds the cost-code entry + auto-summary columns. Only meaningful (and only
+   *  offered in the dialog) when `l2` is also set — cost coding applies to
+   *  take-off line items, not section rollups. */
+  costCodes: boolean;
 }
 
 // Imperative bridge: WorkbookView registers these so the ribbon's row/output

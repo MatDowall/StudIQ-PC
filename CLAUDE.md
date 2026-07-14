@@ -130,6 +130,20 @@ The `sizeOverride` field on `FramingComponent` / `FramingComponentTotal` is **al
 lintel members** (to the lintel's own `FramingSize`) and absent on all other member kinds. This
 is the key that excludes lintels from `matchingTotalM` and marks them for separate worksheet rows.
 
+### Workbook → Excel export is built in Rust, not JS
+
+`WorkbookView.tsx`'s `exportExcel` flattens the workbook (unchanged, in the frontend) and hands
+the row data to the Tauri command `export_workbook_excel` (`desktop/src/excel_export.rs`), which
+builds the `.xlsx` with `rust_xlsxwriter` and writes it straight to disk. This replaced an
+ExcelJS-based writer specifically because the optional "Include cost code columns?" checkbox adds
+a group-by-cost-code summary block that relies on Excel 365 dynamic-array formulas
+(`LET`/`FILTER`/`UNIQUE`/`BYROW`/`VSTACK`/`EXPAND`) — these only spill correctly if the file
+carries the `XLDAPR` dynamic-array cell metadata (`xl/metadata.xml` + `cm="1"` on the formula
+cell), which no JS `.xlsx` writer produces but `Worksheet::write_dynamic_formula` does natively.
+When writing formulas that use these functions, function names (`LET`, `FILTER`, `LAMBDA`, …) are
+auto-prefixed with `_xlfn.`/`_xlfn._xlws.` by the crate — but `LET`/`LAMBDA`-bound variable names
+must be prefixed with `_xlpm.` by hand in the formula string, or Excel won't recognize them.
+
 ## Docs & process
 
 `docs/` holds the phase **prompts** (specs), **handovers** (architecture/state between

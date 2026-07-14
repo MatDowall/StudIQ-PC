@@ -11,6 +11,7 @@ interface ExportExcelDialogProps {
 export function ExportExcelDialog({ onCancel, onConfirm }: ExportExcelDialogProps) {
   const [l1, setL1] = useState(true);
   const [l2, setL2] = useState(true);
+  const [costCodes, setCostCodes] = useState(false);
 
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
@@ -20,6 +21,12 @@ export function ExportExcelDialog({ onCancel, onConfirm }: ExportExcelDialogProp
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [onCancel]);
 
+  // Cost coding applies to take-off line items, not section rollups — force it off
+  // whenever Items isn't included.
+  useEffect(() => {
+    if (!l2) setCostCodes(false);
+  }, [l2]);
+
   const canExport = l1 || l2;
 
   const row = (
@@ -27,11 +34,19 @@ export function ExportExcelDialog({ onCancel, onConfirm }: ExportExcelDialogProp
     onChange: (v: boolean) => void,
     label: string,
     description: string,
+    disabled = false,
   ) => (
-    <label style={{ display: "flex", alignItems: "flex-start", gap: 8, cursor: "pointer", padding: "6px 0" }}>
+    <label
+      style={{
+        display: "flex", alignItems: "flex-start", gap: 8,
+        cursor: disabled ? "default" : "pointer", padding: "6px 0",
+        opacity: disabled ? 0.5 : 1,
+      }}
+    >
       <input
         type="checkbox"
         checked={checked}
+        disabled={disabled}
         onChange={(e) => onChange(e.target.checked)}
         style={{ marginTop: 2 }}
       />
@@ -48,8 +63,13 @@ export function ExportExcelDialog({ onCancel, onConfirm }: ExportExcelDialogProp
         <div style={{ marginBottom: 8, color: theme.text.secondary }}>
           Choose which levels to flatten into the exported sheet:
         </div>
-        {row(l1, setL1, "Sections (Level 1)", "Include each section's row in the output. With Items also selected, a section is shown as leading columns tagging its child items.")}
-        {row(l2, setL2, "Items (Level 2)", "Include each section's take-off line items. A section with no item breakdown exports as a single row using the section's own values.")}
+        {row(l1, setL1, "Trade Summary only (Level 1)", "Include each trade's row in the output.")}
+        {row(l2, setL2, "Takeoff (Level 2)", "Include each Trades's takeoff line items.")}
+        {row(
+          costCodes, setCostCodes, "Include cost code columns?",
+          "Adds a blank cost-code column after each of Lab/Mat/Sub/Sum, plus a self-updating summary.",
+          !l2,
+        )}
         {!canExport ? (
           <div style={{ marginTop: 8, fontSize: 11, color: theme.danger }}>Select at least one level.</div>
         ) : null}
@@ -77,7 +97,7 @@ export function ExportExcelDialog({ onCancel, onConfirm }: ExportExcelDialogProp
           Cancel
         </button>
         <button
-          onClick={() => canExport && onConfirm({ l1, l2 })}
+          onClick={() => canExport && onConfirm({ l1, l2, costCodes })}
           disabled={!canExport}
           style={{
             height: 28,

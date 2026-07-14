@@ -13,7 +13,6 @@ import type Handsontable from "handsontable";
 import { HyperFormula } from "hyperformula";
 import { useAppStore, DEFAULT_WORKBOOK_FORMAT } from "../store/appStore";
 import type { WorkbookFormatApi, WorkbookGridApi, FlattenExportLevels } from "../store/appStore";
-import ExcelJS from "exceljs";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { TemplateManagerDialog } from "./TemplateManagerDialog";
 import { ContextMenu, type ContextMenuEntry } from "./ContextMenu";
@@ -974,15 +973,17 @@ function textOrBlank(v: unknown): string {
   return v != null && v !== "" ? String(v) : "";
 }
 
-/** Base64-encode an ArrayBuffer in chunks (avoids call-stack limits from spreading huge byte arrays). */
-function arrayBufferToBase64(buf: ArrayBuffer): string {
-  const bytes = new Uint8Array(buf);
-  let binary = "";
-  const chunkSize = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+/** Looks up a named cell's resolved value by name, case-insensitively — named cells
+ *  are user-created and their casing isn't enforced, but the cost-code export's
+ *  blended labour rate needs a reliable match on `lab_rate` regardless of how the
+ *  estimator capitalized it when creating the named cell (the same tolerance Factor
+ *  formulas get from HyperFormula's own case-insensitive name resolution). */
+function resolveNamedNumber(namedValues: Map<string, unknown>, name: string): number | undefined {
+  const target = name.toLowerCase();
+  for (const [key, value] of namedValues) {
+    if (key.toLowerCase() === target) return numOrUndefined(value);
   }
-  return btoa(binary);
+  return undefined;
 }
 
 /** One output row of the flattened Excel export — see WorkbookGridApi.exportExcel. */
@@ -3042,50 +3043,9 @@ export function WorkbookView() {
         }
       }
 
-      interface ColDef { key: keyof FlatExportRow; header: string; width: number; numFmt?: string; }
-      const cols: ColDef[] = [];
-      if (includeSectionCols) {
-        cols.push({ key: "sectionCode", header: "Section Code", width: 14 });
-        cols.push({ key: "sectionDesc", header: "Section", width: 32 });
-      }
-      cols.push(
-        { key: "code",      header: "Code",         width: 12 },
-        { key: "desc",      header: "Description",  width: 40 },
-        { key: "qty",       header: "Quantity",     width: 12, numFmt: "#,##0.00" },
-        { key: "unit",      header: "Unit",         width: 10 },
-        { key: "rate",      header: "Rate",         width: 12, numFmt: "#,##0.00" },
-        { key: "subtotal",  header: "Subtotal",     width: 14, numFmt: "#,##0.00" },
-        { key: "factor",    header: "Factor",       width: 10, numFmt: "0.00" },
-        { key: "total",     header: "Total",        width: 14, numFmt: "#,##0.00" },
-        { key: "lab",       header: "Lab",           width: 10, numFmt: "#,##0.00" },
-        { key: "labTotal",  header: "Lab - Total",   width: 14, numFmt: "#,##0.00" },
-        { key: "mat",       header: "Mat",           width: 10, numFmt: "#,##0.00" },
-        { key: "matTotal",  header: "Mat - Total",   width: 14, numFmt: "#,##0.00" },
-        { key: "sub",       header: "Sub",           width: 10, numFmt: "#,##0.00" },
-        { key: "subTotal",  header: "Sub - Total",   width: 14, numFmt: "#,##0.00" },
-        { key: "sum",       header: "Sum",           width: 10, numFmt: "#,##0.00" },
-        { key: "sumTotal",  header: "Sum - Total",   width: 14, numFmt: "#,##0.00" },
-      );
-
-      const workbook = new ExcelJS.Workbook();
-      const sheet = workbook.addWorksheet("Workbook");
-      sheet.columns = cols.map(c => ({ header: c.header, key: c.key, width: c.width }));
-      sheet.getRow(1).font = { bold: true };
-      sheet.getRow(1).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFE0E0E0" } };
-      sheet.views = [{ state: "frozen", ySplit: 1 }];
-      for (const r of flatRows) sheet.addRow(r as unknown as Record<string, unknown>);
-      for (const c of cols) {
-        if (c.numFmt) sheet.getColumn(c.key).numFmt = c.numFmt;
-      }
-      flatRows.forEach((r, i) => {
-        if (!r.rowKind) return;
-        const excelRow = sheet.getRow(i + 2); // +1 for the header row, +1 to convert to 1-based
-        excelRow.font = { bold: true };
-        excelRow.fill = {
-          type: "pattern", pattern: "solid",
-          fgColor: { argb: r.rowKind === "header" ? "FFD9D9D9" : "FFFFF2CC" },
-        };
-      });
+      // The blended $/hr labour rate for the cost-code export's TOTAL Labour formula —
+      // same resolution mechanism Factor formulas use for names like `margin_pct`.
+      const labRate = levels.costCodes ? resolveNamedNumber(namedValues, "lab_rate") : undefined;
 
       const filePath = await saveDialog({
         defaultPath: "workbook.xlsx",
@@ -3093,9 +3053,15 @@ export function WorkbookView() {
       });
       if (!filePath) return;
       try {
-        const buffer = await workbook.xlsx.writeBuffer();
-        const base64 = arrayBufferToBase64(buffer as ArrayBuffer);
-        await invoke("write_binary_file", { path: filePath, dataBase64: base64 });
+        await invoke("export_workbook_excel", {
+          path: filePath,
+          payload: {
+            includeSectionCols,
+            includeCostCodes: levels.costCodes,
+            labRate,
+            rows: flatRows,
+          },
+        });
       } catch (err) {
         console.error("Export failed:", err);
       }
