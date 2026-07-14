@@ -1005,15 +1005,32 @@ interface FlatExportRow {
   subTotal?: number;
   sum?: number;
   sumTotal?: number;
+  /** Marks a synthetic row inserted around a section's items (see `exportExcel`) — not a real sheet row. */
+  rowKind?: "header" | "footer";
+}
+
+/** Applies the same Factor/Total defaulting `deriveLevelFormulas` (pass 2) applies live in the
+ *  grid — auto-populate Factor=1 the first time Subtotal is positive and Factor is blank, and
+ *  derive Total=Subtotal×Factor when Total itself is blank. A persisted L1 row's G/H are only
+ *  ever written this way when the sheet has actually been displayed in the grid (recalculateWorkbook's
+ *  rollupL2IntoL1 deliberately leaves them alone), so the export — which reads straight from
+ *  SQLite — must re-apply the same default or Factor/Total show blank despite Subtotal being set. */
+function deriveFactorTotal(subtotal: number | undefined, factor: number | undefined, total: number | undefined): { factor?: number; total?: number } {
+  if (subtotal == null) return { factor, total };
+  if (factor == null && subtotal > 0) factor = 1;
+  if (total == null) total = subtotal * (factor ?? 0);
+  return { factor, total };
 }
 
 /** Build one flattened export row from an evaluated sheet row (see `evaluateClonedRows`). */
 function flatExportRowFrom(evaluated: unknown[], sectionCode: string, sectionDesc: string): FlatExportRow {
+  const subtotal = numOrUndefined(evaluated[COL_SUBTOTAL]);
+  const { factor, total } = deriveFactorTotal(subtotal, numOrUndefined(evaluated[COL_FACTOR]), numOrUndefined(evaluated[COL_TOTAL]));
   return {
     sectionCode, sectionDesc,
     code: textOrBlank(evaluated[COL_CODE]), desc: textOrBlank(evaluated[COL_DESC]),
     qty: numOrUndefined(evaluated[COL_QTY]), unit: textOrBlank(evaluated[COL_UNIT]), rate: numOrUndefined(evaluated[COL_RATE]),
-    subtotal: numOrUndefined(evaluated[COL_SUBTOTAL]), factor: numOrUndefined(evaluated[COL_FACTOR]), total: numOrUndefined(evaluated[COL_TOTAL]),
+    subtotal, factor, total,
     lab: numOrUndefined(evaluated[COL_LAB]), labTotal: numOrUndefined(evaluated[COL_LAB_TOTAL]),
     mat: numOrUndefined(evaluated[COL_MAT]), matTotal: numOrUndefined(evaluated[COL_MAT_TOTAL]),
     sub: numOrUndefined(evaluated[COL_SUB]), subTotal: numOrUndefined(evaluated[COL_SUB_TOTAL]),
@@ -2960,8 +2977,13 @@ export function WorkbookView() {
       // rows ARE that level, with no separate grouping columns.
       const includeSectionCols = levels.l1 && levels.l2;
 
+      // A Factor formula like `=1+margin_pct/100` references a named cell — evaluate
+      // against resolved named values (not the plain evaluateClonedRows) or HyperFormula
+      // can't resolve the name and the cell silently reads as blank/zero.
+      const namedValues = await resolveNamedValues(revId);
+
       const l1Source = await fetchSheetSourceData(revId, "L1");
-      const l1Evaluated = evaluateClonedRows(l1Source);
+      const l1Evaluated = evaluateWithNames(l1Source, namedValues);
 
       const flatRows: FlatExportRow[] = [];
       for (let row = 0; row < NUM_ROWS; row++) {
@@ -2988,9 +3010,35 @@ export function WorkbookView() {
           continue;
         }
 
-        const childEvaluated = evaluateClonedRows(childSource);
+        // With both levels selected, bracket each section's items with a header row
+        // (the section name) and a footer row (its rolled-up totals) rather than only
+        // relying on the repeated leading Section columns to show where it begins/ends.
+        if (includeSectionCols) {
+          flatRows.push({ sectionCode, sectionDesc, code: "", desc: "", unit: "", rowKind: "header" });
+        }
+
+        const childEvaluated = evaluateWithNames(childSource, namedValues);
         for (const cr of childLineRows) {
           flatRows.push(flatExportRowFrom(childEvaluated[cr] as unknown[], sectionCode, sectionDesc));
+        }
+
+        if (includeSectionCols) {
+          // Subtotal = the section's own rolled-up Subtotal (from L1); Factor = the
+          // section's own Factor (from L1); Total = the product of the two — per spec,
+          // computed directly rather than trusting whatever Total happens to be stored.
+          const subtotal = numOrUndefined(sectionEval[COL_SUBTOTAL]);
+          const { factor } = deriveFactorTotal(subtotal, numOrUndefined(sectionEval[COL_FACTOR]), undefined);
+          const total = subtotal != null ? subtotal * (factor ?? 0) : undefined;
+          flatRows.push({
+            sectionCode: "", sectionDesc: `Total of ${sectionDesc}`,
+            code: "", desc: "", unit: "",
+            subtotal, factor, total,
+            lab: numOrUndefined(sectionEval[COL_LAB]), labTotal: numOrUndefined(sectionEval[COL_LAB_TOTAL]),
+            mat: numOrUndefined(sectionEval[COL_MAT]), matTotal: numOrUndefined(sectionEval[COL_MAT_TOTAL]),
+            sub: numOrUndefined(sectionEval[COL_SUB]), subTotal: numOrUndefined(sectionEval[COL_SUB_TOTAL]),
+            sum: numOrUndefined(sectionEval[COL_SUM]), sumTotal: numOrUndefined(sectionEval[COL_SUM_TOTAL]),
+            rowKind: "footer",
+          });
         }
       }
 
@@ -3029,6 +3077,15 @@ export function WorkbookView() {
       for (const c of cols) {
         if (c.numFmt) sheet.getColumn(c.key).numFmt = c.numFmt;
       }
+      flatRows.forEach((r, i) => {
+        if (!r.rowKind) return;
+        const excelRow = sheet.getRow(i + 2); // +1 for the header row, +1 to convert to 1-based
+        excelRow.font = { bold: true };
+        excelRow.fill = {
+          type: "pattern", pattern: "solid",
+          fgColor: { argb: r.rowKind === "header" ? "FFD9D9D9" : "FFFFF2CC" },
+        };
+      });
 
       const filePath = await saveDialog({
         defaultPath: "workbook.xlsx",
@@ -3582,6 +3639,32 @@ export function WorkbookView() {
   }
 
   /**
+   * Resolves every named cell's current true value by evaluating its bound sheet's own
+   * formulas — two passes so a named cell whose formula references another named cell
+   * settles to a stable value. Shared by `recalculateWorkbook` and `exportExcel`: both
+   * need every sheet's formulas evaluated with live named-cell values, since only one
+   * sheet is ever loaded into HyperFormula's "Sheet1" at a time (see the module doc
+   * comment above `evaluateClonedRows`), so a formula on a sheet other than the one
+   * currently displayed can't resolve a name like `margin_pct` without this.
+   */
+  async function resolveNamedValues(revisionId: number): Promise<Map<string, unknown>> {
+    const namedValues = new Map<string, unknown>();
+    for (const nc of namedCellMap.current.values()) namedValues.set(nc.name, 0);
+    for (let pass = 0; pass < 2; pass++) {
+      for (const nc of namedCellMap.current.values()) {
+        const data = (await fetchSheetForRecalc(revisionId, nc.path)) ?? createEmptyData();
+        const computed = evaluateWithNames(data, namedValues);
+        // Cache the full evaluated snapshot too — readCellValue() (used when this
+        // sheet's cells are later referenced by name from wherever the user is
+        // currently viewing) falls back to it instead of an un-evaluated formula string.
+        sheetComputedMap.current.set(nc.path, computed);
+        namedValues.set(nc.name, computed[nc.row]?.[nc.col] ?? null);
+      }
+    }
+    return namedValues;
+  }
+
+  /**
    * Recalculate the whole workbook: re-evaluates every sheet's formulas against
    * every named cell's *current* value, then re-runs the same rollup drillUp would
    * apply at every parent/child boundary — without requiring the user to physically
@@ -3610,22 +3693,9 @@ export function WorkbookView() {
     sheetDataMap.current.set(curPath, curSourceData);
     persistSheet(revId, curPath, curSourceData);
 
-    // 1. Resolve every named cell's current true value by evaluating its bound
-    //    sheet's own formulas. Two passes so a named cell whose formula references
-    //    another named cell (rare, but not disallowed) settles to a stable value.
-    const namedValues = new Map<string, unknown>();
-    for (const nc of namedCellMap.current.values()) namedValues.set(nc.name, 0);
-    for (let pass = 0; pass < 2; pass++) {
-      for (const nc of namedCellMap.current.values()) {
-        const data = (await fetchSheetForRecalc(revId, nc.path)) ?? createEmptyData();
-        const computed = evaluateWithNames(data, namedValues);
-        // Cache the full evaluated snapshot too — readCellValue() (used when this
-        // sheet's cells are later referenced by name from wherever the user is
-        // currently viewing) falls back to it instead of an un-evaluated formula string.
-        sheetComputedMap.current.set(nc.path, computed);
-        namedValues.set(nc.name, computed[nc.row]?.[nc.col] ?? null);
-      }
-    }
+    // 1. Resolve every named cell's current true value by evaluating its bound sheet's
+    //    own formulas.
+    const namedValues = await resolveNamedValues(revId);
 
     // 2. Walk the L1 → L2 → L3 tree bottom-up, re-evaluating each sheet against the
     //    resolved named values and rolling child totals into their parent row —
