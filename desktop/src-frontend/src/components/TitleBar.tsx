@@ -2,6 +2,9 @@ import { useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { theme } from "../theme";
 import { FileMenu } from "./FileMenu";
+import { ViewMenu } from "./ViewMenu";
+import { WorkbookMenu } from "./WorkbookMenu";
+import { HelpMenu } from "./HelpMenu";
 
 const appWindow = getCurrentWindow();
 
@@ -37,6 +40,9 @@ export function TitleBar() {
         <span style={{ color: theme.accent, fontWeight: 600 }}>IQ</span>
         <span>StudIQ</span>
         <FileMenu />
+        <ViewMenu />
+        <WorkbookMenu />
+        <HelpMenu />
       </div>
       <div style={{ display: "flex", height: "100%" }}>
         <TitleBarButton title="Minimize" onClick={() => void appWindow.minimize()}>
