@@ -518,6 +518,14 @@ fn load_document_meta_via_renderer(
 }
 
 #[tauri::command]
+async fn show_splashscreen(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(splash) = app.get_webview_window("splashscreen") {
+        let _ = splash.show();
+    }
+    Ok(())
+}
+
+#[tauri::command]
 async fn close_splashscreen(app: tauri::AppHandle) -> Result<(), String> {
     if let Some(splash) = app.get_webview_window("splashscreen") {
         let _ = splash.close();
@@ -4964,6 +4972,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            show_splashscreen,
             close_splashscreen,
             get_active_project,
             get_startup_file,

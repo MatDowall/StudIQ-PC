@@ -481,14 +481,36 @@ function makeStudRect(centre: PagePoint, dir: PagePoint, halfThk: number, halfDe
 }
 
 /**
- * Corner sheet-fixing gap (mm) between corner studs 2 and 3 = wall depth − stud thickness, so
- * stud 3's outer face lands on the wall's internal corner (the inner face of the lead-in wall),
- * forming the internal nailing corner. Equals 45 mm for a 90×45 wall (the docs example), and
- * grows with deeper framing (95 mm for 140×45, etc.). See docs/corner makeup.png.
+ * Number of stud-thickness-wide (45 mm) packer blocks that pack out the corner sheet-fixing gap
+ * between corner studs 2 and 3 (docs/corner makeup.png) — one per wall depth increment: 1 for
+ * 90×45, 2 for 140×45, up to 5 for 290×45. Zero for 45×45 — a wall that thin has no gap to pack at
+ * all, so the corner is just 3 studs meeting flush (docs/corner makeup 45mm.png).
+ */
+export function cornerPackerCount(size: FramingSize): number {
+  const depthMm = framingDepthMm(size);
+  if (depthMm <= STUD_THICKNESS_MM) return 0;
+  return Math.round((depthMm - 90) / 50) + 1;
+}
+
+/**
+ * Corner sheet-fixing gap (mm) between corner studs 2 and 3 — sized to exactly fit
+ * `cornerPackerCount` 45 mm-wide packer blocks with no leftover sliver (builders pack this gap
+ * out with whole blocking, not a part-filled gap), rather than the raw depth − stud-thickness
+ * distance. Stud 3 sits this far from stud 2, which lands its outer face at (or, for framing
+ * deeper than 90×45, up to ~20 mm short of) the wall's internal corner. Equals 45 mm for a 90×45
+ * wall (the docs example, an exact match with depth − thickness), 90 mm for 140×45 (depth −
+ * thickness would be 95 mm — deliberately shorted to a whole packer multiple), and 0 for 45×45
+ * (studs 2 and 3 sit flush against each other — a plain 3-stud corner, no packing needed). See
+ * docs/corner makeup.png.
  */
 export function cornerGapMm(size: FramingSize): number {
-  return framingDepthMm(size) - STUD_THICKNESS_MM;
+  return cornerPackerCount(size) * STUD_THICKNESS_MM;
 }
+
+/** Length (mm) of a solid corner packer block — see `cornerPackerCount`. Always 300 mm regardless
+ *  of framing size; a deeper wall packs more of them side by side (`cornerPackerCount`), never a
+ *  taller block. */
+export const PACKER_LENGTH_MM = 300;
 
 /** Per-segment stud set-out: `a`/`dir`/`segLen` plus the arc-length centres of the `anchor` studs
  *  (flush ends + the NZ 3-stud corner makeup, always present) and the `regular` infill studs
@@ -825,6 +847,7 @@ export type FramingComponentKind =
   | "plate"
   | "stud"
   | "dwang"
+  | "packer"
   | "king"
   | "trimmer"
   | "lintel"
@@ -832,10 +855,11 @@ export type FramingComponentKind =
   | "sill"
   | "sill_jack";
 
-const KIND_ORDER: FramingComponentKind[] = ["plate", "stud", "dwang", "king", "trimmer", "lintel", "jack", "sill", "sill_jack"];
+const KIND_ORDER: FramingComponentKind[] = ["plate", "stud", "dwang", "packer", "king", "trimmer", "lintel", "jack", "sill", "sill_jack"];
 const KIND_LABEL: Record<FramingComponentKind, string> = {
   plate: "Plates",
   stud: "Studs",
+  packer: "Packers",
   dwang: "Dwangs",
   king: "King studs",
   trimmer: "Trimmers",
@@ -1337,8 +1361,15 @@ export function wallMembers(
 
     // Dwangs — per row (fixed centres up from the bottom plate), between adjacent members present at
     // that height, skipping a bay that spans an open daylight (door: full height; window: sill→head).
+    // The corner-makeup gap (between corner studs 2 & 3, docs/corner makeup.png) gets solid packer
+    // blocks instead — a real dwang can't reach across it, so it's packed out with 300 mm blocking.
+    // Still a single row at the dwang-row height (never stacked taller): `cornerPackerCount` blocks
+    // sit side by side across the gap's width, each one stud-thickness (45 mm) wide, so a deeper
+    // wall (wider gap) gets more 300 mm blocks packed in, not one taller block.
     if (settings.dwangsOn && centresMm > 0) {
       const maxTop = verticals.reduce((mx, v) => Math.max(mx, v.yT), 0);
+      const cornerGapX0 = seg.startCorner ? seg.anchors[0] : null;
+      const cornerGapX1 = seg.startCorner ? seg.anchors[1] : null;
       for (let h = bottomMakeup + centresMm; h <= maxTop + 1e-6; h += centresMm) {
         const present = verticals.filter((v) => v.yB <= h + 1e-6 && v.yT >= h - 1e-6).sort((a, b) => a.x - b.x);
         for (let i = 0; i + 1 < present.length; i += 1) {
@@ -1346,7 +1377,22 @@ export function wallMembers(
           if (openMeta.some((o) => Math.abs(mid - o.centrePts) < o.dwHalf && h > o.sill + 1e-6 && h < o.head - 1e-6)) continue;
           const bayGapMm = (present[i + 1].x - present[i].x) * mmPerPoint - STUD_THICKNESS_MM;
           if (bayGapMm <= 0) continue;
-          members.push({ kind: "dwang", lengthM: M(bayGapMm), position: [fx(mid), M(h), fz(mid)], size: [M(bayGapMm), thkM, depthM], yaw, pitch: 0 });
+          const isCornerGap =
+            cornerGapX0 !== null &&
+            cornerGapX1 !== null &&
+            Math.abs(present[i].x - cornerGapX0) < GEOM_EPS &&
+            Math.abs(present[i + 1].x - cornerGapX1) < GEOM_EPS;
+          if (isCornerGap) {
+            const packerCount = cornerPackerCount(settings.framingSize);
+            const groupWidthPts = packerCount * studThkPts;
+            const groupStart = mid - groupWidthPts / 2 + studThkPts / 2;
+            for (let p = 0; p < packerCount; p += 1) {
+              const s = groupStart + p * studThkPts;
+              members.push({ kind: "packer", lengthM: M(PACKER_LENGTH_MM), position: [fx(s), M(h), fz(s)], size: [thkM, M(PACKER_LENGTH_MM), depthM], yaw, pitch: 0 });
+            }
+          } else {
+            members.push({ kind: "dwang", lengthM: M(bayGapMm), position: [fx(mid), M(h), fz(mid)], size: [M(bayGapMm), thkM, depthM], yaw, pitch: 0 });
+          }
         }
       }
     }

@@ -45,6 +45,7 @@ export const MEMBER_COLOURS: Record<string, string> = {
   plate: "#C77F2E",
   stud: "#3F6FB0",
   dwang: "#7A7F87",
+  packer: "#5C6270",
   king: "#2E8B57",
   trimmer: "#C0392B",
   lintel: "#7D3C98",

@@ -7,6 +7,7 @@ import {
   computeFramingGeometry,
   computeFramingQuantities,
   cornerGapMm,
+  cornerPackerCount,
   dwangRowCount,
   dwangRowsForStudHeight,
   orthogonalConstrain,
@@ -126,10 +127,10 @@ describe("corners (M4)", () => {
     expect(out).toEqual({ x: 37, y: 91 });
   });
 
-  it("corner gap scales with wall depth (depth − thickness)", () => {
-    expect(cornerGapMm("90x45")).toBe(45);
-    expect(cornerGapMm("140x45")).toBe(95);
-    expect(cornerGapMm("190x45")).toBe(145);
+  it("corner gap is sized to exact 45mm packer multiples, not the raw depth − thickness distance", () => {
+    expect(cornerGapMm("90x45")).toBe(45); // exact match: depth − thickness is already 45
+    expect(cornerGapMm("140x45")).toBe(90); // depth − thickness would be 95; shorted to 2 × 45
+    expect(cornerGapMm("190x45")).toBe(135); // depth − thickness would be 145; shorted to 3 × 45
   });
 
   it("corner studs stay non-overlapping for a deeper 140×45 frame", () => {
@@ -148,6 +149,93 @@ describe("corners (M4)", () => {
         expect(ix * iy).toBeLessThan(1);
       }
     }
+  });
+
+  it("packer count scales with corner gap width, ~1 per 50 mm (docs/corner makeup.png)", () => {
+    expect(cornerPackerCount("45x45")).toBe(0); // no gap to pack — plain 3-stud corner
+    expect(cornerPackerCount("90x45")).toBe(1);
+    expect(cornerPackerCount("140x45")).toBe(2);
+    expect(cornerPackerCount("190x45")).toBe(3);
+    expect(cornerPackerCount("240x45")).toBe(4);
+    expect(cornerPackerCount("290x45")).toBe(5);
+  });
+
+  it("a 45×45 corner has zero gap and gets no packer at all — just 3 flush studs", () => {
+    expect(cornerGapMm("45x45")).toBe(0);
+    const members = wallMembers(lWall, settings({ framingSize: "45x45" }), MM_PER_PT);
+    expect(members.filter((m) => m.kind === "packer")).toHaveLength(0);
+    // The two corner-makeup studs sit exactly one stud-thickness apart (flush, touching faces).
+    const arcLenMm = (m: (typeof members)[number]) => m.position[2] * 1000;
+    const cornerStuds = members
+      .filter((m) => m.kind === "stud" && Math.abs(m.position[0] - 2) < 1e-9)
+      .sort((a, b) => arcLenMm(a) - arcLenMm(b))
+      .slice(0, 2);
+    expect(arcLenMm(cornerStuds[1]) - arcLenMm(cornerStuds[0])).toBeCloseTo(STUD_THICKNESS_MM, 6);
+  });
+
+  it("the corner-makeup gap gets packer blocks instead of a dwang (2 rows × 1 packer for 90×45)", () => {
+    const members = wallMembers(lWall, settings({ framingSize: "90x45" }), MM_PER_PT);
+    const packers = members.filter((m) => m.kind === "packer");
+    expect(packers).toHaveLength(2);
+    for (const p of packers) {
+      expect(p.lengthM).toBeCloseTo(0.3, 6); // always 300 mm long, never taller
+      expect(p.size[0]).toBeCloseTo(STUD_THICKNESS_MM / 1000, 6); // 45 mm wide
+      expect(p.size[1]).toBeCloseTo(0.3, 6);
+      expect(p.size[2]).toBeCloseTo(0.09, 6); // full 90 mm wall depth
+    }
+    // None of the plain dwangs span the corner gap itself (45 mm) — it's packer-only.
+    const dwangs = members.filter((m) => m.kind === "dwang");
+    expect(dwangs.every((d) => Math.abs(d.lengthM - cornerGapMm("90x45") / 1000) > 1e-6)).toBe(true);
+  });
+
+  it("a deeper 140×45 corner packs 2 blocks side by side in a single row, never a taller stack", () => {
+    const members = wallMembers(lWall, settings({ framingSize: "140x45" }), MM_PER_PT);
+    const packers = members.filter((m) => m.kind === "packer");
+    expect(packers).toHaveLength(4); // 2 dwang rows × 2 blocks each
+    for (const p of packers) {
+      expect(p.lengthM).toBeCloseTo(0.3, 6); // still always 300 mm, never grows
+      expect(p.size[1]).toBeCloseTo(0.3, 6);
+      expect(p.size[2]).toBeCloseTo(0.14, 6); // full 140 mm wall depth
+    }
+    // Group by row height (Y position) — each row's pair sits at the SAME height (single row),
+    // spread apart in X (the wall-run axis) rather than stacked taller in Y.
+    const byRow = new Map<number, typeof packers>();
+    for (const p of packers) {
+      const key = Math.round(p.position[1] * 1e6);
+      byRow.set(key, [...(byRow.get(key) ?? []), p]);
+    }
+    expect(byRow.size).toBe(2); // 2 distinct row heights, not 4
+    for (const rowPackers of byRow.values()) {
+      expect(rowPackers).toHaveLength(2);
+      const [a, b] = rowPackers;
+      expect(a.position[1]).toBeCloseTo(b.position[1], 6); // same height
+      const dx = a.position[0] - b.position[0];
+      const dz = a.position[2] - b.position[2];
+      expect(Math.hypot(dx, dz)).toBeCloseTo(STUD_THICKNESS_MM / 1000, 6); // offset sideways by 45 mm
+    }
+  });
+
+  it("the packer group fills the corner gap flush, with zero leftover sliver either side", () => {
+    const members = wallMembers(lWall, settings({ framingSize: "140x45" }), MM_PER_PT);
+    // Segment 1 (the corner segment) runs due south, so its world Z directly encodes arc-length
+    // (mm, since MM_PER_PT = 1) — usable here to compare stud faces against the packer footprint.
+    const arcLenMm = (m: (typeof members)[number]) => m.position[2] * 1000;
+    const cornerStuds = members
+      .filter((m) => m.kind === "stud" && Math.abs(m.position[0] - 2) < 1e-9)
+      .sort((a, b) => arcLenMm(a) - arcLenMm(b))
+      .slice(0, 2); // the two corner-makeup studs sit first along the segment
+    const gapLo = arcLenMm(cornerStuds[0]) + STUD_THICKNESS_MM / 2; // stud 2's outer face
+    const gapHi = arcLenMm(cornerStuds[1]) - STUD_THICKNESS_MM / 2; // stud 3's inner face
+    expect(gapHi - gapLo).toBeCloseTo(cornerGapMm("140x45"), 6);
+
+    const rowPackers = members
+      .filter((m) => m.kind === "packer" && Math.abs(m.position[1] - 0.845) < 1e-6)
+      .sort((a, b) => arcLenMm(a) - arcLenMm(b));
+    expect(rowPackers).toHaveLength(2);
+    const footprintLo = arcLenMm(rowPackers[0]) - STUD_THICKNESS_MM / 2;
+    const footprintHi = arcLenMm(rowPackers[rowPackers.length - 1]) + STUD_THICKNESS_MM / 2;
+    expect(footprintLo).toBeCloseTo(gapLo, 6);
+    expect(footprintHi).toBeCloseTo(gapHi, 6);
   });
 });
 
