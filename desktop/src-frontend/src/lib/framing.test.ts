@@ -327,6 +327,54 @@ describe("doors (M5) — 4 m wall, 90×45, single T&B, 2400 high, door at 2.0 m 
   });
 });
 
+describe("CRITICAL regression: a wall resized shorter than an opening already on it must not hang/crash", () => {
+  // A wall can be shrunk (drag an endpoint) after a door/window is already placed on it, leaving
+  // the opening's king/trimmer arc-length positions beyond every segment's own length. Their world
+  // point then falls outside every segment's footprint test in `ceilingMmAt`, which used to leave
+  // its `min` accumulator at the initial `Infinity` sentinel and return that unchanged. That
+  // Infinity became a vertical member's `yT`, then `maxTop` (`verticals.reduce(Math.max, 0)`), then
+  // the dwang-row loop's upper bound (`for (h = ...; h <= maxTop; h += centresMm)`) — which never
+  // terminates against `Infinity`, so it just kept pushing members forever. In the app this exhausts
+  // memory and crashes; because the resize is persisted immediately, reopening the project hit the
+  // same computation on load and crashed again, with no way to fix it from the UI.
+  const settings90 = settings({ framingSize: "90x45", wallHeightMm: 2400 });
+  const door = { kind: "door" as const, segmentIndex: 0, centreMm: 2000, daylightHeightMm: 2100, daylightWidthMm: 910, lintelSize: "90x45" as const, lintelPly: 2 };
+  const window_ = { kind: "window" as const, segmentIndex: 0, centreMm: 2000, sillHeightMm: 900, daylightHeightMm: 1200, daylightWidthMm: 1200, lintelSize: "90x45" as const, lintelPly: 2 };
+
+  it("door: wall shrunk well short of the opening still returns a small, finite member list", () => {
+    const wall = [{ x: 0, y: 0 }, { x: 1000, y: 0 }];
+    const framing = { openings: [door], rakes: [], extraStuds: [] };
+    const members = wallMembers(wall, settings90, MM_PER_PT, framing);
+    expect(members.length).toBeLessThan(500);
+    expect(members.every((m) => Number.isFinite(m.lengthM) && Number.isFinite(m.size[1]))).toBe(true);
+  });
+
+  it("door: the new wall end lands inside the opening's own daylight width (the reported repro)", () => {
+    const wall = [{ x: 0, y: 0 }, { x: 1900, y: 0 }]; // daylight spans [1545, 2455] — 1900 is inside it
+    const framing = { openings: [door], rakes: [], extraStuds: [] };
+    const members = wallMembers(wall, settings90, MM_PER_PT, framing);
+    expect(members.length).toBeLessThan(500);
+    expect(members.every((m) => Number.isFinite(m.lengthM))).toBe(true);
+  });
+
+  it("window variant is equally bounded", () => {
+    const wall = [{ x: 0, y: 0 }, { x: 1000, y: 0 }];
+    const framing = { openings: [window_], rakes: [], extraStuds: [] };
+    const members = wallMembers(wall, settings90, MM_PER_PT, framing);
+    expect(members.length).toBeLessThan(500);
+    expect(members.every((m) => Number.isFinite(m.lengthM))).toBe(true);
+  });
+
+  it("computeFramingQuantities and computeFramingGeometry stay finite too (the two other live call sites)", () => {
+    const wall = [{ x: 0, y: 0 }, { x: 1000, y: 0 }];
+    const framing = { openings: [door], rakes: [], extraStuds: [] };
+    const q = computeFramingQuantities(wall, settings90, MM_PER_PT, framing);
+    expect(q && Number.isFinite(q.totalM)).toBe(true);
+    const geom = computeFramingGeometry(wall, settings90, MM_PER_PT, framing);
+    expect(geom.studs.length).toBeLessThan(500);
+  });
+});
+
 describe("regression: a regular stud just outside the door's daylight width must stay a full stud, not vanish (QA-reported jack-stud undercount)", () => {
   // 4 m wall, 500mm centres, 90×45. Door centred at 1022.5mm with the default 910mm daylight width
   // (dwHalf = 455mm) puts two regular studs (at 522.5mm and 1522.5mm, i.e. exactly 500mm off the

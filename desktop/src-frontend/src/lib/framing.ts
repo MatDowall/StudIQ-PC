@@ -1010,7 +1010,13 @@ export function wallMembers(
     }
     return false;
   };
-  /** The lowest underside-of-top-plate height (mm) of any segment whose footprint covers `p`. */
+  /** The lowest underside-of-top-plate height (mm) of any segment whose footprint covers `p`. Falls
+   *  back to the plain wall height when no segment's footprint covers `p` at all — e.g. a wall
+   *  resized shorter than an opening still on it leaves the opening's king/trimmer positions
+   *  outside every segment's arc-length range. Returning `Infinity` there (the old behaviour) would
+   *  propagate into a member's `yT`, then into the dwang-row loop's upper bound below, running it
+   *  forever (a real crash: `for (h = ...; h <= maxTop; h += centresMm)` never terminates against
+   *  `Infinity`) — always returning a finite height keeps every downstream computation bounded. */
   const ceilingMmAt = (p: PagePoint): number => {
     let min = Infinity;
     layout.forEach((segJ, j) => {
@@ -1024,7 +1030,7 @@ export function wallMembers(
         min = Math.min(min, heightAt(j, frac) - topMakeup);
       }
     });
-    return min;
+    return Number.isFinite(min) ? min : settings.wallHeightMm - topMakeup;
   };
 
   layout.forEach((seg, segIndex) => {
