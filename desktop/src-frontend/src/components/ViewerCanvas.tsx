@@ -15,7 +15,6 @@ import {
   reindexFramingForVertexDeletion,
   reindexFramingForVertexInsertion,
   serializeWallFraming,
-  STUD_THICKNESS_MM,
   wallStudPositions,
   type Opening,
   type OpeningTemplate,
@@ -329,71 +328,21 @@ function drawFraming(
     return;
   }
 
-  // Plate outlines — solid, but the section spanning a door/window opening is drawn as a thin
-  // dashed line so the opening reads clearly. Build per-path-segment opening arc-length ranges.
+  // Plate outlines — solid and unbroken, including across door/window openings (the opening
+  // itself is still legible from the jamb studs and, for a window, the glass centreline below).
   const baseWidth = selected ? FRAMING_LINE_WIDTH + 1 : FRAMING_LINE_WIDTH;
-  // The dashed span covers the whole opening assembly (king-to-king), so the solid plate stops
-  // outside the kings rather than running over the jamb studs.
-  const segRanges: { lo: number; hi: number }[][] = points.map(() => []);
-  if (mmPerPoint) {
-    const jambPts = 2 * (STUD_THICKNESS_MM / mmPerPoint); // trimmer + king on each side
-    for (const o of framing?.openings ?? []) {
-      const c = o.centreMm / mmPerPoint;
-      const h = o.daylightWidthMm / mmPerPoint / 2 + jambPts;
-      if (segRanges[o.segmentIndex]) segRanges[o.segmentIndex].push({ lo: c - h, hi: c + h });
-    }
-  }
   ctx.strokeStyle = colour;
-  ctx.lineCap = "butt"; // plate breaks end exactly at the opening edge (no round-cap overshoot)
+  ctx.lineWidth = baseWidth;
+  ctx.setLineDash(lineDash(style, baseWidth));
   for (const edge of [geom.plateLeft, geom.plateRight]) {
     if (edge.length < 2) continue;
-    for (let i = 0; i < edge.length - 1; i += 1) {
-      const a = edge[i];
-      const b = edge[i + 1];
-      const segLen = Math.hypot(points[i + 1].x - points[i].x, points[i + 1].y - points[i].y) || 1;
-      const ranges = (segRanges[i] ?? [])
-        .filter((r) => r.hi > 0 && r.lo < segLen)
-        .map((r) => ({ lo: Math.max(0, r.lo) / segLen, hi: Math.min(segLen, r.hi) / segLen }))
-        .sort((x, y) => x.lo - y.lo);
-      const lerp = (t: number) => toScreen({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
-      const strokeLine = (t0: number, t1: number) => {
-        const p0 = lerp(t0);
-        const p1 = lerp(t1);
-        ctx.beginPath();
-        ctx.moveTo(p0.x, p0.y);
-        ctx.lineTo(p1.x, p1.y);
-        ctx.stroke();
-      };
-      const stroke = (t0: number, t1: number, dashed: boolean) => {
-        if (t1 - t0 < 1e-6) return;
-        if (dashed) {
-          // Dash phase resets to "on" at the start of each stroke() call, but wherever the pattern
-          // lands at the far end is whatever the span length happens to divide into — usually mid-gap,
-          // leaving a visible blank right where the dashed span meets the solid plate line. Drawing the
-          // dash from each end in toward the middle guarantees an "on" dash touches both seams; any
-          // leftover mismatch lands in the middle of the opening where it isn't visible against a seam.
-          ctx.setLineDash([5, 4]);
-          ctx.lineWidth = 1;
-          const tm = (t0 + t1) / 2;
-          strokeLine(t0, tm);
-          strokeLine(t1, tm);
-          return;
-        }
-        ctx.setLineDash(lineDash(style, baseWidth));
-        ctx.lineWidth = baseWidth;
-        strokeLine(t0, t1);
-      };
-      let t = 0;
-      for (const r of ranges) {
-        stroke(t, r.lo, false);
-        stroke(r.lo, r.hi, true);
-        t = r.hi;
-      }
-      stroke(t, 1, false);
-    }
+    const sp = edge.map(toScreen);
+    ctx.beginPath();
+    ctx.moveTo(sp[0].x, sp[0].y);
+    for (const s of sp.slice(1)) ctx.lineTo(s.x, s.y);
+    ctx.stroke();
   }
   ctx.setLineDash([]);
-  ctx.lineCap = "round";
 
   // Studs.
   ctx.lineWidth = selected ? 1.8 : 1.3;
