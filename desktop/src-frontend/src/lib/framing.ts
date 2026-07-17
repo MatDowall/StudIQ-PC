@@ -393,8 +393,11 @@ export interface FramingGeometry {
   /** The two parallel plate edges (centre path offset ±depth/2). */
   plateLeft: PagePoint[];
   plateRight: PagePoint[];
-  /** Each stud as its 4 corners (PDF points), ordered for a closed rectangle. */
-  studs: PagePoint[][];
+  /** Each stud as its 4 corners (PDF points, ordered for a closed rectangle), plus whether it's a
+   *  continuous full-height member (regular stud/king — drawn with a corner-to-corner cross) or a
+   *  non-continuous one interrupted by an opening (trimmer/jack — drawn with a single diagonal,
+   *  the standard architectural symbol for a non-continuous member). */
+  studs: { rect: PagePoint[]; continuous: boolean }[];
   studCount: number;
   /** Door/window daylight openings (the rectangular gap in the wall), for rendering. */
   openings: { daylight: PagePoint[]; kind: "door" | "window" }[];
@@ -675,7 +678,7 @@ export function computeFramingGeometry(
   const openings = framing?.openings ?? [];
   const rakes = framing?.rakes ?? [];
 
-  const studs: PagePoint[][] = [];
+  const studs: { rect: PagePoint[]; continuous: boolean }[] = [];
   const openingRects: { daylight: PagePoint[]; kind: "door" | "window" }[] = [];
 
   const halfDepthForCut = halfDepth;
@@ -743,6 +746,15 @@ export function computeFramingGeometry(
       .filter((s) => isStudDoubled(framing, segIndex, s * mmPerPoint))
       .map((s) => s + sisterOffset(s));
 
+    // Jack stud positions: regular-grid candidates that land inside an opening's own daylight width
+    // — cut from the continuous stud run by the opening, but present in real framing as a cripple
+    // ("jack") above the lintel (and, for a window, a matching sill jack below the sill, at the same
+    // plan position) — mirrors `jackGridPositions` in `wallMembers`. Non-continuous in plan (single
+    // diagonal), unlike a king or a full-height regular stud.
+    const jackXs = allCandidates.filter((s) =>
+      segOpenings.some((o) => Math.abs(s - o.centreMm / mmPerPoint) <= o.daylightWidthMm / mmPerPoint / 2),
+    );
+
     // Unlike `wallMembers` (which correctly keeps a king and a trimmer from two DIFFERENT openings
     // as separate members when they land close together, since they occupy different HEIGHTS — a
     // door's trimmer runs to its own lintel while a window's king above continues to the ceiling), a
@@ -750,18 +762,21 @@ export function computeFramingGeometry(
     // thickness of each other are, on this page, the same visible stud, and drawing both produces
     // the crossed/overlapping-rect artefact reported by QA. So here (only) they're deduped into one
     // rect regardless of which requirement produced them.
-    const finalXs: number[] = [];
-    const addFinal = (x: number) => {
-      if (!finalXs.some((f) => Math.abs(f - x) < studThkPts / 2)) finalXs.push(x);
+    const finalXs: { x: number; continuous: boolean }[] = [];
+    const addFinal = (x: number, continuous: boolean) => {
+      if (!finalXs.some((f) => Math.abs(f.x - x) < studThkPts / 2)) finalXs.push({ x, continuous });
     };
-    for (const x of kingXs) addFinal(x);
-    for (const x of trimmerXs) addFinal(x);
+    // Kings and full-height regular studs are continuous; trimmers and jacks are interrupted by the
+    // opening they jamb/cripple, so they get the non-continuous (single-diagonal) symbol.
+    for (const x of kingXs) addFinal(x, true);
+    for (const x of trimmerXs) addFinal(x, false);
     for (const s of notCut) {
       if (sisterPositions.some((sx) => Math.abs(sx - s) < studThkPts / 2)) continue;
-      addFinal(s);
-      if (isStudDoubled(framing, segIndex, s * mmPerPoint)) addFinal(s + sisterOffset(s));
+      addFinal(s, true);
+      if (isStudDoubled(framing, segIndex, s * mmPerPoint)) addFinal(s + sisterOffset(s), true);
     }
-    for (const x of finalXs) studs.push(makeStudRect(pointAt(seg, x), seg.dir, halfThk, halfDepth));
+    for (const x of jackXs) addFinal(x, false);
+    for (const f of finalXs) studs.push({ rect: makeStudRect(pointAt(seg, f.x), seg.dir, halfThk, halfDepth), continuous: f.continuous });
 
     for (const o of segOpenings) {
       const centrePts = o.centreMm / mmPerPoint;
@@ -772,7 +787,7 @@ export function computeFramingGeometry(
 
   for (const es of framing?.extraStuds ?? []) {
     const rect = extraStudRect(path, settings, mmPerPoint, es.segmentIndex, es.centreMm);
-    if (rect) studs.push(rect);
+    if (rect) studs.push({ rect, continuous: true });
   }
 
   return { plateLeft, plateRight, studs, studCount: studs.length, openings: openingRects };

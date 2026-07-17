@@ -356,16 +356,32 @@ function drawFraming(
         .map((r) => ({ lo: Math.max(0, r.lo) / segLen, hi: Math.min(segLen, r.hi) / segLen }))
         .sort((x, y) => x.lo - y.lo);
       const lerp = (t: number) => toScreen({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
-      const stroke = (t0: number, t1: number, dashed: boolean) => {
-        if (t1 - t0 < 1e-6) return;
+      const strokeLine = (t0: number, t1: number) => {
         const p0 = lerp(t0);
         const p1 = lerp(t1);
-        ctx.setLineDash(dashed ? [5, 4] : lineDash(style, baseWidth));
-        ctx.lineWidth = dashed ? 1 : baseWidth;
         ctx.beginPath();
         ctx.moveTo(p0.x, p0.y);
         ctx.lineTo(p1.x, p1.y);
         ctx.stroke();
+      };
+      const stroke = (t0: number, t1: number, dashed: boolean) => {
+        if (t1 - t0 < 1e-6) return;
+        if (dashed) {
+          // Dash phase resets to "on" at the start of each stroke() call, but wherever the pattern
+          // lands at the far end is whatever the span length happens to divide into — usually mid-gap,
+          // leaving a visible blank right where the dashed span meets the solid plate line. Drawing the
+          // dash from each end in toward the middle guarantees an "on" dash touches both seams; any
+          // leftover mismatch lands in the middle of the opening where it isn't visible against a seam.
+          ctx.setLineDash([5, 4]);
+          ctx.lineWidth = 1;
+          const tm = (t0 + t1) / 2;
+          strokeLine(t0, tm);
+          strokeLine(t1, tm);
+          return;
+        }
+        ctx.setLineDash(lineDash(style, baseWidth));
+        ctx.lineWidth = baseWidth;
+        strokeLine(t0, t1);
       };
       let t = 0;
       for (const r of ranges) {
@@ -382,7 +398,7 @@ function drawFraming(
   // Studs.
   ctx.lineWidth = selected ? 1.8 : 1.3;
   for (const stud of geom.studs) {
-    const c = stud.map(toScreen);
+    const c = stud.rect.map(toScreen);
     ctx.beginPath();
     ctx.moveTo(c[0].x, c[0].y);
     ctx.lineTo(c[1].x, c[1].y);
@@ -393,12 +409,15 @@ function drawFraming(
     ctx.fill();
     ctx.strokeStyle = colour;
     ctx.stroke();
-    // Corner-to-corner cross (architectural stud symbol).
     ctx.beginPath();
     ctx.moveTo(c[0].x, c[0].y);
     ctx.lineTo(c[2].x, c[2].y);
-    ctx.moveTo(c[1].x, c[1].y);
-    ctx.lineTo(c[3].x, c[3].y);
+    if (stud.continuous) {
+      // Corner-to-corner cross (architectural symbol for a continuous full-height member).
+      ctx.moveTo(c[1].x, c[1].y);
+      ctx.lineTo(c[3].x, c[3].y);
+    }
+    // Non-continuous members (trimmer/jack) get a single corner-to-corner diagonal only.
     ctx.stroke();
   }
 

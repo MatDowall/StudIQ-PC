@@ -91,7 +91,7 @@ describe("corners (M4)", () => {
       minY: Math.min(...stud.map((p) => p.y)),
       maxY: Math.max(...stud.map((p) => p.y)),
     });
-    const boxes = geom.studs.map(aabb);
+    const boxes = geom.studs.map((s) => aabb(s.rect));
     for (let i = 0; i < boxes.length; i += 1) {
       for (let j = i + 1; j < boxes.length; j += 1) {
         const ix = Math.max(0, Math.min(boxes[i].maxX, boxes[j].maxX) - Math.max(boxes[i].minX, boxes[j].minX));
@@ -141,7 +141,7 @@ describe("corners (M4)", () => {
       minY: Math.min(...stud.map((p) => p.y)),
       maxY: Math.max(...stud.map((p) => p.y)),
     });
-    const boxes = geom.studs.map(aabb);
+    const boxes = geom.studs.map((s) => aabb(s.rect));
     for (let i = 0; i < boxes.length; i += 1) {
       for (let j = i + 1; j < boxes.length; j += 1) {
         const ix = Math.max(0, Math.min(boxes[i].maxX, boxes[j].maxX) - Math.max(boxes[i].minX, boxes[j].minX));
@@ -307,6 +307,23 @@ describe("doors (M5) — 4 m wall, 90×45, single T&B, 2400 high, door at 2.0 m 
   });
   it("plates unaffected by the door (8.000 m)", () => {
     expect(comp("plate")!.totalM).toBeCloseTo(8.0, 6);
+  });
+
+  it("plan view: kings are continuous (full cross), but trimmers and jacks are non-continuous — and the jacks above the lintel (previously omitted from the plan) are now present", () => {
+    const geom = computeFramingGeometry(wall4m, settings({ framingSize: "90x45", wallHeightMm: 2400 }), MM_PER_PT, door);
+    const centreXMm = (stud: (typeof geom.studs)[number]) => stud.rect.reduce((sum, p) => sum + p.x, 0) / stud.rect.length;
+    const near = (xMm: number) => geom.studs.find((s) => Math.abs(centreXMm(s) - xMm) < 1);
+    // Kings at 2000 ± (455 + 67.5); trimmers at 2000 ± (455 + 22.5) (openingJambs, dwHalf 455, studThk 45).
+    expect(near(1477.5)?.continuous).toBe(true);
+    expect(near(2522.5)?.continuous).toBe(true);
+    expect(near(1522.5)?.continuous).toBe(false);
+    expect(near(2477.5)?.continuous).toBe(false);
+    // The 2 jacks above the lintel sit at the regular 600mm-grid positions inside the daylight width
+    // (1822.5 and 2422.5, inside [1545, 2455]) — dropped from the plan entirely before this fix.
+    expect(near(1822.5)).toBeDefined();
+    expect(near(1822.5)?.continuous).toBe(false);
+    expect(near(2422.5)).toBeDefined();
+    expect(near(2422.5)?.continuous).toBe(false);
   });
 });
 
@@ -571,11 +588,11 @@ describe("QA-reported real project case — a wide door and a narrower window on
 
   it("the 2D plan view collapses the door's right trimmer and the window's right king (0.4mm apart) into a single stud, not a crossed/overlapping pair", () => {
     const geom = computeFramingGeometry(wall, gableSettings, mmPerPoint, framing);
-    const centreArcLenMm = (rect: (typeof geom.studs)[number]) => {
-      const cy = rect.reduce((sum, p) => sum + p.y, 0) / rect.length;
+    const centreArcLenMm = (stud: (typeof geom.studs)[number]) => {
+      const cy = stud.rect.reduce((sum, p) => sum + p.y, 0) / stud.rect.length;
       return (cy - wall[0].y) * mmPerPoint;
     };
-    const near2270 = geom.studs.filter((rect) => Math.abs(centreArcLenMm(rect) - 2270) < 5);
+    const near2270 = geom.studs.filter((stud) => Math.abs(centreArcLenMm(stud) - 2270) < 5);
     expect(near2270).toHaveLength(1);
   });
 });
