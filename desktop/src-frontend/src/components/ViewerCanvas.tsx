@@ -1,8 +1,22 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { useAppStore, type SnapPoint, type SnapType } from "../store/appStore";
-import { deriveQuantity, formatQuantity, parseArrayMeta, serializeArrayMeta, type ArrayMeta, type ArrayTrim, type BoxTrim, type GroupProps } from "../lib/quantity";
+import { useAppStore, type SnapPoint, type SnapType, type TreeNodeDto } from "../store/appStore";
+import {
+  deriveQuantity,
+  formatQuantity,
+  parseArrayMeta,
+  polygonAreaPts,
+  polygonPerimeterPts,
+  quantityValueText,
+  serializeArrayMeta,
+  MEASUREMENT_TYPE_ICONS,
+  MEASUREMENT_TYPE_LABELS,
+  type ArrayMeta,
+  type ArrayTrim,
+  type BoxTrim,
+  type GroupProps,
+} from "../lib/quantity";
 import {
   computeFramingGeometry,
   computeFramingQuantities,
@@ -15,6 +29,7 @@ import {
   reindexFramingForVertexDeletion,
   reindexFramingForVertexInsertion,
   serializeWallFraming,
+  wallMembers,
   wallStudPositions,
   type Opening,
   type OpeningTemplate,
@@ -33,6 +48,7 @@ import { ContextMenu, type ContextMenuItem } from "./ContextMenu";
 import { OpeningDialog } from "./OpeningDialog";
 import { RakingDialog } from "./RakingDialog";
 import { Framing3DView } from "./Framing3DView";
+import { MeasurementHoverCard, type HoverCardData, type HoverCardRow } from "./MeasurementHoverCard";
 
 type ViewerMenuItem = ContextMenuItem;
 
@@ -201,6 +217,16 @@ function pathLengthPts(points: PagePoint[]) {
     total += Math.hypot(points[i].x - points[i - 1].x, points[i].y - points[i - 1].y);
   }
   return total;
+}
+
+/** Recursively finds a dimension-group tree node by id, for the hover card's group name/size. */
+function findGroupNode(nodes: TreeNodeDto[], childCache: Record<number, TreeNodeDto[]>, targetId: number): TreeNodeDto | null {
+  for (const node of nodes) {
+    if (node.id === targetId) return node;
+    const found = findGroupNode(childCache[node.id] ?? [], childCache, targetId);
+    if (found) return found;
+  }
+  return null;
 }
 
 // Length, timber-framing, and array dimensions are open polylines; area-type displays close
@@ -1184,7 +1210,7 @@ export function ViewerCanvas({
   const [draftPoints, setDraftPoints] = useState<PagePoint[]>([]);
   const [cursorPagePoint, setCursorPagePoint] = useState<PagePoint | null>(null);
   const [cursorClient, setCursorClient] = useState<{ x: number; y: number } | null>(null);
-  const [hoverInfo, setHoverInfo] = useState<{ x: number; y: number; text: string } | null>(null);
+  const [hoverInfo, setHoverInfo] = useState<HoverCardData | null>(null);
   // Live geometry of the dimension whose vertex is being dragged (select mode).
   const [editPreview, setEditPreview] = useState<{ id: number; points: PagePoint[] } | null>(null);
   const [viewerMenu, setViewerMenu] = useState<{ x: number; y: number; items: ViewerMenuItem[] } | null>(null);
@@ -1291,6 +1317,8 @@ export function ViewerCanvas({
   const setPageScale = useAppStore((state) => state.setPageScale);
   const loadPageScale = useAppStore((state) => state.loadPageScale);
   const groupProps = useAppStore((state) => state.groupProps);
+  const dimensionRoots = useAppStore((state) => state.dimensionRoots);
+  const childCache = useAppStore((state) => state.childCache);
   const drawPolarity = useAppStore((state) => state.drawPolarity);
   const drawingDimmer = useAppStore((state) => state.drawingDimmer);
 
@@ -3358,7 +3386,7 @@ export function ViewerCanvas({
     );
   }
 
-  // Hover tooltip over committed measurements.
+  // Hover card over committed measurements.
   function updateHover(clientX: number, clientY: number) {
     const element = viewportRef.current;
     if (!element || !page) {
@@ -3382,6 +3410,9 @@ export function ViewerCanvas({
 
       const screenPts = points.map((point) => pageToScreen(point.x, point.y, page.height_pts, pan, zoom));
       const props = groupProps[measurement.dimension_group_id];
+      const groupNode = findGroupNode(dimensionRoots, childCache, measurement.dimension_group_id);
+      const groupName = groupNode?.name ?? "";
+      const mPerPt = pageScale ? pageScale.mm_per_point / 1000 : null;
 
       // Count markers: hover by proximity to the point (or the shape footprint for custom
       // shapes), showing the count value.
@@ -3392,31 +3423,62 @@ export function ViewerCanvas({
           : screenPts.some((s) => Math.hypot(screenX - s.x, screenY - s.y) <= 8);
         if (hovered) {
           const quantity = props ? deriveQuantity(points, pageScale?.mm_per_point ?? null, props) : null;
-          setHoverInfo({ x: clientX, y: clientY, text: quantity ? formatQuantity(quantity) : "1" });
+          const rows: HoverCardRow[] = [{ label: "Total Count", value: quantity ? formatQuantity(quantity) : "1" }];
+          if (props?.count_type === "custom") {
+            rows.push({ label: "Custom Height", value: `${Math.round(props.default_height * 1000)}mm` });
+            rows.push({ label: "Custom Width", value: `${Math.round(props.default_width * 1000)}mm` });
+          }
+          setHoverInfo({
+            x: clientX,
+            y: clientY,
+            icon: MEASUREMENT_TYPE_ICONS.count,
+            groupTypeLabel: MEASUREMENT_TYPE_LABELS.count,
+            groupName,
+            mainValue: quantity ? quantityValueText(quantity) : "1",
+            mainValueUom: quantity?.uom ?? "no",
+            rows,
+          });
           return;
         }
         continue;
       }
       if (screenPts.length < 2) continue;
 
-      // Array: hit-test all member segments (after trim).
+      // Array: hit-test all member segments (after trim); remember which trimmed piece was hit
+      // so we can report its own length as the "current segment".
       if (measurement.measurement_type === "array") {
         const meta = parseArrayMeta(measurement.framing_json ?? null);
         const members = getArrayMembers(points[0], points[1], meta);
         const absTrimsList = absTrims(meta.trims, points[0]);
-        let hit = false;
+        let hitSeg: [PagePoint, PagePoint] | null = null;
         for (const member of members) {
           for (const clipped of applyTrimsToSegment(member, absTrimsList)) {
             const sa = pageToScreen(clipped[0].x, clipped[0].y, page.height_pts, pan, zoom);
             const sb = pageToScreen(clipped[1].x, clipped[1].y, page.height_pts, pan, zoom);
-            if (distanceToSegment(screenX, screenY, sa.x, sa.y, sb.x, sb.y) <= tolerance) { hit = true; break; }
+            if (distanceToSegment(screenX, screenY, sa.x, sa.y, sb.x, sb.y) <= tolerance) { hitSeg = clipped; break; }
           }
-          if (hit) break;
+          if (hitSeg) break;
         }
-        if (hit) {
+        if (hitSeg) {
           const quantity = props ? deriveQuantity(points, pageScale?.mm_per_point ?? null, props, measurement.framing_json) : null;
-          const text = quantity ? formatQuantity(quantity) : formatLength(pathLengthPts(points), pageScale);
-          setHoverInfo({ x: clientX, y: clientY, text });
+          const lengthQty = props ? deriveQuantity(points, pageScale?.mm_per_point ?? null, { ...props, default_display: "length" }, measurement.framing_json) : null;
+          const countQty = props ? deriveQuantity(points, pageScale?.mm_per_point ?? null, { ...props, default_display: "count" }, measurement.framing_json) : null;
+          const m = props?.default_multiplier ?? 1;
+          const segLenM = mPerPt != null ? Math.hypot(hitSeg[1].x - hitSeg[0].x, hitSeg[1].y - hitSeg[0].y) * mPerPt * m : null;
+          setHoverInfo({
+            x: clientX,
+            y: clientY,
+            icon: MEASUREMENT_TYPE_ICONS.array,
+            groupTypeLabel: MEASUREMENT_TYPE_LABELS.array,
+            groupName,
+            mainValue: quantity ? quantityValueText(quantity) : formatLength(pathLengthPts(points), pageScale),
+            mainValueUom: quantity?.uom,
+            rows: [
+              { label: "Length (Current Segment)", value: segLenM != null ? formatQuantity({ value: segLenM, uom: "m" }) : "—" },
+              { label: "Total Length", value: lengthQty ? formatQuantity(lengthQty) : formatLength(pathLengthPts(points), pageScale) },
+              { label: "Count", value: countQty ? formatQuantity(countQty) : "—" },
+            ],
+          });
           return;
         }
         continue;
@@ -3430,14 +3492,86 @@ export function ViewerCanvas({
         if (distanceToSegment(screenX, screenY, a.x, a.y, b.x, b.y) <= tolerance) {
           if (measurement.measurement_type === "timber_framing") {
             const settings = parseFramingSettings(props?.framing_props_json ?? null);
-            const q = computeFramingQuantities(points, settings, pageScale?.mm_per_point ?? null, parseWallFraming(measurement.framing_json));
-            const text = q ? `${q.studCount} studs · ${q.totalM.toFixed(2)} m` : formatLength(pathLengthPts(points), pageScale);
-            setHoverInfo({ x: clientX, y: clientY, text });
+            const wallFraming = parseWallFraming(measurement.framing_json);
+            const q = computeFramingQuantities(points, settings, pageScale?.mm_per_point ?? null, wallFraming);
+            // Filter the ONE full-wall member list (correct corner-makeup/packer geometry, since
+            // it sees every neighbouring segment) down to members tagged with this edge's index,
+            // rather than recomputing framing on an isolated 2-point sub-wall — that would lose
+            // corner context and mis-place/omit the corner studs & packers shown in the reference
+            // diagram. Mirrors computeFramingQuantities' own aggregation (studCount = "stud"-kind
+            // members, totalM = every member's length, lintels included).
+            const allMembers = wallMembers(points, settings, pageScale?.mm_per_point ?? null, wallFraming);
+            const segMembers = allMembers.filter((mem) => mem.segmentIndex === i);
+            const segStudCount = segMembers.filter((mem) => mem.kind === "stud").length;
+            const segTotalM = segMembers.reduce((sum, mem) => sum + mem.lengthM, 0);
+            const segLenM = mPerPt != null ? Math.hypot(points[i].x - points[i + 1].x, points[i].y - points[i + 1].y) * mPerPt : null;
+            setHoverInfo({
+              x: clientX,
+              y: clientY,
+              icon: MEASUREMENT_TYPE_ICONS.timber_framing,
+              groupTypeLabel: MEASUREMENT_TYPE_LABELS.timber_framing,
+              groupName,
+              framingSize: settings.framingSize.replace("x", " × "),
+              mainValue: q ? q.totalM.toFixed(2) : formatLength(pathLengthPts(points), pageScale),
+              mainValueUom: "m",
+              rows: [
+                { label: "Plate Run", value: q ? `${q.wallLengthM.toFixed(2)} M` : "—" },
+                { label: "Total Studs", value: q ? `${q.studCount} NO` : "—" },
+                { label: "Wall Height", value: `${(settings.wallHeightMm / 1000).toFixed(2)} M` },
+                { label: "Studs in Current Segment", value: `${segStudCount} NO` },
+                { label: "Plate Run (Current Segment)", value: segLenM != null ? `${segLenM.toFixed(2)} M` : "—" },
+                { label: "Current Segment Total", value: `${segTotalM.toFixed(2)} M` },
+              ],
+            });
             return;
           }
+
           const quantity = props ? deriveQuantity(points, pageScale?.mm_per_point ?? null, props) : null;
-          const text = quantity ? formatQuantity(quantity) : formatLength(pathLengthPts(points), pageScale);
-          setHoverInfo({ x: clientX, y: clientY, text });
+          const h = props?.default_height ?? 0;
+          const m = props?.default_multiplier ?? 1;
+
+          if (isArea) {
+            const perimeterM = mPerPt != null ? polygonPerimeterPts(points) * mPerPt : null;
+            const areaM2 = mPerPt != null ? polygonAreaPts(points) * mPerPt * mPerPt : null;
+            const nextIdx = (i + 1) % points.length;
+            const segLenM = mPerPt != null ? Math.hypot(points[i].x - points[nextIdx].x, points[i].y - points[nextIdx].y) * mPerPt : null;
+            setHoverInfo({
+              x: clientX,
+              y: clientY,
+              icon: MEASUREMENT_TYPE_ICONS.area,
+              groupTypeLabel: MEASUREMENT_TYPE_LABELS.area,
+              groupName,
+              mainValue: quantity ? quantityValueText(quantity) : formatLength(pathLengthPts(points), pageScale),
+              mainValueUom: quantity?.uom,
+              rows: [
+                { label: "Current Segment Length", value: segLenM != null ? formatQuantity({ value: segLenM * m, uom: "m" }) : "—" },
+                { label: "Current Segment Wall Area", value: segLenM != null ? formatQuantity({ value: segLenM * h * m, uom: "m²" }) : "—" },
+                { label: "Area", value: areaM2 != null ? formatQuantity({ value: areaM2 * m, uom: "m²" }) : "—" },
+                { label: "Wall Area", value: perimeterM != null ? formatQuantity({ value: perimeterM * h * m, uom: "m²" }) : "—" },
+                { label: "Perimeter Total", value: perimeterM != null ? formatQuantity({ value: perimeterM * m, uom: "m" }) : "—" },
+                { label: "Volume Total", value: areaM2 != null ? formatQuantity({ value: areaM2 * h * m, uom: "m³" }) : "—" },
+              ],
+            });
+            return;
+          }
+
+          const boundaryM = mPerPt != null ? pathLengthPts(points) * mPerPt : null;
+          const segLenM = mPerPt != null ? Math.hypot(points[i].x - points[i + 1].x, points[i].y - points[i + 1].y) * mPerPt : null;
+          setHoverInfo({
+            x: clientX,
+            y: clientY,
+            icon: MEASUREMENT_TYPE_ICONS.length,
+            groupTypeLabel: MEASUREMENT_TYPE_LABELS.length,
+            groupName,
+            mainValue: quantity ? quantityValueText(quantity) : formatLength(pathLengthPts(points), pageScale),
+            mainValueUom: quantity?.uom,
+            rows: [
+              { label: "Length (Current Segment)", value: segLenM != null ? formatQuantity({ value: segLenM * m, uom: "m" }) : "—" },
+              { label: "Wall Area (Current Segment)", value: segLenM != null ? formatQuantity({ value: segLenM * h * m, uom: "m²" }) : "—" },
+              { label: "Total Length", value: boundaryM != null ? formatQuantity({ value: boundaryM * m, uom: "m" }) : formatLength(pathLengthPts(points), pageScale) },
+              { label: "Total Wall Area", value: boundaryM != null ? formatQuantity({ value: boundaryM * h * m, uom: "m²" }) : "—" },
+            ],
+          });
           return;
         }
       }
@@ -3830,19 +3964,11 @@ export function ViewerCanvas({
             position: "fixed",
             left: hoverInfo.x + 14,
             top: hoverInfo.y + 14,
-            padding: "2px 6px",
-            background: "rgba(20,22,26,0.9)",
-            color: "#ffffff",
-            border: "1px solid rgba(255,255,255,0.25)",
-            borderRadius: 3,
-            fontSize: 11,
-            fontFamily: "Segoe UI, sans-serif",
             pointerEvents: "none",
-            whiteSpace: "nowrap",
             zIndex: 10,
           }}
         >
-          {hoverInfo.text}
+          <MeasurementHoverCard data={hoverInfo} />
         </div>
       ) : null}
       {doubleStudSelect ? (

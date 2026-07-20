@@ -10,7 +10,7 @@ import { DimensionGroupCopyDialog } from "./DimensionGroupCopyDialog";
 import { DimensionGroupDialog } from "./DimensionGroupDialog";
 import { DimensionGroupPropertiesDialog } from "./DimensionGroupPropertiesDialog";
 import { TextInputDialog } from "./TextInputDialog";
-import { groupNetQuantity, quantityValueText, type PagePoint, type Quantity } from "../lib/quantity";
+import { groupNetQuantity, quantityValueText, MEASUREMENT_TYPE_ICONS, type PagePoint, type Quantity } from "../lib/quantity";
 import { aggregateFramingGroup, parseFramingSettings, parseWallFraming, type FramingGroupBreakdown, type FramingWallInput } from "../lib/framing";
 
 const tabs = ["Dimension Groups"];
@@ -30,14 +30,6 @@ function summaryForNode(node: TreeNodeDto, total: Quantity | null | undefined) {
   if (node.node_type !== "dimension_group" || !total) return { quantity: "", uom: "" };
   return { quantity: quantityValueText(total), uom: total.uom };
 }
-
-const MEASUREMENT_TYPE_ICONS: Record<string, string> = {
-  timber_framing: "calendar_view_week",
-  area: "crop_free",
-  count: "123",
-  length: "straighten",
-  array: "data_array",
-};
 
 function DimensionNodeIcon({ node, measurementType }: { node: TreeNodeDto; measurementType?: string }) {
   if (node.node_type === "folder") {

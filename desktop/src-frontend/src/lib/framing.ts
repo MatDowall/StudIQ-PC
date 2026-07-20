@@ -926,6 +926,11 @@ export interface WallMember {
   kind: FramingComponentKind;
   /** Lintel-only: the lintel's FramingSize (always set for lintels, absent for all other kinds). */
   sizeOverride?: FramingSize;
+  /** Which input-path segment (0-based, between path[i] and path[i+1]) generated this member.
+   *  Purely informational metadata — never read by the quantity/rollup math itself — so a
+   *  per-segment breakdown (e.g. the canvas hover card) can filter the one true member list
+   *  instead of re-deriving a synthetic sub-wall that would lose corner-makeup context. */
+  segmentIndex: number;
   lengthM: number;
   position: [number, number, number];
   size: [number, number, number]; // [along, vertical thickness/height, depth across the wall]
@@ -1076,6 +1081,7 @@ export function wallMembers(
         ];
         members.push({
           kind,
+          segmentIndex: segIndex,
           lengthM: M((yTopLeft + yTopRight) / 2 - yB),
           position: [fx(sLeft), 0, fz(sLeft)],
           size: [thkM, M(Math.max(yTopLeft, yTopRight) - yB), depthM],
@@ -1093,7 +1099,7 @@ export function wallMembers(
           const yTR = ceilingMmAt(pointAt(seg, sRightD));
           if (Math.min(yTL, yTR) - yB > 0) {
             const quadD: [number, number][] = [[0, M(yB)], [thkM, M(yB)], [thkM, M(yTR)], [0, M(yTL)]];
-            members.push({ kind: "stud", lengthM: M((yTL + yTR) / 2 - yB), position: [fx(sLeftD), 0, fz(sLeftD)], size: [thkM, M(Math.max(yTL, yTR) - yB), depthM], yaw, pitch: 0, wedge: { quad: quadD, depthM } });
+            members.push({ kind: "stud", segmentIndex: segIndex, lengthM: M((yTL + yTR) / 2 - yB), position: [fx(sLeftD), 0, fz(sLeftD)], size: [thkM, M(Math.max(yTL, yTR) - yB), depthM], yaw, pitch: 0, wedge: { quad: quadD, depthM } });
           }
         }
         return;
@@ -1103,14 +1109,14 @@ export function wallMembers(
       // segment's lower top plate at a shared corner.
       const cappedYT = Math.min(yT, ceilingMmAt(pointAt(seg, s)));
       if (cappedYT - yB <= 0) return;
-      members.push({ kind, lengthM: M(cappedYT - yB), position: [fx(s), M((yB + cappedYT) / 2), fz(s)], size: [thkM, M(cappedYT - yB), depthM], yaw, pitch: 0 });
+      members.push({ kind, segmentIndex: segIndex, lengthM: M(cappedYT - yB), position: [fx(s), M((yB + cappedYT) / 2), fz(s)], size: [thkM, M(cappedYT - yB), depthM], yaw, pitch: 0 });
       // Sister doubled stud — pushed to verticals so dwangs space from it, not the primary.
       if (kind === "stud" && isStudDoubled(framing, segIndex, s * mmPerPoint)) {
         const sD = s + sisterOffset(s);
         verticals.push({ x: sD, yB, yT });
         const cappedYTD = Math.min(yT, ceilingMmAt(pointAt(seg, sD)));
         if (cappedYTD - yB > 0) {
-          members.push({ kind: "stud", lengthM: M(cappedYTD - yB), position: [fx(sD), M((yB + cappedYTD) / 2), fz(sD)], size: [thkM, M(cappedYTD - yB), depthM], yaw, pitch: 0 });
+          members.push({ kind: "stud", segmentIndex: segIndex, lengthM: M(cappedYTD - yB), position: [fx(sD), M((yB + cappedYTD) / 2), fz(sD)], size: [thkM, M(cappedYTD - yB), depthM], yaw, pitch: 0 });
         }
       }
     };
@@ -1124,7 +1130,7 @@ export function wallMembers(
     const plateMidS = (plateEndExtPts - plateStartExtPts) / 2 + midS;
     const plateLenM = plateTotalPts * S;
     for (let l = 0; l < bottomLayers; l += 1) {
-      members.push({ kind: "plate", lengthM: plateLenM, position: [fx(plateMidS), M(l * STUD_THICKNESS_MM + STUD_THICKNESS_MM / 2), fz(plateMidS)], size: [plateLenM, thkM, depthM], yaw, pitch: 0 });
+      members.push({ kind: "plate", segmentIndex: segIndex, lengthM: plateLenM, position: [fx(plateMidS), M(l * STUD_THICKNESS_MM + STUD_THICKNESS_MM / 2), fz(plateMidS)], size: [plateLenM, thkM, depthM], yaw, pitch: 0 });
     }
     // Top plate(s): one sloped piece spanning the segment, or (for a gable) two pieces meeting at
     // the apex (`middleMm`) at `apexS` (the segment midpoint unless `middlePositionMm` overrides it).
@@ -1155,6 +1161,7 @@ export function wallMembers(
           ];
           members.push({
             kind: "plate",
+            segmentIndex: segIndex,
             lengthM: lenM,
             position: [startX, 0, startZ],
             size: [lenM, thkM, depthM],
@@ -1167,6 +1174,7 @@ export function wallMembers(
         for (let l = 0; l < topLayers; l += 1) {
           members.push({
             kind: "plate",
+            segmentIndex: segIndex,
             lengthM: plateLenM,
             position: [fx(plateMidS), M(settings.wallHeightMm - topMakeup + l * STUD_THICKNESS_MM + STUD_THICKNESS_MM / 2), fz(plateMidS)],
             size: [plateLenM, thkM, depthM],
@@ -1338,11 +1346,11 @@ export function wallMembers(
       const plyDepthM = depthM / Math.max(1, o.lintelPly);
       for (let p = 0; p < o.lintelPly; p += 1) {
         const plyOffset = (p - (o.lintelPly - 1) / 2) * plyDepthM;
-        members.push({ kind: "lintel", sizeOverride: lintelSizeOverride, lengthM: lintelLenM, position: [fx(centrePts) + Math.sin(yaw) * plyOffset, M(head + lintelDepth / 2), fz(centrePts) + Math.cos(yaw) * plyOffset], size: [lintelLenM, M(lintelDepth), plyDepthM], yaw, pitch: 0 });
+        members.push({ kind: "lintel", sizeOverride: lintelSizeOverride, segmentIndex: segIndex, lengthM: lintelLenM, position: [fx(centrePts) + Math.sin(yaw) * plyOffset, M(head + lintelDepth / 2), fz(centrePts) + Math.cos(yaw) * plyOffset], size: [lintelLenM, M(lintelDepth), plyDepthM], yaw, pitch: 0 });
       }
       if (o.kind === "window") {
         const sill = o.sillHeightMm ?? 0;
-        members.push({ kind: "sill", lengthM: M(o.daylightWidthMm), position: [fx(centrePts), M(sill - STUD_THICKNESS_MM / 2), fz(centrePts)], size: [M(o.daylightWidthMm), thkM, depthM], yaw, pitch: 0 });
+        members.push({ kind: "sill", segmentIndex: segIndex, lengthM: M(o.daylightWidthMm), position: [fx(centrePts), M(sill - STUD_THICKNESS_MM / 2), fz(centrePts)], size: [M(o.daylightWidthMm), thkM, depthM], yaw, pitch: 0 });
       }
     }
 
@@ -1409,10 +1417,10 @@ export function wallMembers(
             const groupStart = mid - groupWidthPts / 2 + studThkPts / 2;
             for (let p = 0; p < packerCount; p += 1) {
               const s = groupStart + p * studThkPts;
-              members.push({ kind: "packer", lengthM: M(PACKER_LENGTH_MM), position: [fx(s), M(h), fz(s)], size: [thkM, M(PACKER_LENGTH_MM), depthM], yaw, pitch: 0 });
+              members.push({ kind: "packer", segmentIndex: segIndex, lengthM: M(PACKER_LENGTH_MM), position: [fx(s), M(h), fz(s)], size: [thkM, M(PACKER_LENGTH_MM), depthM], yaw, pitch: 0 });
             }
           } else {
-            members.push({ kind: "dwang", lengthM: M(bayGapMm), position: [fx(mid), M(h), fz(mid)], size: [M(bayGapMm), thkM, depthM], yaw, pitch: 0 });
+            members.push({ kind: "dwang", segmentIndex: segIndex, lengthM: M(bayGapMm), position: [fx(mid), M(h), fz(mid)], size: [M(bayGapMm), thkM, depthM], yaw, pitch: 0 });
           }
         }
       }
@@ -1429,6 +1437,7 @@ export function wallMembers(
     if (yT - bottomMakeup <= 0) continue;
     members.push({
       kind: "stud",
+      segmentIndex: es.segmentIndex,
       lengthM: M(yT - bottomMakeup),
       position: [(seg.a.x + seg.dir.x * sPts) * S, M((bottomMakeup + yT) / 2), -(seg.a.y + seg.dir.y * sPts) * S],
       size: [thkM, M(yT - bottomMakeup), depthM],

@@ -29,6 +29,25 @@ export interface PagePoint {
   y: number;
 }
 
+// Single source of truth for measurement-type -> icon/label, shared by the dimension-group
+// tree (DimensionGroupPane) and the canvas hover card (MeasurementHoverCard). See the
+// "Established icon assignments" table in CLAUDE.md before changing these.
+export const MEASUREMENT_TYPE_ICONS: Record<string, string> = {
+  timber_framing: "calendar_view_week",
+  area: "crop_free",
+  count: "123",
+  length: "straighten",
+  array: "data_array",
+};
+
+export const MEASUREMENT_TYPE_LABELS: Record<string, string> = {
+  timber_framing: "Timber Framing",
+  area: "Area",
+  count: "Count",
+  length: "Length",
+  array: "Array",
+};
+
 export interface Quantity {
   value: number;
   uom: string;
