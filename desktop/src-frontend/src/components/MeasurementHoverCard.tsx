@@ -12,6 +12,8 @@ export interface HoverCardData {
   y: number;
   icon: string;
   groupTypeLabel: string;
+  /** Subtitle text — the dimension group's name for a normal measurement, or the opening's
+   *  "WIDTHmm x HEIGHTmm" daylight size for a door/window opening card. */
   groupName: string;
   /** Only set for timber-framing groups (e.g. "90 × 45"); renders as the top-right subtitle. */
   framingSize?: string;

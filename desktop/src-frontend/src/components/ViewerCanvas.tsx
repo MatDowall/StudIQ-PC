@@ -3484,6 +3484,66 @@ export function ViewerCanvas({
         continue;
       }
 
+      // Timber-framing door/window openings: hit-test the opening's own daylight footprint (the
+      // void in the wall) BEFORE the generic per-edge wall test below, so hovering directly over a
+      // door/window shows its own king/trimmer/lintel/jack/sill breakdown instead of just the wall
+      // segment's totals — previously an opening had no dedicated hover at all.
+      if (measurement.measurement_type === "timber_framing") {
+        const settings = parseFramingSettings(props?.framing_props_json ?? null);
+        const wallFraming = parseWallFraming(measurement.framing_json);
+        const geometry = computeFramingGeometry(points, settings, pageScale?.mm_per_point ?? null, wallFraming);
+        const hitOpening = geometry.openings.find((opening) => {
+          const screenRect = opening.daylight.map((p) => pageToScreen(p.x, p.y, page.height_pts, pan, zoom));
+          return pointInPolygon({ x: screenX, y: screenY }, screenRect);
+        });
+        const openingData = hitOpening
+          ? wallFraming.openings.find((o) => o.segmentIndex === hitOpening.segmentIndex && Math.abs(o.centreMm - hitOpening.centreMm) < 1)
+          : null;
+        if (hitOpening && openingData) {
+          // Filter the ONE full-wall member list by the opening identity tagged in wallMembers()
+          // (openingSegmentIndex/openingCentreMm) — same "filter the real computation" approach as
+          // the per-segment breakdown above, so corner/rake context stays correct.
+          const allMembers = wallMembers(points, settings, pageScale?.mm_per_point ?? null, wallFraming);
+          const openingMembers = allMembers.filter(
+            (mem) => mem.openingSegmentIndex === hitOpening.segmentIndex && Math.abs((mem.openingCentreMm ?? -Infinity) - hitOpening.centreMm) < 1,
+          );
+          const sumKind = (kind: string) => openingMembers.filter((mem) => mem.kind === kind).reduce((sum, mem) => sum + mem.lengthM, 0);
+          const kingM = sumKind("king");
+          const trimmerM = sumKind("trimmer");
+          const lintelM = sumKind("lintel");
+          const jackM = sumKind("jack");
+          const sillJackM = sumKind("sill_jack");
+          const sillM = sumKind("sill");
+          const totalM = openingMembers.reduce((sum, mem) => sum + mem.lengthM, 0);
+          const isWindow = openingData.kind === "window";
+          const rows: HoverCardRow[] = [
+            { label: "King Studs", value: formatQuantity({ value: kingM, uom: "m" }) },
+            { label: "Trimmer Studs", value: formatQuantity({ value: trimmerM, uom: "m" }) },
+            { label: "Lintel", value: formatQuantity({ value: lintelM, uom: "m" }) },
+          ];
+          if (isWindow) {
+            rows.push({ label: "Jack Studs", value: formatQuantity({ value: jackM, uom: "m" }) });
+            rows.push({ label: "Sill Jacks", value: formatQuantity({ value: sillJackM, uom: "m" }) });
+            rows.push({ label: "Sill Plates", value: formatQuantity({ value: sillM, uom: "m" }) });
+          } else if (jackM > 1e-6) {
+            // Not in the reference template's baseline door card, but a wide-enough door still gets
+            // real interior cripple studs above the head — surface them rather than silently drop.
+            rows.push({ label: "Jack Studs", value: formatQuantity({ value: jackM, uom: "m" }) });
+          }
+          setHoverInfo({
+            x: clientX,
+            y: clientY,
+            icon: isWindow ? "window_closed" : "door_front",
+            groupTypeLabel: isWindow ? "Window Opening" : "Door Opening",
+            groupName: `${openingData.daylightWidthMm}mm x ${openingData.daylightHeightMm}mm`,
+            mainValue: totalM.toFixed(2),
+            mainValueUom: "m",
+            rows,
+          });
+          return;
+        }
+      }
+
       const isArea = isAreaType(measurement.measurement_type);
       const segmentCount = isArea ? screenPts.length : screenPts.length - 1;
       for (let i = 0; i < segmentCount; i += 1) {
@@ -3498,12 +3558,17 @@ export function ViewerCanvas({
             // it sees every neighbouring segment) down to members tagged with this edge's index,
             // rather than recomputing framing on an isolated 2-point sub-wall — that would lose
             // corner context and mis-place/omit the corner studs & packers shown in the reference
-            // diagram. Mirrors computeFramingQuantities' own aggregation (studCount = "stud"-kind
-            // members, totalM = every member's length, lintels included).
+            // diagram.
             const allMembers = wallMembers(points, settings, pageScale?.mm_per_point ?? null, wallFraming);
             const segMembers = allMembers.filter((mem) => mem.segmentIndex === i);
             const segStudCount = segMembers.filter((mem) => mem.kind === "stud").length;
-            const segTotalM = segMembers.reduce((sum, mem) => sum + mem.lengthM, 0);
+            // "matchingTotalM" convention (see CLAUDE.md / framing-multi-size-model): lintels are
+            // excluded from the group's own-size total, since a lintel can be a different framing
+            // size to the wall (sizeOverride is set only on lintel members) — summing it in would
+            // mix two different timber sizes into one lineal-metre figure.
+            const matchingTotalM = (members: typeof allMembers) => members.filter((mem) => !mem.sizeOverride).reduce((sum, mem) => sum + mem.lengthM, 0);
+            const wholeWallMatchingTotalM = matchingTotalM(allMembers);
+            const segMatchingTotalM = matchingTotalM(segMembers);
             const segLenM = mPerPt != null ? Math.hypot(points[i].x - points[i + 1].x, points[i].y - points[i + 1].y) * mPerPt : null;
             setHoverInfo({
               x: clientX,
@@ -3512,7 +3577,7 @@ export function ViewerCanvas({
               groupTypeLabel: MEASUREMENT_TYPE_LABELS.timber_framing,
               groupName,
               framingSize: settings.framingSize.replace("x", " × "),
-              mainValue: q ? q.totalM.toFixed(2) : formatLength(pathLengthPts(points), pageScale),
+              mainValue: wholeWallMatchingTotalM.toFixed(2),
               mainValueUom: "m",
               rows: [
                 { label: "Plate Run", value: q ? `${q.wallLengthM.toFixed(2)} M` : "—" },
@@ -3520,7 +3585,7 @@ export function ViewerCanvas({
                 { label: "Wall Height", value: `${(settings.wallHeightMm / 1000).toFixed(2)} M` },
                 { label: "Studs in Current Segment", value: `${segStudCount} NO` },
                 { label: "Plate Run (Current Segment)", value: segLenM != null ? `${segLenM.toFixed(2)} M` : "—" },
-                { label: "Current Segment Total", value: `${segTotalM.toFixed(2)} M` },
+                { label: "Current Segment Total", value: `${segMatchingTotalM.toFixed(2)} M` },
               ],
             });
             return;

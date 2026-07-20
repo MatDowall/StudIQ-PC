@@ -399,8 +399,10 @@ export interface FramingGeometry {
    *  the standard architectural symbol for a non-continuous member). */
   studs: { rect: PagePoint[]; continuous: boolean }[];
   studCount: number;
-  /** Door/window daylight openings (the rectangular gap in the wall), for rendering. */
-  openings: { daylight: PagePoint[]; kind: "door" | "window" }[];
+  /** Door/window daylight openings (the rectangular gap in the wall), for rendering. Carries the
+   *  opening's own (segmentIndex, centreMm) back so callers (the canvas hover card) can hit-test
+   *  this exact rect and then look up the source Opening / its wallMembers()-tagged framing. */
+  openings: { daylight: PagePoint[]; kind: "door" | "window"; segmentIndex: number; centreMm: number }[];
 }
 
 const GEOM_EPS = 1e-6;
@@ -679,7 +681,7 @@ export function computeFramingGeometry(
   const rakes = framing?.rakes ?? [];
 
   const studs: { rect: PagePoint[]; continuous: boolean }[] = [];
-  const openingRects: { daylight: PagePoint[]; kind: "door" | "window" }[] = [];
+  const openingRects: { daylight: PagePoint[]; kind: "door" | "window"; segmentIndex: number; centreMm: number }[] = [];
 
   const halfDepthForCut = halfDepth;
   // Only for a DIFFERENT segment's opening reaching into this one at a corner (a corner-makeup
@@ -781,7 +783,7 @@ export function computeFramingGeometry(
     for (const o of segOpenings) {
       const centrePts = o.centreMm / mmPerPoint;
       const dwHalf = o.daylightWidthMm / mmPerPoint / 2;
-      openingRects.push({ daylight: memberRect(seg, centrePts - dwHalf, centrePts + dwHalf, halfDepth), kind: o.kind });
+      openingRects.push({ daylight: memberRect(seg, centrePts - dwHalf, centrePts + dwHalf, halfDepth), kind: o.kind, segmentIndex: o.segmentIndex, centreMm: o.centreMm });
     }
   });
 
@@ -931,6 +933,12 @@ export interface WallMember {
    *  per-segment breakdown (e.g. the canvas hover card) can filter the one true member list
    *  instead of re-deriving a synthetic sub-wall that would lose corner-makeup context. */
   segmentIndex: number;
+  /** Set only on king/trimmer/jack/sill_jack/lintel/sill members — identifies the specific
+   *  opening this piece belongs to, by (segmentIndex, centreMm) (same identity scheme as
+   *  Rake/ExtraStud/DoubledStud). Lets the hover card show "this door/window's own framing"
+   *  without an array-index that would drift when opening lists get filtered/re-derived. */
+  openingSegmentIndex?: number;
+  openingCentreMm?: number;
   lengthM: number;
   position: [number, number, number];
   size: [number, number, number]; // [along, vertical thickness/height, depth across the wall]
@@ -1059,7 +1067,19 @@ export function wallMembers(
     const verticals: { x: number; yB: number; yT: number }[] = [];
     // Sister stud offset: always toward wall interior so end studs double inward, not outside plates.
     const sisterOffset = (s: number) => (s < seg.segLen / 2 ? studThkPts : -studThkPts);
-    const addV = (kind: FramingComponentKind, s: number, yB: number, yT: number, rakeCut = false) => {
+    const addV = (
+      kind: FramingComponentKind,
+      s: number,
+      yB: number,
+      yT: number,
+      rakeCut = false,
+      // Which opening this member belongs to (king/trimmer/jack/sill_jack only) — identified the
+      // same way as Rake/ExtraStud/DoubledStud elsewhere in this file, by (segmentIndex, centreMm)
+      // rather than an array index, since filtered/derived opening lists don't share index space
+      // with the caller's own `WallFraming.openings`. Purely metadata forwarded onto the pushed
+      // member; never read by the quantity/rollup math itself.
+      openingId?: { segmentIndex: number; centreMm: number },
+    ) => {
       if (yT - yB <= 0) return;
       verticals.push({ x: s, yB, yT });
       if (rakeCut && rake && seg.segLen > 0) {
@@ -1082,6 +1102,7 @@ export function wallMembers(
         members.push({
           kind,
           segmentIndex: segIndex,
+          ...(openingId ? { openingSegmentIndex: openingId.segmentIndex, openingCentreMm: openingId.centreMm } : {}),
           lengthM: M((yTopLeft + yTopRight) / 2 - yB),
           position: [fx(sLeft), 0, fz(sLeft)],
           size: [thkM, M(Math.max(yTopLeft, yTopRight) - yB), depthM],
@@ -1109,7 +1130,16 @@ export function wallMembers(
       // segment's lower top plate at a shared corner.
       const cappedYT = Math.min(yT, ceilingMmAt(pointAt(seg, s)));
       if (cappedYT - yB <= 0) return;
-      members.push({ kind, segmentIndex: segIndex, lengthM: M(cappedYT - yB), position: [fx(s), M((yB + cappedYT) / 2), fz(s)], size: [thkM, M(cappedYT - yB), depthM], yaw, pitch: 0 });
+      members.push({
+        kind,
+        segmentIndex: segIndex,
+        ...(openingId ? { openingSegmentIndex: openingId.segmentIndex, openingCentreMm: openingId.centreMm } : {}),
+        lengthM: M(cappedYT - yB),
+        position: [fx(s), M((yB + cappedYT) / 2), fz(s)],
+        size: [thkM, M(cappedYT - yB), depthM],
+        yaw,
+        pitch: 0,
+      });
       // Sister doubled stud — pushed to verticals so dwangs space from it, not the primary.
       if (kind === "stud" && isStudDoubled(framing, segIndex, s * mmPerPoint)) {
         const sD = s + sisterOffset(s);
@@ -1242,16 +1272,17 @@ export function wallMembers(
       excludeIdxs: ReadonlySet<number>,
       marginPts = 0,
       rakeCut = false,
+      openingId?: { segmentIndex: number; centreMm: number },
     ) => {
       let cursor = yB;
       for (const hole of holesAt(s, excludeIdxs, marginPts)) {
         const lo = Math.max(hole.lo, cursor);
         const hi = Math.min(hole.hi, yT);
         if (hi <= lo) continue;
-        if (lo > cursor) addV(kind, s, cursor, lo, false);
+        if (lo > cursor) addV(kind, s, cursor, lo, false, openingId);
         cursor = hi;
       }
-      if (cursor < yT) addV(kind, s, cursor, yT, rakeCut);
+      if (cursor < yT) addV(kind, s, cursor, yT, rakeCut, openingId);
     };
 
     // King and trimmer jamb studs, each merged ONLY within their own kind — a king merges with
@@ -1286,8 +1317,17 @@ export function wallMembers(
     // king sits `1.5×studThk` out, plus its own half-thickness) — so that's the true reach of an
     // opening's jamb assembly, wider than the bare daylight width used everywhere else.
     const jambMarginPts = 2 * studThkPts;
-    for (const g of kingGroups) addVClipped("king", g.x, bottomMakeup, ceilingMmAt(pointAt(seg, g.x)), g.ownIdxs, jambMarginPts, true); // full, follows rake
-    for (const g of trimmerGroups) addVClipped("trimmer", g.x, bottomMakeup, g.headMm, g.ownIdxs, jambMarginPts, false); // bottom plate → underside of lintel
+    // A shared king/trimmer (two openings' jambs landing on the same line) is tagged to whichever
+    // opening comes first in ownIdxs — a rare edge case (stacked openings), not the common case.
+    const firstOwningOpening = (ownIdxs: Set<number>) => openMeta[[...ownIdxs][0]]?.o;
+    for (const g of kingGroups) {
+      const owner = firstOwningOpening(g.ownIdxs);
+      addVClipped("king", g.x, bottomMakeup, ceilingMmAt(pointAt(seg, g.x)), g.ownIdxs, jambMarginPts, true, owner ? { segmentIndex: segIndex, centreMm: owner.centreMm } : undefined); // full, follows rake
+    }
+    for (const g of trimmerGroups) {
+      const owner = firstOwningOpening(g.ownIdxs);
+      addVClipped("trimmer", g.x, bottomMakeup, g.headMm, g.ownIdxs, jambMarginPts, false, owner ? { segmentIndex: segIndex, centreMm: owner.centreMm } : undefined); // bottom plate → underside of lintel
+    }
 
     // Gable apex: a stud under each side's top plate, meeting at the ridge. Corner-makeup anchors
     // and the gable apex pair are otherwise drawn unconditionally — but if an opening cuts through
@@ -1346,11 +1386,11 @@ export function wallMembers(
       const plyDepthM = depthM / Math.max(1, o.lintelPly);
       for (let p = 0; p < o.lintelPly; p += 1) {
         const plyOffset = (p - (o.lintelPly - 1) / 2) * plyDepthM;
-        members.push({ kind: "lintel", sizeOverride: lintelSizeOverride, segmentIndex: segIndex, lengthM: lintelLenM, position: [fx(centrePts) + Math.sin(yaw) * plyOffset, M(head + lintelDepth / 2), fz(centrePts) + Math.cos(yaw) * plyOffset], size: [lintelLenM, M(lintelDepth), plyDepthM], yaw, pitch: 0 });
+        members.push({ kind: "lintel", sizeOverride: lintelSizeOverride, segmentIndex: segIndex, openingSegmentIndex: segIndex, openingCentreMm: o.centreMm, lengthM: lintelLenM, position: [fx(centrePts) + Math.sin(yaw) * plyOffset, M(head + lintelDepth / 2), fz(centrePts) + Math.cos(yaw) * plyOffset], size: [lintelLenM, M(lintelDepth), plyDepthM], yaw, pitch: 0 });
       }
       if (o.kind === "window") {
         const sill = o.sillHeightMm ?? 0;
-        members.push({ kind: "sill", segmentIndex: segIndex, lengthM: M(o.daylightWidthMm), position: [fx(centrePts), M(sill - STUD_THICKNESS_MM / 2), fz(centrePts)], size: [M(o.daylightWidthMm), thkM, depthM], yaw, pitch: 0 });
+        members.push({ kind: "sill", segmentIndex: segIndex, openingSegmentIndex: segIndex, openingCentreMm: o.centreMm, lengthM: M(o.daylightWidthMm), position: [fx(centrePts), M(sill - STUD_THICKNESS_MM / 2), fz(centrePts)], size: [M(o.daylightWidthMm), thkM, depthM], yaw, pitch: 0 });
       }
     }
 
@@ -1368,14 +1408,18 @@ export function wallMembers(
     for (const s of jackGridPositions) {
       const top = ceilingMmAt(pointAt(seg, s));
       let cursor = bottomMakeup;
+      // A grid line can sit inside more than one stacked opening's width; tag with whichever
+      // opening's window contains it first (rare edge case — same simplification as king/trimmer).
+      const owner = openMeta.find((m) => Math.abs(s - m.centrePts) <= m.dwHalf)?.o;
+      const ownerId = owner ? { segmentIndex: segIndex, centreMm: owner.centreMm } : undefined;
       for (const hole of holesAt(s, NO_EXCLUSIONS)) {
         const lo = Math.max(hole.lo, cursor);
         const hi = Math.min(hole.hi, top);
         if (hi <= lo) continue;
-        if (lo > cursor) addV(hole.isWindow && Math.abs(lo - hole.lo) < GEOM_EPS ? "sill_jack" : "jack", s, cursor, lo, false);
+        if (lo > cursor) addV(hole.isWindow && Math.abs(lo - hole.lo) < GEOM_EPS ? "sill_jack" : "jack", s, cursor, lo, false, ownerId);
         cursor = hi;
       }
-      if (cursor < top) addV("jack", s, cursor, top, true);
+      if (cursor < top) addV("jack", s, cursor, top, true, ownerId);
     }
 
     // Window-only tight support studs directly under the sill (inside the trimmers) — always a
@@ -1384,7 +1428,7 @@ export function wallMembers(
       if (!m.isWindow) continue;
       const sillTop = m.sill - STUD_THICKNESS_MM; // underside of the sill
       for (const s of [m.centrePts - (m.dwHalf - studThkPts / 2), m.centrePts + (m.dwHalf - studThkPts / 2)]) {
-        addVClipped("sill_jack", s, bottomMakeup, sillTop, NO_EXCLUSIONS);
+        addVClipped("sill_jack", s, bottomMakeup, sillTop, NO_EXCLUSIONS, 0, false, { segmentIndex: segIndex, centreMm: m.o.centreMm });
       }
     }
 
