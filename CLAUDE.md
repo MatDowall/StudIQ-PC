@@ -194,10 +194,16 @@ Material Symbols Outlined.
 | Export project | `save_as` |
 | Edit / Project Info | `edit` |
 | Timber Framing group | `calendar_view_week` |
-| Area group | `crop_free` |
-| Count group | `123` |
-| Length group | `straighten` |
+| Area group | `activity_zone` |
+| Count group | `tag` |
+| Length group | `diagonal_line` |
+| Array group | `texture` |
 | Recalculate workbook | `calculate` |
+| Rotate Left (Page / Takeoff Item) | `rotate_90_degrees_ccw` |
+| Rotate Right (Page / Takeoff Item) | `rotate_90_degrees_cw` |
+| Flip Horizontal (Page / Takeoff Item) | `flip` |
+| Flip Vertical (Page / Takeoff Item) | `flip` (rotated 90° via `Icon`'s `rotate` prop) |
+| Pitch (Takeoff Item, stub) | `signal_cellular_null` |
 
 ### Ribbon layout rules
 - The ribbon uses `display: flex; align-items: stretch` — group divs fill the full ribbon height.

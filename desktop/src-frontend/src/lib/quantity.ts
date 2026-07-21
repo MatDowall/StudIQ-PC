@@ -34,10 +34,10 @@ export interface PagePoint {
 // "Established icon assignments" table in CLAUDE.md before changing these.
 export const MEASUREMENT_TYPE_ICONS: Record<string, string> = {
   timber_framing: "calendar_view_week",
-  area: "crop_free",
-  count: "123",
-  length: "straighten",
-  array: "data_array",
+  area: "activity_zone",
+  count: "tag",
+  length: "diagonal_line",
+  array: "texture",
 };
 
 export const MEASUREMENT_TYPE_LABELS: Record<string, string> = {
