@@ -21,6 +21,19 @@ export interface HoverCardData {
   /** Unit shown small and grey after the main value (e.g. "m²", "m", "no"). */
   mainValueUom?: string;
   rows: HoverCardRow[];
+  /** Set when the hovered measurement's group has a pitch angle > 0 — drives a separate
+   *  double-headed arrow + angle-label overlay rendered alongside this card (see ViewerCanvas's
+   *  pitch indicator render, next to where this card itself is rendered). Deliberately PAGE-space
+   *  (not pre-transformed through pageToScreen): pan/zoom can change without a mousemove event
+   *  (e.g. scroll-to-zoom with the cursor stationary), so the screen transform is applied at
+   *  render time against current pan/zoom rather than cached from whenever the hover was detected. */
+  pitchIndicator?: {
+    cxPt: number;
+    cyPt: number;
+    dirRad: number;
+    pitchDeg: number;
+    halfDiagPts: number;
+  };
 }
 
 const CARD_BG = "#fff6b4";

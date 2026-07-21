@@ -300,7 +300,6 @@ Material Symbols Outlined.
 | Rotate Right (Page / Takeoff Item) | `rotate_90_degrees_cw` |
 | Flip Horizontal (Page / Takeoff Item) | `flip` |
 | Flip Vertical (Page / Takeoff Item) | `flip` (rotated 90° via `Icon`'s `rotate` prop) |
-| Pitch (Takeoff Item, stub) | `signal_cellular_null` |
 
 ### Ribbon layout rules
 - The ribbon uses `display: flex; align-items: stretch` — group divs fill the full ribbon height.

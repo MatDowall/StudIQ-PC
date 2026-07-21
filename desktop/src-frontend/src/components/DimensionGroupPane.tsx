@@ -344,6 +344,8 @@ export function DimensionGroupPane() {
   const dgPaneCommand = useAppStore((state) => state.dgPaneCommand);
   const setView3d = useAppStore((state) => state.setView3d);
   const setView3dMulti = useAppStore((state) => state.setView3dMulti);
+  const setPitchDirectionMode = useAppStore((state) => state.setPitchDirectionMode);
+  const pitchDirectionResult = useAppStore((state) => state.pitchDirectionResult);
   const [selectedFolderId, setSelectedFolderId] = useState<number | null>(null);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; node: TreeNodeDto } | null>(null);
   const [pendingAddGroupPath, setPendingAddGroupPath] = useState<string | null>(null);
@@ -357,6 +359,11 @@ export function DimensionGroupPane() {
   const [status, setStatus] = useState("");
   const [paneTab, setPaneTab] = useState<PaneTab>("Dimension Groups");
   const lastCommandSeq = useRef(0);
+  // While true, the Properties dialog is hidden and the canvas is showing the pitch-direction
+  // drag-to-pick gesture; `pendingProps` (node/framingWalls) is kept around so the dialog can
+  // reopen once the pick resolves.
+  const [pickingDirection, setPickingDirection] = useState(false);
+  const lastPitchSeq = useRef(0);
 
   const scaleFor = useCallback(
     (drawingId: number, pageIndex: number) => scaleCache[`${drawingId}:${pageIndex}`]?.mm_per_point ?? null,
@@ -608,6 +615,28 @@ export function DimensionGroupPane() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dgPaneCommand]);
+
+  // Pitch-direction "Pick on Drawing": hides the Properties dialog and hands the canvas a
+  // drag-to-pick, axis-locked gesture. Called with a full snapshot of the dialog's in-progress
+  // edits so nothing typed is lost while the dialog is hidden.
+  function startPitchDirectionPick(snapshot: DimensionGroupPropsDto) {
+    setPendingProps((prev) => (prev ? { ...prev, props: snapshot } : prev));
+    setPickingDirection(true);
+    setPitchDirectionMode(true);
+  }
+
+  // Canvas → pane bridge for the pitch-direction pick: the canvas bumps `pitchDirectionResult.seq`
+  // with the picked axis (or `null` if cancelled via Esc) when the drag resolves. Merge the axis
+  // into the stashed snapshot and reopen the dialog.
+  useEffect(() => {
+    if (!pickingDirection || !pitchDirectionResult || pitchDirectionResult.seq === lastPitchSeq.current) return;
+    lastPitchSeq.current = pitchDirectionResult.seq;
+    const axis = pitchDirectionResult.axis;
+    if (axis !== null) {
+      setPendingProps((prev) => (prev ? { ...prev, props: { ...prev.props, pitch_direction_deg: axis === "y" ? 90 : 0 } } : prev));
+    }
+    setPickingDirection(false);
+  }, [pickingDirection, pitchDirectionResult]);
 
   // Clears the active group's measurements — the only way to remove drawn dimensions
   // until per-measurement delete lands in M5. Scoped to the active group so it never
@@ -889,7 +918,7 @@ export function DimensionGroupPane() {
           }}
         />
       ) : null}
-      {pendingProps ? (
+      {pendingProps && !pickingDirection ? (
         <DimensionGroupPropertiesDialog
           groupName={pendingProps.node.name}
           initial={pendingProps.props}
@@ -898,6 +927,7 @@ export function DimensionGroupPane() {
           onConfirm={(props) => {
             void confirmProperties(props);
           }}
+          onPickDirection={startPitchDirectionPick}
         />
       ) : null}
       {pendingCopy ? (

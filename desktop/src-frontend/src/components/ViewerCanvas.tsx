@@ -6,6 +6,9 @@ import {
   deriveQuantity,
   formatQuantity,
   parseArrayMeta,
+  pitchedPolygonPerimeterPts,
+  pitchedPolylineLengthPts,
+  pitchedSegmentLengthPts,
   polygonAreaPts,
   polygonPerimeterPts,
   quantityValueText,
@@ -995,6 +998,79 @@ function drawArrayDraft(
   ctx.restore();
 }
 
+/**
+ * Draw the pitch-direction pick's live preview: a dashed line from the clicked start point to
+ * the cursor, snapped to whichever page axis (X or Y) the cursor's offset from start currently
+ * favours — small arrowheads at both ends echo the double-headed direction indicator shown on
+ * hover once a pitch is set.
+ */
+function drawPitchDirectionOutline(
+  ctx: CanvasRenderingContext2D,
+  start: PagePoint,
+  livePoint: PagePoint,
+  pan: { x: number; y: number },
+  zoom: number,
+  page: PageMeta,
+) {
+  const dx = livePoint.x - start.x;
+  const dy = livePoint.y - start.y;
+  if (Math.hypot(dx, dy) < 1e-6) return;
+  const axisIsX = Math.abs(dx) >= Math.abs(dy);
+  const end: PagePoint = axisIsX ? { x: livePoint.x, y: start.y } : { x: start.x, y: livePoint.y };
+
+  const a = pageToScreen(start.x, start.y, page.height_pts, pan, zoom);
+  const b = pageToScreen(end.x, end.y, page.height_pts, pan, zoom);
+  ctx.save();
+  ctx.strokeStyle = "#00E5FF";
+  ctx.fillStyle = "#00E5FF";
+  ctx.lineWidth = 2;
+  ctx.setLineDash([6, 4]);
+  ctx.beginPath();
+  ctx.moveTo(a.x, a.y);
+  ctx.lineTo(b.x, b.y);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Small arrowheads at both ends, oriented along the snapped line.
+  const angle = Math.atan2(b.y - a.y, b.x - a.x);
+  const headLen = 9;
+  const headAngle = Math.PI / 7;
+  for (const [tip, dir] of [
+    [a, angle + Math.PI],
+    [b, angle],
+  ] as const) {
+    ctx.beginPath();
+    ctx.moveTo(tip.x, tip.y);
+    ctx.lineTo(tip.x - headLen * Math.cos(dir - headAngle), tip.y - headLen * Math.sin(dir - headAngle));
+    ctx.lineTo(tip.x - headLen * Math.cos(dir + headAngle), tip.y - headLen * Math.sin(dir + headAngle));
+    ctx.closePath();
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+/**
+ * Page-space anchor for the pitch-direction hover indicator: the shape's centroid (average of its
+ * points, a good-enough anchor for this affordance) plus its own extent *along the pitch
+ * direction*, used as the arrow's reach — not the bounding-box diagonal, which is ≥ the shape's
+ * extent along any single axis and so overshoots past the shape's edges for anything that isn't
+ * square. Projecting each point onto the direction vector and taking half the (max − min) span
+ * keeps the arrow inscribed inside the shape, touching its edges rather than extending past them.
+ * Deliberately left in page space — see the `pitchIndicator` field comment on `HoverCardData` for
+ * why the screen transform is applied at render time instead of here.
+ */
+function computePitchIndicator(points: PagePoint[], pitchDeg: number, dirRad: number) {
+  const cxPt = points.reduce((sum, p) => sum + p.x, 0) / points.length;
+  const cyPt = points.reduce((sum, p) => sum + p.y, 0) / points.length;
+  const dirX = Math.cos(dirRad);
+  const dirY = Math.sin(dirRad);
+  const projections = points.map((p) => (p.x - cxPt) * dirX + (p.y - cyPt) * dirY);
+  // A little inset (0.85x) so the arrowheads sit just inside the shape's outline rather than
+  // exactly on top of it.
+  const halfDiagPts = ((Math.max(...projections) - Math.min(...projections)) / 2 || 40) * 0.85;
+  return { cxPt, cyPt, dirRad, pitchDeg, halfDiagPts };
+}
+
 /** Draw the in-progress trim outline: a dashed line for "line" trim, or a dashed polygon for "box" trim. */
 function drawArrayTrimOutline(
   ctx: CanvasRenderingContext2D,
@@ -1280,6 +1356,8 @@ export function ViewerCanvas({
   const [arrayTrimDraft, setArrayTrimDraft] = useState<PagePoint[]>([]);
   const [arrayTrimKeepPt, setArrayTrimKeepPt] = useState<PagePoint | null>(null);
   const arrayTrimDraftRef = useRef<PagePoint[]>([]);
+  // Pitch-direction pick gesture: the first click's page point, or null before it's placed.
+  const [pitchPickStart, setPitchPickStart] = useState<PagePoint | null>(null);
 
   const vertexDragRef = useRef<{ measurementId: number; vertexIndex: number } | null>(null);
   const draftPointsRef = useRef<PagePoint[]>([]);
@@ -1323,6 +1401,8 @@ export function ViewerCanvas({
   const arrayTrimMode = useAppStore((state) => state.arrayTrimMode);
   const setArrayTrimMode = useAppStore((state) => state.setArrayTrimMode);
   const arrayTrimType = useAppStore((state) => state.arrayTrimType);
+  const pitchDirectionMode = useAppStore((state) => state.pitchDirectionMode);
+  const resolvePitchDirectionPick = useAppStore((state) => state.resolvePitchDirectionPick);
   const activeDimensionGroupId = useAppStore((state) => state.activeDimensionGroupId);
   const activeDrawingId = useAppStore((state) => state.activeDrawingId);
   const viewerMode = useAppStore((state) => state.viewerMode);
@@ -1415,6 +1495,11 @@ export function ViewerCanvas({
       setArrayTrimKeepPt(null);
     }
   }, [arrayTrimMode]);
+
+  // Reset the pitch-direction pick whenever the mode is toggled off (committed or cancelled).
+  useEffect(() => {
+    if (!pitchDirectionMode) setPitchPickStart(null);
+  }, [pitchDirectionMode]);
 
   useEffect(() => {
     setArrayTrimDraft([]);
@@ -2251,6 +2336,12 @@ export function ViewerCanvas({
       ctx.restore();
     }
 
+    // Pitch-direction pick: dashed axis-snapped preview from the clicked start point to the cursor.
+    if (pitchDirectionMode && page && pitchPickStart) {
+      const livePoint = cursorPagePoint;
+      if (livePoint) drawPitchDirectionOutline(ctx, pitchPickStart, livePoint, pan, zoom, page);
+    }
+
     // Array trim tool: draw in-progress trim outline and ghost of the trim result.
     if (arrayTrimMode && page) {
       const livePoint = snapPoint ?? cursorPagePoint;
@@ -2326,7 +2417,7 @@ export function ViewerCanvas({
         }
       }
     }
-  }, [activeProps, activeDimensionGroupId, arrayDirection, arrayExtraMembers, arraySpacingPts, arrayTrimDraft, arrayTrimKeepPt, arrayTrimMode, arrayTrimType, calibDialog, calibPoints, calibrating, clipboard, cursorPagePoint, doc, doubleStudSelect, draftColour, draftPoints, draftStyle, drawingArea, drawingArray, drawingFraming, drawingType, editPreview, groupColours, groupProps, lightMode, lineSnapResult, marqueeState, measuring, moveMode, openingGhost, openingPlacement, overlayColour, overlayMeasurements, page, pageIndex, pageScale, pageSize.height, pageSize.width, pan, pasteMode, pendingRake, selectedSet, shiftHeld, snapPoint, snapType, studGhost, viewportSize.height, viewportSize.width, zoom]);
+  }, [activeProps, activeDimensionGroupId, arrayDirection, arrayExtraMembers, arraySpacingPts, arrayTrimDraft, arrayTrimKeepPt, arrayTrimMode, arrayTrimType, calibDialog, calibPoints, calibrating, clipboard, cursorPagePoint, doc, doubleStudSelect, draftColour, draftPoints, draftStyle, drawingArea, drawingArray, drawingFraming, drawingType, editPreview, groupColours, groupProps, lightMode, lineSnapResult, marqueeState, measuring, moveMode, openingGhost, openingPlacement, overlayColour, overlayMeasurements, page, pageIndex, pageScale, pageSize.height, pageSize.width, pan, pasteMode, pendingRake, pitchDirectionMode, pitchPickStart, selectedSet, shiftHeld, snapPoint, snapType, studGhost, viewportSize.height, viewportSize.width, zoom]);
 
   function clampPan(nextPan: { x: number; y: number }, nextZoom = zoom) {
     if (!page) return nextPan;
@@ -2385,6 +2476,23 @@ export function ViewerCanvas({
         const pixelLength = Math.hypot(point.x - start.x, point.y - start.y);
         applyCalib([start, point]);
         if (pixelLength > 1e-6) setCalibDialog({ pixelLength });
+      }
+      return;
+    }
+
+    // Pitch-direction pick: first click sets the start point, second click commits — snapped to
+    // whichever page axis (X or Y) the drag's dominant component aligns with.
+    if (pitchDirectionMode && page) {
+      const point = placementPoint(event.clientX, event.clientY);
+      if (!point) return;
+      if (!pitchPickStart) {
+        setPitchPickStart(point);
+      } else {
+        const dx = point.x - pitchPickStart.x;
+        const dy = point.y - pitchPickStart.y;
+        if (Math.hypot(dx, dy) > 1e-6) {
+          resolvePitchDirectionPick(Math.abs(dx) >= Math.abs(dy) ? "x" : "y");
+        }
       }
       return;
     }
@@ -2593,7 +2701,7 @@ export function ViewerCanvas({
       );
     }
 
-    if (measuring || calibrating || moveMode || pasteMode || arrayTrimMode) {
+    if (measuring || calibrating || moveMode || pasteMode || arrayTrimMode || pitchDirectionMode) {
       // Drive the live rubber-band endpoint (drawing a dimension, a calibration line,
       // or a move/paste ghost).
       setCursorClient({ x: event.clientX, y: event.clientY });
@@ -3508,7 +3616,11 @@ export function ViewerCanvas({
           const lengthQty = props ? deriveQuantity(points, pageScale?.mm_per_point ?? null, { ...props, default_display: "length" }, measurement.framing_json) : null;
           const countQty = props ? deriveQuantity(points, pageScale?.mm_per_point ?? null, { ...props, default_display: "count" }, measurement.framing_json) : null;
           const m = props?.default_multiplier ?? 1;
-          const segLenM = mPerPt != null ? Math.hypot(hitSeg[1].x - hitSeg[0].x, hitSeg[1].y - hitSeg[0].y) * mPerPt * m : null;
+          // Array pitch is a flat 1/cos(angle) scale (no direction), same as a single-segment
+          // Length — applies uniformly to every member, including this hit-tested one.
+          const arrayPitchRad = ((props?.pitch_angle_deg ?? 0) * Math.PI) / 180;
+          const arrayPitchScale = arrayPitchRad !== 0 ? 1 / Math.cos(arrayPitchRad) : 1;
+          const segLenM = mPerPt != null ? Math.hypot(hitSeg[1].x - hitSeg[0].x, hitSeg[1].y - hitSeg[0].y) * mPerPt * m * arrayPitchScale : null;
           setHoverInfo({
             x: clientX,
             y: clientY,
@@ -3638,12 +3750,21 @@ export function ViewerCanvas({
           const quantity = props ? deriveQuantity(points, pageScale?.mm_per_point ?? null, props) : null;
           const h = props?.default_height ?? 0;
           const m = props?.default_multiplier ?? 1;
+          const pitchRad = ((props?.pitch_angle_deg ?? 0) * Math.PI) / 180;
+          const dirRad = ((props?.pitch_direction_deg ?? 0) * Math.PI) / 180;
+          const hasPitch = pitchRad !== 0;
 
           if (isArea) {
-            const perimeterM = mPerPt != null ? polygonPerimeterPts(points) * mPerPt : null;
-            const areaM2 = mPerPt != null ? polygonAreaPts(points) * mPerPt * mPerPt : null;
+            const perimeterM = mPerPt != null ? (hasPitch ? pitchedPolygonPerimeterPts(points, pitchRad, dirRad) : polygonPerimeterPts(points)) * mPerPt : null;
+            // Area total is direction-independent for a mono-pitch: plan_area / cos(pitchRad).
+            const areaM2 = mPerPt != null ? (hasPitch ? polygonAreaPts(points) / Math.cos(pitchRad) : polygonAreaPts(points)) * mPerPt * mPerPt : null;
             const nextIdx = (i + 1) % points.length;
-            const segLenM = mPerPt != null ? Math.hypot(points[i].x - points[nextIdx].x, points[i].y - points[nextIdx].y) * mPerPt : null;
+            const segLenM =
+              mPerPt != null
+                ? (hasPitch
+                    ? pitchedSegmentLengthPts(points[nextIdx].x - points[i].x, points[nextIdx].y - points[i].y, pitchRad, dirRad)
+                    : Math.hypot(points[i].x - points[nextIdx].x, points[i].y - points[nextIdx].y)) * mPerPt
+                : null;
             setHoverInfo({
               x: clientX,
               y: clientY,
@@ -3660,12 +3781,29 @@ export function ViewerCanvas({
                 { label: "Perimeter Total", value: perimeterM != null ? formatQuantity({ value: perimeterM * m, uom: "m" }) : "—" },
                 { label: "Volume Total", value: areaM2 != null ? formatQuantity({ value: areaM2 * h * m, uom: "m³" }) : "—" },
               ],
+              pitchIndicator: hasPitch ? computePitchIndicator(points, props?.pitch_angle_deg ?? 0, dirRad) : undefined,
             });
             return;
           }
 
-          const boundaryM = mPerPt != null ? pathLengthPts(points) * mPerPt : null;
-          const segLenM = mPerPt != null ? Math.hypot(points[i].x - points[i + 1].x, points[i].y - points[i + 1].y) * mPerPt : null;
+          const boundaryM =
+            mPerPt != null
+              ? (hasPitch
+                  ? points.length === 2
+                    ? pathLengthPts(points) / Math.cos(pitchRad)
+                    : pitchedPolylineLengthPts(points, pitchRad, dirRad)
+                  : pathLengthPts(points)) * mPerPt
+              : null;
+          // Single 2-point Length measurement: no direction dependency (same flat rule as
+          // boundaryM above), so this row always matches "Total Length" for that case.
+          const segLenM =
+            mPerPt != null
+              ? (hasPitch
+                  ? points.length === 2
+                    ? Math.hypot(points[i].x - points[i + 1].x, points[i].y - points[i + 1].y) / Math.cos(pitchRad)
+                    : pitchedSegmentLengthPts(points[i + 1].x - points[i].x, points[i + 1].y - points[i].y, pitchRad, dirRad)
+                  : Math.hypot(points[i].x - points[i + 1].x, points[i].y - points[i + 1].y)) * mPerPt
+              : null;
           setHoverInfo({
             x: clientX,
             y: clientY,
@@ -3680,6 +3818,7 @@ export function ViewerCanvas({
               { label: "Total Length", value: boundaryM != null ? formatQuantity({ value: boundaryM * m, uom: "m" }) : formatLength(pathLengthPts(points), pageScale) },
               { label: "Total Wall Area", value: boundaryM != null ? formatQuantity({ value: boundaryM * h * m, uom: "m²" }) : "—" },
             ],
+            pitchIndicator: hasPitch ? computePitchIndicator(points, props?.pitch_angle_deg ?? 0, dirRad) : undefined,
           });
           return;
         }
@@ -3853,6 +3992,16 @@ export function ViewerCanvas({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [arrayTrimMode, arrayTrimType, arrayTrimKeepPt, commitArrayTrim]);
 
+  // Pitch-direction pick keyboard: Esc cancels (dialog reopens with direction unchanged).
+  useEffect(() => {
+    if (!pitchDirectionMode) return;
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") resolvePitchDirectionPick(null);
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [pitchDirectionMode, resolvePitchDirectionPick]);
+
   // Select-studs-to-double mode: Enter commits, Escape cancels.
   useEffect(() => {
     if (!doubleStudSelect) return;
@@ -4000,6 +4149,50 @@ export function ViewerCanvas({
     return null;
   })();
 
+  // Pitch indicator's on-screen geometry, computed fresh every render from the current page/pan/
+  // zoom — NOT cached from whenever the hover was detected. pan/zoom can change without a
+  // mousemove event (scroll-to-zoom with the cursor stationary), so caching this in hoverInfo
+  // state would leave the arrow's size/position stuck at whatever zoom level was active the last
+  // time the mouse actually moved.
+  const pitchIndicatorScreen = (() => {
+    const ind = hoverInfo?.pitchIndicator;
+    const rect = viewportRef.current?.getBoundingClientRect();
+    if (!ind || !page || !rect) return null;
+
+    // cx/cy are deliberately viewport-relative (no rect.left/top offset) — the wrapper div below
+    // is itself positioned+sized to `rect` with overflow:hidden, so the indicator is clipped to
+    // the canvas viewport and can never bleed into the side panels either side of it.
+    const centreScreen = pageToScreen(ind.cxPt, ind.cyPt, page.height_pts, pan, zoom);
+    const tipScreen = pageToScreen(
+      ind.cxPt + Math.cos(ind.dirRad) * ind.halfDiagPts,
+      ind.cyPt + Math.sin(ind.dirRad) * ind.halfDiagPts,
+      page.height_pts,
+      pan,
+      zoom,
+    );
+    const screenAngleDeg = (Math.atan2(tipScreen.y - centreScreen.y, tipScreen.x - centreScreen.x) * 180) / Math.PI;
+    const halfLengthPx = Math.max(12, Math.hypot(tipScreen.x - centreScreen.x, tipScreen.y - centreScreen.y));
+
+    // Angle label offset perpendicular to the arrow (not just "up" in screen space) so it sits
+    // beside the line instead of running through it when the arrow is vertical.
+    const perpRad = ((screenAngleDeg - 90) * Math.PI) / 180;
+    const labelDist = 14;
+
+    return {
+      rectLeft: rect.left,
+      rectTop: rect.top,
+      rectWidth: rect.width,
+      rectHeight: rect.height,
+      cx: centreScreen.x,
+      cy: centreScreen.y,
+      screenAngleDeg,
+      halfLengthPx,
+      pitchDeg: ind.pitchDeg,
+      labelX: Math.cos(perpRad) * labelDist,
+      labelY: Math.sin(perpRad) * labelDist,
+    };
+  })();
+
   return (
     <>
     <div
@@ -4021,7 +4214,7 @@ export function ViewerCanvas({
         minHeight: 0,
         overflow: "hidden",
         cursor: doc
-          ? measuring || calibrating || openingPlacement || arrayTrimMode
+          ? measuring || calibrating || openingPlacement || arrayTrimMode || pitchDirectionMode
             ? "crosshair"
             : moveMode || pasteMode
               ? "crosshair"
@@ -4078,6 +4271,57 @@ export function ViewerCanvas({
           }}
         >
           <MeasurementHoverCard data={hoverInfo} />
+        </div>
+      ) : null}
+      {pitchIndicatorScreen && !liveReadout ? (
+        <div
+          style={{
+            position: "fixed",
+            left: pitchIndicatorScreen.rectLeft,
+            top: pitchIndicatorScreen.rectTop,
+            width: pitchIndicatorScreen.rectWidth,
+            height: pitchIndicatorScreen.rectHeight,
+            overflow: "hidden",
+            pointerEvents: "none",
+            zIndex: 9,
+          }}
+        >
+          <svg style={{ position: "absolute", left: 0, top: 0, width: "100%", height: "100%", overflow: "visible" }}>
+            <g transform={`translate(${pitchIndicatorScreen.cx} ${pitchIndicatorScreen.cy})`}>
+              <g transform={`rotate(${pitchIndicatorScreen.screenAngleDeg})`}>
+                <line
+                  x1={-pitchIndicatorScreen.halfLengthPx}
+                  y1={0}
+                  x2={pitchIndicatorScreen.halfLengthPx}
+                  y2={0}
+                  stroke="#00E676"
+                  strokeWidth={2.5}
+                />
+                {[-1, 1].map((side) => (
+                  <polygon
+                    key={side}
+                    fill="#00E676"
+                    points={`${side * pitchIndicatorScreen.halfLengthPx},0 ${side * (pitchIndicatorScreen.halfLengthPx - 10)},-5 ${side * (pitchIndicatorScreen.halfLengthPx - 10)},5`}
+                  />
+                ))}
+              </g>
+              {/* Not nested inside the rotated group, so the label always reads horizontally.
+                  Offset perpendicular to the arrow (not just "up" in screen space) so it sits
+                  beside the line instead of running through it when the arrow is vertical. */}
+              <text
+                x={pitchIndicatorScreen.labelX}
+                y={pitchIndicatorScreen.labelY}
+                textAnchor="middle"
+                dominantBaseline="middle"
+                fill="#00E676"
+                fontSize={14}
+                fontWeight={700}
+                fontFamily="Arial, sans-serif"
+              >
+                {`${pitchIndicatorScreen.pitchDeg}°`}
+              </text>
+            </g>
+          </svg>
         </div>
       ) : null}
       {doubleStudSelect ? (

@@ -16,6 +16,13 @@ export interface GroupProps {
   neg_colour: string;
   neg_style: string;
   weight_uom: string | null;
+  // Slope angle in degrees (0 = flat/no correction) applied to Area/Length quantities. Area
+  // totals are direction-independent (plan_area / cos θ); perimeter/boundary edges are not, so
+  // they also need pitch_direction_deg. See quantity.ts's pitched-length helpers.
+  pitch_angle_deg: number;
+  // Pitch (slope) direction in page space: 0 = along +X, 90 = along +Y. Only ever set via the
+  // on-canvas axis-locked pick gesture — always exactly 0 or 90.
+  pitch_direction_deg: number;
   // Timber-framing settings (framing size, stud spacing, plate config, wall height, dwang
   // centres) as a JSON blob; null for non-framing groups. Parsed via lib/framing.ts.
   framing_props_json: string | null;
@@ -77,6 +84,36 @@ export function polygonAreaPts(points: PagePoint[]): number {
     sum += a.x * b.y - b.x * a.y;
   }
   return Math.abs(sum) / 2;
+}
+
+/**
+ * True (sloped) length of a single edge under a mono-pitch: the edge's own component along the
+ * pitch direction is stretched by 1/cos(pitchRad), while its component perpendicular to the
+ * pitch direction (running level, across the slope) is unchanged. Reduces to `hypot(dx,dy)` when
+ * pitchRad is 0, to `L/cos(pitchRad)` when the edge runs parallel to the pitch direction, and to
+ * `L` unchanged when the edge runs perpendicular to it.
+ */
+export function pitchedSegmentLengthPts(dx: number, dy: number, pitchRad: number, dirRad: number): number {
+  if (pitchRad === 0) return Math.hypot(dx, dy);
+  const along = dx * Math.cos(dirRad) + dy * Math.sin(dirRad);
+  const straightLen = Math.hypot(dx, dy);
+  return Math.sqrt(straightLen * straightLen + along * along * Math.tan(pitchRad) ** 2);
+}
+
+/** Pitched open-path length: sums `pitchedSegmentLengthPts` over consecutive points. */
+export function pitchedPolylineLengthPts(points: PagePoint[], pitchRad: number, dirRad: number): number {
+  let total = 0;
+  for (let i = 1; i < points.length; i += 1) {
+    total += pitchedSegmentLengthPts(points[i].x - points[i - 1].x, points[i].y - points[i - 1].y, pitchRad, dirRad);
+  }
+  return total;
+}
+
+/** Pitched closed-polygon perimeter: `pitchedPolylineLengthPts` plus the closing edge. */
+export function pitchedPolygonPerimeterPts(points: PagePoint[], pitchRad: number, dirRad: number): number {
+  if (points.length < 2) return 0;
+  const closing = pitchedSegmentLengthPts(points[0].x - points[points.length - 1].x, points[0].y - points[points.length - 1].y, pitchRad, dirRad);
+  return pitchedPolylineLengthPts(points, pitchRad, dirRad) + closing;
 }
 
 /** Parsed array metadata from framing_json for an array-type measurement. */
@@ -294,11 +331,15 @@ export function deriveQuantity(points: PagePoint[], mmPerPoint: number | null, p
   if (props.default_display === "count") return { value: props.default_multiplier, uom: "no" };
   if (points.length < 2 || mmPerPoint == null || !(mmPerPoint > 0)) return null;
 
-  // Array: sum post-trim length of all members.
+  // Array: sum post-trim length of all members. Pitch (if set) is a flat 1/cos(angle) scale with
+  // no direction dependency — an array run is drawn directly along the slope, same as a single
+  // 2-point Length segment, so there's no ambiguity to resolve with a direction.
   if (props.measurement_type === "array") {
     const meta = parseArrayMeta(framingJson ?? null);
     const totalPts = arrayTrimmedLengthPts(points[0], points[1], meta);
-    return { value: totalPts * (mmPerPoint / 1000) * props.default_multiplier, uom: "m" };
+    const pitchRad = ((props.pitch_angle_deg ?? 0) * Math.PI) / 180;
+    const pitchScale = pitchRad !== 0 ? 1 / Math.cos(pitchRad) : 1;
+    return { value: totalPts * (mmPerPoint / 1000) * props.default_multiplier * pitchScale, uom: "m" };
   }
 
   const mPerPt = mmPerPoint / 1000;
@@ -307,9 +348,23 @@ export function deriveQuantity(points: PagePoint[], mmPerPoint: number | null, p
   const h = props.default_height;
   const isAreaMeasure = props.measurement_type === "area";
 
-  const lengthM = polylineLengthPts(points) * mPerPt;
-  const perimeterM = polygonPerimeterPts(points) * mPerPt;
-  const areaM2 = polygonAreaPts(points) * mPerPt * mPerPt;
+  const pitchRad = ((props.pitch_angle_deg ?? 0) * Math.PI) / 180;
+  const dirRad = ((props.pitch_direction_deg ?? 0) * Math.PI) / 180;
+  const hasPitch = pitchRad !== 0;
+
+  // Length-type groups: a single 2-point segment is drawn directly along the rake, so it's a flat
+  // 1/cos(pitchRad) scale with no direction dependency; a multi-segment polyline (e.g. a fascia
+  // line bending around a hip) needs the same per-edge directional correction as an area's
+  // perimeter, since its segments run at different angles to the pitch direction.
+  const lengthM =
+    (hasPitch
+      ? points.length === 2
+        ? polylineLengthPts(points) / Math.cos(pitchRad)
+        : pitchedPolylineLengthPts(points, pitchRad, dirRad)
+      : polylineLengthPts(points)) * mPerPt;
+  const perimeterM = (hasPitch ? pitchedPolygonPerimeterPts(points, pitchRad, dirRad) : polygonPerimeterPts(points)) * mPerPt;
+  // Area total is direction-independent for a mono-pitch: true_area = plan_area / cos(pitchRad).
+  const areaM2 = (hasPitch ? polygonAreaPts(points) / Math.cos(pitchRad) : polygonAreaPts(points)) * mPerPt * mPerPt;
   // Linear extent of the boundary: the run for a line, the perimeter for an area.
   const boundaryM = isAreaMeasure ? perimeterM : lengthM;
 

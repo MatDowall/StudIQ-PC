@@ -21,7 +21,6 @@ const BUTTON_ICONS: Record<string, string> = {
   "Rotate Right": "rotate_90_degrees_cw",
   "Flip Horizontal": "flip",
   "Flip Vertical": "flip",
-  Pitch: "signal_cellular_null",
 };
 
 // Flip Vertical reuses the "flip" glyph (which is drawn horizontal) rotated 90° — per
@@ -35,7 +34,7 @@ const groups = [
   { label: "Type", tools: ["Point", "Line"] },
   { label: "Drawing", tools: ["Plan View", "View in 3D", "Dim", "Elevation PDF"] },
   { label: "Snap", tools: ["Geometry"] },
-  { label: "Takeoff Item", tools: ["Rotate Left", "Rotate Right", "Flip Horizontal", "Flip Vertical", "Pitch"] },
+  { label: "Takeoff Item", tools: ["Rotate Left", "Rotate Right", "Flip Horizontal", "Flip Vertical"] },
 ];
 
 const TAKEOFF_ITEM_COMMANDS: Record<string, "rotateCcw" | "rotateCw" | "flipH" | "flipV"> = {
@@ -151,7 +150,7 @@ export function Ribbon() {
                 }}
               >
                 <div style={{ display: "flex", gap: 5, alignItems: "center", overflow: "hidden" }}>
-                  {group.tools.slice(0, isDrawingGroup ? 4 : isTakeoffItemGroup ? 5 : 3).map((tool, toolIndex) => {
+                  {group.tools.slice(0, isDrawingGroup ? 4 : isTakeoffItemGroup ? 4 : 3).map((tool, toolIndex) => {
                     const dgCommand = groupIndex === 0 ? DIMENSION_GROUP_TOOLS[tool] : undefined;
                     const isTypeToggle = group.label === "Type" && (tool === "Point" || tool === "Line");
                     const isViewToggle = group.label === "Drawing" && (tool === "Plan View" || tool === "View in 3D");
@@ -159,7 +158,6 @@ export function Ribbon() {
                     const isSnapToggle = group.label === "Snap" && tool === "Geometry";
                     const isElevationExport = group.label === "Drawing" && tool === "Elevation PDF";
                     const takeoffCommand = isTakeoffItemGroup ? TAKEOFF_ITEM_COMMANDS[tool] : undefined;
-                    const isPitchStub = isTakeoffItemGroup && tool === "Pitch";
 
                     let enabled: boolean;
                     let cursor: string;
@@ -193,10 +191,6 @@ export function Ribbon() {
                       enabled = selectedMeasurementIds.length > 0;
                       active = false;
                       cursor = enabled ? "pointer" : "not-allowed";
-                    } else if (isPitchStub) {
-                      enabled = false;
-                      active = false;
-                      cursor = "not-allowed";
                     } else {
                       enabled = toolIndex === 0;
                       active = enabled;
@@ -235,7 +229,7 @@ export function Ribbon() {
                         key={`${group.label}-${tool}`}
                         disabled={isDisabled}
                         onClick={handleClick}
-                        title={isPitchStub ? "Pitch (not yet implemented)" : takeoffCommand !== undefined && !enabled ? `${tool} (select a takeoff item first)` : tool}
+                        title={takeoffCommand !== undefined && !enabled ? `${tool} (select a takeoff item first)` : tool}
                         style={{
                           minWidth: 44,
                           height: 50,

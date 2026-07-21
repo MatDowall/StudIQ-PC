@@ -471,6 +471,14 @@ pub struct DimensionGroupPropsDto {
     pub neg_colour: String,
     pub neg_style: String,
     pub weight_uom: Option<String>,
+    /// Slope angle (degrees, 0 = flat/no correction) applied to Area/Length quantities. See
+    /// docs/phase3-plan.md-adjacent pitch feature notes; direction-independent for Area totals,
+    /// direction-dependent for perimeter/boundary edges (see `pitch_direction_deg`).
+    pub pitch_angle_deg: f64,
+    /// Pitch (slope) direction in page space: `0.0` = along the page's +X axis, `90.0` = along
+    /// +Y. Only ever set via the on-canvas axis-locked pick gesture, never typed — always exactly
+    /// 0 or 90.
+    pub pitch_direction_deg: f64,
     /// Timber-framing settings (framing size, stud spacing, plate config, wall height, dwang
     /// centres) as an opaque JSON blob. `None` for non-framing groups. The frontend owns the
     /// shape; the backend stores and round-trips it without interpreting it.
@@ -1793,10 +1801,12 @@ async fn copy_dimension_group(
         INSERT INTO dimension_group_props
             (node_id, measurement_type, default_display, default_multiplier, default_width,
              default_height, default_offset, add_to_gfa, pos_colour, pos_style, neg_colour,
-             neg_style, weight_uom, framing_props_json, count_type)
+             neg_style, weight_uom, framing_props_json, count_type, pitch_angle_deg,
+             pitch_direction_deg)
         SELECT ?, measurement_type, default_display, default_multiplier, default_width,
                default_height, default_offset, add_to_gfa, pos_colour, pos_style, neg_colour,
-               neg_style, weight_uom, framing_props_json, count_type
+               neg_style, weight_uom, framing_props_json, count_type, pitch_angle_deg,
+               pitch_direction_deg
         FROM dimension_group_props WHERE node_id = ?
         "#,
     )
@@ -2274,7 +2284,8 @@ async fn get_dimension_group_props(
         r#"
         SELECT measurement_type, default_display, default_multiplier, default_width,
                default_height, default_offset, add_to_gfa, pos_style,
-               neg_colour, neg_style, weight_uom, framing_props_json, count_type
+               neg_colour, neg_style, weight_uom, framing_props_json, count_type,
+               pitch_angle_deg, pitch_direction_deg
         FROM dimension_group_props
         WHERE node_id = ?
         "#,
@@ -2299,6 +2310,8 @@ async fn get_dimension_group_props(
             neg_colour: row.try_get("neg_colour").map_err(|e| e.to_string())?,
             neg_style: row.try_get("neg_style").map_err(|e| e.to_string())?,
             weight_uom: row.try_get("weight_uom").map_err(|e| e.to_string())?,
+            pitch_angle_deg: row.try_get("pitch_angle_deg").map_err(|e| e.to_string())?,
+            pitch_direction_deg: row.try_get("pitch_direction_deg").map_err(|e| e.to_string())?,
             framing_props_json: row.try_get("framing_props_json").map_err(|e| e.to_string())?,
             count_type: row.try_get("count_type").map_err(|e| e.to_string())?,
         });
@@ -2319,6 +2332,8 @@ async fn get_dimension_group_props(
         neg_colour: "#FF0000".to_string(),
         neg_style: "solid".to_string(),
         weight_uom: None,
+        pitch_angle_deg: 0.0,
+        pitch_direction_deg: 0.0,
         framing_props_json: None,
         count_type: "marker".to_string(),
     })
@@ -2347,6 +2362,14 @@ async fn set_dimension_group_props(
     if !props.default_multiplier.is_finite() {
         return Err("default_multiplier must be a finite number".to_string());
     }
+    // Pitch angle must stay well clear of 90° (tan(θ) blows up); direction is only ever set via
+    // the on-canvas axis-locked pick gesture, so it must always be exactly 0 or 90.
+    if !props.pitch_angle_deg.is_finite() || !(0.0..90.0).contains(&props.pitch_angle_deg) {
+        return Err("pitch_angle_deg must be between 0 and 90 degrees".to_string());
+    }
+    if props.pitch_direction_deg != 0.0 && props.pitch_direction_deg != 90.0 {
+        return Err("pitch_direction_deg must be 0 or 90".to_string());
+    }
     let pos_colour = clean_colour(&props.pos_colour)?;
     let neg_colour = clean_colour(&props.neg_colour)?;
 
@@ -2355,8 +2378,9 @@ async fn set_dimension_group_props(
         INSERT INTO dimension_group_props
             (node_id, measurement_type, default_display, default_multiplier, default_width,
              default_height, default_offset, add_to_gfa, pos_colour, pos_style, neg_colour,
-             neg_style, weight_uom, framing_props_json, count_type)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             neg_style, weight_uom, framing_props_json, count_type, pitch_angle_deg,
+             pitch_direction_deg)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(node_id) DO UPDATE SET
             measurement_type = excluded.measurement_type,
             default_display = excluded.default_display,
@@ -2371,7 +2395,9 @@ async fn set_dimension_group_props(
             neg_style = excluded.neg_style,
             weight_uom = excluded.weight_uom,
             framing_props_json = excluded.framing_props_json,
-            count_type = excluded.count_type
+            count_type = excluded.count_type,
+            pitch_angle_deg = excluded.pitch_angle_deg,
+            pitch_direction_deg = excluded.pitch_direction_deg
         "#,
     )
     .bind(props.node_id)
@@ -2389,6 +2415,8 @@ async fn set_dimension_group_props(
     .bind(&props.weight_uom)
     .bind(&props.framing_props_json)
     .bind(&props.count_type)
+    .bind(props.pitch_angle_deg)
+    .bind(props.pitch_direction_deg)
     .execute(&db)
     .await
     .map_err(|e| format!("Failed to save dimension group props: {e}"))?;
@@ -4232,7 +4260,9 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), String> {
             neg_style          TEXT    NOT NULL DEFAULT 'solid',
             weight_uom         TEXT,
             framing_props_json TEXT,
-            count_type         TEXT    NOT NULL DEFAULT 'marker'
+            count_type         TEXT    NOT NULL DEFAULT 'marker',
+            pitch_angle_deg    REAL    NOT NULL DEFAULT 0.0,
+            pitch_direction_deg REAL   NOT NULL DEFAULT 0.0
         );
         "#,
     )
@@ -4267,6 +4297,35 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), String> {
         if !msg.contains("duplicate column name") {
             return Err(format!(
                 "Failed to add dimension_group_props.count_type: {msg}"
+            ));
+        }
+    }
+
+    // Project DBs created before the Pitch feature lack these columns; add them idempotently
+    // (same pattern as framing_props_json/count_type above).
+    if let Err(e) = sqlx::query(
+        "ALTER TABLE dimension_group_props ADD COLUMN pitch_angle_deg REAL NOT NULL DEFAULT 0.0",
+    )
+    .execute(pool)
+    .await
+    {
+        let msg = e.to_string();
+        if !msg.contains("duplicate column name") {
+            return Err(format!(
+                "Failed to add dimension_group_props.pitch_angle_deg: {msg}"
+            ));
+        }
+    }
+    if let Err(e) = sqlx::query(
+        "ALTER TABLE dimension_group_props ADD COLUMN pitch_direction_deg REAL NOT NULL DEFAULT 0.0",
+    )
+    .execute(pool)
+    .await
+    {
+        let msg = e.to_string();
+        if !msg.contains("duplicate column name") {
+            return Err(format!(
+                "Failed to add dimension_group_props.pitch_direction_deg: {msg}"
             ));
         }
     }

@@ -317,6 +317,13 @@ interface AppStore {
   arrayTrimMode: boolean;
   // "line" = single cut line (half-plane trim); "box" = closed polygon (inside/outside trim).
   arrayTrimType: "line" | "box";
+  // When true, the Properties dialog's "Pick on Drawing" gesture is active: the canvas is
+  // showing a drag-to-pick, axis-locked (X/Y) pitch-direction preview.
+  pitchDirectionMode: boolean;
+  // Bridge for the pitch-direction pick gesture: the canvas bumps `seq` with the picked axis
+  // (`null` = cancelled via Esc) when the drag commits; the Properties dialog watches this to
+  // resume with the picked direction merged into its stashed in-progress edits.
+  pitchDirectionResult: { axis: "x" | "y" | null; seq: number } | null;
   // Drawing ribbon: false = 2D plan view (default), true = 3D framing view.
   view3d: boolean;
   // When true (and view3d is set), render the multi-page scene from `multiPage3DConfig`
@@ -368,6 +375,9 @@ interface AppStore {
   setOpeningPlacement: (template: OpeningTemplate | null) => void;
   setArrayTrimMode: (on: boolean) => void;
   setArrayTrimType: (trimType: "line" | "box") => void;
+  setPitchDirectionMode: (on: boolean) => void;
+  /** Called by the canvas when the pitch-direction drag commits (or Esc cancels with `null`). */
+  resolvePitchDirectionPick: (axis: "x" | "y" | null) => void;
   setView3d: (on: boolean) => void;
   setView3dMulti: (on: boolean) => void;
   setMultiPage3DConfig: (config: MultiPage3DConfig | null) => void;
@@ -797,6 +807,8 @@ export const useAppStore = create<AppStore>((set, get) => ({
   openingPlacement: null,
   arrayTrimMode: false,
   arrayTrimType: "line",
+  pitchDirectionMode: false,
+  pitchDirectionResult: null,
   view3d: false,
   view3dMulti: false,
   multiPage3DConfig: null,
@@ -894,6 +906,17 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   setArrayTrimType: (trimType) => {
     set({ arrayTrimType: trimType });
+  },
+
+  setPitchDirectionMode: (on) => {
+    set({ pitchDirectionMode: on });
+  },
+
+  resolvePitchDirectionPick: (axis) => {
+    set((state) => ({
+      pitchDirectionMode: false,
+      pitchDirectionResult: { axis, seq: (state.pitchDirectionResult?.seq ?? 0) + 1 },
+    }));
   },
 
   setView3d: (on) => {

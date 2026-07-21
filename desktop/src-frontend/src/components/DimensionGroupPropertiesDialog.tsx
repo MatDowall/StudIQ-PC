@@ -85,12 +85,18 @@ export function DimensionGroupPropertiesDialog({
   framingWalls = [],
   onCancel,
   onConfirm,
+  onPickDirection,
 }: {
   groupName: string;
   initial: DimensionGroupPropsDto;
   framingWalls?: FramingWallInput[];
   onCancel: () => void;
   onConfirm: (props: DimensionGroupPropsDto) => void;
+  /** "Pick on Drawing" for Pitch Direction: called with a full snapshot of the dialog's current
+   *  in-progress edits (not just pitch) so the caller can hide this dialog for the canvas drag
+   *  gesture and reopen it afterwards with nothing lost. Omit to hide the picker (e.g. read-only
+   *  contexts). */
+  onPickDirection?: (props: DimensionGroupPropsDto) => void;
 }) {
   const [measurementType, setMeasurementType] = useState(initial.measurement_type);
   const [defaultDisplay, setDefaultDisplay] = useState(initial.default_display);
@@ -103,6 +109,10 @@ export function DimensionGroupPropertiesDialog({
   const [negColour, setNegColour] = useState(initial.neg_colour);
   const [negStyle, setNegStyle] = useState(initial.neg_style);
   const [countType, setCountType] = useState(initial.count_type ?? "marker");
+  const [pitchAngle, setPitchAngle] = useState(String(initial.pitch_angle_deg ?? 0));
+  // Direction is never typed — only ever set via the "Pick on Drawing" canvas gesture, which is
+  // axis-locked, so this is always exactly "x" (0°) or "y" (90°).
+  const [pitchDirection, setPitchDirection] = useState<"x" | "y">(initial.pitch_direction_deg === 90 ? "y" : "x");
   // Custom count shape Height/Width are edited in millimetres (the natural unit for a small
   // real-world object — a fixture, a sheet, etc.) even though default_width/default_height are
   // stored in metres everywhere else in the app; converted at the confirm() boundary.
@@ -126,6 +136,14 @@ export function DimensionGroupPropertiesDialog({
   const isArray = measurementType === "array";
   const isCount = measurementType === "count";
   const isCustomCount = isCount && countType === "custom";
+  // Pitch Angle applies to Area (whole-shape slope correction), Length (a rake/rafter run, or a
+  // bending polyline like a fascia line), and Array (a run of members drawn along the slope) —
+  // not Count or Timber Framing (which has its own unrelated roof-framing "pitch" concept in
+  // lib/framing.ts). Direction only matters for Area and multi-segment Length, where different
+  // edges can run at different angles to the slope — a single Array run has no such ambiguity
+  // (same reasoning as a single 2-point Length segment), so it gets Angle without a Direction picker.
+  const showsPitch = measurementType === "area" || measurementType === "length" || isArray;
+  const showsPitchDirection = measurementType === "area" || measurementType === "length";
   const displayOptions = DISPLAYS_BY_TYPE[measurementType] ?? DISPLAYS_BY_TYPE.length;
   const customShapeInvalid = isCustomCount && (parseNumber(customWidthMm, 0) <= 0 || parseNumber(customHeightMm, 0) <= 0);
 
@@ -159,8 +177,10 @@ export function DimensionGroupPropertiesDialog({
   const framingDwangRows = dwangRowCount(framingSettings);
   const framingSummary = isFraming ? aggregateFramingGroup(framingWalls, framingSettings) : null;
 
-  function confirm() {
-    onConfirm({
+  // Shared by Save and the pitch-direction "Pick on Drawing" gesture (which needs a full
+  // snapshot of every in-progress edit so hiding/reopening this dialog loses nothing).
+  function buildProps(): DimensionGroupPropsDto {
+    return {
       node_id: initial.node_id,
       measurement_type: measurementType,
       // Framing always displays as length. Array displays as length or count.
@@ -178,10 +198,19 @@ export function DimensionGroupPropertiesDialog({
       neg_colour: negColour,
       neg_style: negStyle,
       weight_uom: initial.weight_uom,
+      // Switching a group away from a pitch-eligible type drops any pitch back to inert
+      // (0/along-X) rather than silently retaining a stale value the dialog no longer shows.
+      // Array has no direction concept, so it always stores 0 (along-X) regardless of pitchDirection.
+      pitch_angle_deg: showsPitch ? Math.min(89.9, Math.max(0, parseNumber(pitchAngle, 0))) : 0,
+      pitch_direction_deg: showsPitchDirection && pitchDirection === "y" ? 90 : 0,
       // Persist framing settings when this is a framing group; otherwise keep any existing blob.
       framing_props_json: isFraming ? serializeFramingSettings(framingSettings) : initial.framing_props_json,
       count_type: isCount ? countType : initial.count_type,
-    });
+    };
+  }
+
+  function confirm() {
+    onConfirm(buildProps());
   }
 
   return (
@@ -251,6 +280,46 @@ export function DimensionGroupPropertiesDialog({
                   <input type="number" value={height} onChange={(e) => setHeight(e.target.value)} style={{ ...inputStyle, flex: 1 }} />
                   <span style={{ color: theme.text.secondary, fontSize: 12 }}>m</span>
                 </Field>
+              ) : null}
+              {showsPitch ? (
+                <>
+                  <Field label="Pitch Angle">
+                    <input
+                      type="number"
+                      value={pitchAngle}
+                      onChange={(e) => setPitchAngle(e.target.value)}
+                      style={{ ...inputStyle, flex: 1 }}
+                      min={0}
+                      max={89.9}
+                      title="Slope angle from horizontal; 0 = no correction"
+                    />
+                    <span style={{ color: theme.text.secondary, fontSize: 12 }}>°</span>
+                  </Field>
+                  {showsPitchDirection ? (
+                    <Field label="Pitch Direction">
+                      <span style={{ flex: 1, fontSize: 12, color: theme.text.primary }}>
+                        {pitchDirection === "y" ? "Along Y" : "Along X"}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => onPickDirection?.(buildProps())}
+                        disabled={!onPickDirection}
+                        title="Drag a line on the drawing to set the slope direction, locked to the page's X or Y axis"
+                        style={{
+                          height: 24,
+                          padding: "0 8px",
+                          background: theme.bg.input,
+                          color: onPickDirection ? theme.text.primary : theme.text.disabled,
+                          border: `1px solid ${theme.border.divider}`,
+                          cursor: onPickDirection ? "pointer" : "not-allowed",
+                          fontSize: 11,
+                        }}
+                      >
+                        Pick on Drawing
+                      </button>
+                    </Field>
+                  ) : null}
+                </>
               ) : null}
             </>
           ) : (
