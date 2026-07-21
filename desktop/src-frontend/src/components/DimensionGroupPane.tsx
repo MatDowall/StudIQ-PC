@@ -12,8 +12,10 @@ import { DimensionGroupPropertiesDialog } from "./DimensionGroupPropertiesDialog
 import { TextInputDialog } from "./TextInputDialog";
 import { groupNetQuantity, quantityValueText, MEASUREMENT_TYPE_ICONS, type PagePoint, type Quantity } from "../lib/quantity";
 import { aggregateFramingGroup, parseFramingSettings, parseWallFraming, type FramingGroupBreakdown, type FramingWallInput } from "../lib/framing";
+import { RateLibraryPane } from "./RateLibraryPane";
 
-const tabs = ["Dimension Groups"];
+const tabs = ["Dimension Groups", "Rate Library"] as const;
+type PaneTab = (typeof tabs)[number];
 const gridColumns = "22px minmax(150px, 1fr) 72px 48px 26px";
 
 function findPath(nodes: TreeNodeDto[], targetId: number, childCache: Record<number, TreeNodeDto[]>, path: string[] = []): string[] | null {
@@ -353,6 +355,7 @@ export function DimensionGroupPane() {
   const [pendingProps, setPendingProps] = useState<{ node: TreeNodeDto; props: DimensionGroupPropsDto; framingWalls: FramingWallInput[] } | null>(null);
   const [pendingCopy, setPendingCopy] = useState<{ node: TreeNodeDto; folders: FolderOption[]; defaultFolderId: number | null } | null>(null);
   const [status, setStatus] = useState("");
+  const [paneTab, setPaneTab] = useState<PaneTab>("Dimension Groups");
   const lastCommandSeq = useRef(0);
 
   const scaleFor = useCallback(
@@ -632,16 +635,19 @@ export function DimensionGroupPane() {
   return (
     <section style={{ display: "flex", minHeight: 0, flexDirection: "column", background: theme.bg.pane }}>
       <div style={{ display: "flex", height: theme.tabHeight, background: theme.bg.tabBar, borderBottom: `1px solid ${theme.border.subtle}` }}>
-        {tabs.map((tab, index) => (
+        {tabs.map((tab) => (
           <div
             key={tab}
+            onClick={() => setPaneTab(tab)}
             style={{
               display: "flex",
               alignItems: "center",
               padding: "0 10px",
               borderRight: `1px solid ${theme.border.subtle}`,
-              background: index === 0 ? theme.bg.pane : theme.bg.tabBar,
-              color: index === 0 ? theme.text.primary : theme.text.disabled,
+              background: paneTab === tab ? theme.bg.pane : theme.bg.tabBar,
+              color: paneTab === tab ? theme.text.primary : theme.text.disabled,
+              cursor: "pointer",
+              userSelect: "none",
               fontSize: 12,
             }}
           >
@@ -649,6 +655,10 @@ export function DimensionGroupPane() {
           </div>
         ))}
       </div>
+      {paneTab === "Rate Library" ? (
+        <RateLibraryPane />
+      ) : (
+        <>
       <div style={{ display: "flex", gap: 6, padding: 6, borderBottom: `1px solid ${theme.border.subtle}` }}>
         <button
           onClick={() => setPendingFolderParent({ id: 0, tree: "dimensions", node_type: "folder", parent_id: null, name: "root", sort_order: 0, has_children: false, file_path: null, page_count: null, uom: null, colour: null, framing_size: null, measurement_type: null })}
@@ -736,6 +746,8 @@ export function DimensionGroupPane() {
           "No dimension group selected"
         )}
       </div>
+        </>
+      )}
       {contextMenu ? (
         <ContextMenu
           x={contextMenu.x}

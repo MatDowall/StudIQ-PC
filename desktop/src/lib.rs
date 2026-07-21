@@ -405,6 +405,37 @@ pub struct ConstantDto {
     pub value: f64,
 }
 
+/// One CSV upload of a supplier price book (e.g. a Carters STANDARD Price Book export),
+/// logged in the shared (cross-project) registry database. `is_current` marks the most
+/// recently uploaded book — the only one `price_book_items` holds rows for.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct PriceBookImportDto {
+    pub id: i64,
+    pub source_filename: String,
+    pub price_book_name: String,
+    pub account_number: String,
+    pub account_name: String,
+    pub branch_code: String,
+    pub download_date: String,
+    pub row_count: i64,
+    pub is_current: bool,
+    pub imported_at: String,
+}
+
+/// A single line from the current supplier price book — one product/code/rate.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct PriceBookItemDto {
+    pub id: i64,
+    pub product_category: String,
+    pub group_name: String,
+    pub sub_group: String,
+    pub description: String,
+    pub product_code: String,
+    pub unit_of_sale: String,
+    pub unit_price: f64,
+    pub effective_date: String,
+}
+
 /// CostX-style dimension-group properties. Width/height/offset are in metres (the unit
 /// the dialog edits); multiplier is unitless. `measurement_type` is how dimensions are
 /// drawn; `default_display` is how the quantity is derived (see the derivation matrix).
@@ -3799,6 +3830,66 @@ async fn init_registry_database(
     .execute(&pool)
     .await;
 
+    // Rate library: supplier price books (e.g. Carters), uploaded via the management
+    // console and shared across every project. `price_book_imports` is a full ingest
+    // history log (kept for audit — one row per upload); `price_book_items` holds only
+    // the rows for the *current* import (`is_current = 1`) since a workbook drag-drop
+    // copies the rate value at drop time rather than linking back to it live.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS price_book_imports (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_filename  TEXT    NOT NULL,
+            price_book_name  TEXT    NOT NULL DEFAULT '',
+            account_number   TEXT    NOT NULL DEFAULT '',
+            account_name     TEXT    NOT NULL DEFAULT '',
+            branch_code      TEXT    NOT NULL DEFAULT '',
+            download_date    TEXT    NOT NULL DEFAULT '',
+            row_count        INTEGER NOT NULL DEFAULT 0,
+            is_current       INTEGER NOT NULL DEFAULT 0,
+            imported_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+        );
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .map_err(|e| format!("Failed to create price_book_imports: {e}"))?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS price_book_items (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            import_id           INTEGER NOT NULL REFERENCES price_book_imports(id) ON DELETE CASCADE,
+            product_category    TEXT    NOT NULL DEFAULT '',
+            group_name          TEXT    NOT NULL DEFAULT '',
+            sub_group           TEXT    NOT NULL DEFAULT '',
+            description         TEXT    NOT NULL DEFAULT '',
+            product_code        TEXT    NOT NULL DEFAULT '',
+            unit_of_sale        TEXT    NOT NULL DEFAULT '',
+            unit_price          REAL    NOT NULL DEFAULT 0.0,
+            effective_date      TEXT    NOT NULL DEFAULT ''
+        );
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .map_err(|e| format!("Failed to create price_book_items: {e}"))?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_price_book_items_import ON price_book_items(import_id)")
+        .execute(&pool)
+        .await
+        .map_err(|e| format!("Failed to create price_book_items import index: {e}"))?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_price_book_items_group ON price_book_items(import_id, product_category, group_name, sub_group)",
+    )
+    .execute(&pool)
+    .await
+    .map_err(|e| format!("Failed to create price_book_items group index: {e}"))?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_price_book_items_desc ON price_book_items(description)")
+        .execute(&pool)
+        .await
+        .map_err(|e| format!("Failed to create price_book_items description index: {e}"))?;
+
     let projects = load_recent_projects_from_registry(&pool).await?;
 
     Ok((pool, projects))
@@ -4442,6 +4533,350 @@ async fn delete_constant(name: String, state: State<'_, AppState>) -> Result<(),
     Ok(())
 }
 
+// ─── Price book (rate library) commands ────────────────────────────────────────
+// Supplier price books (e.g. a Carters export) are shared across every project —
+// uploaded once via the management console (registry_db, not the per-project
+// database) and live-queried from the sidebar Rate Library pane. Dragging an item
+// into the workbook copies its code/description/unit/rate at drop time; nothing
+// keeps a live link back to the source row, so a re-upload can freely replace the
+// item table without touching any workbook that already borrowed a rate from it.
+
+fn row_to_price_book_item(row: &sqlx::sqlite::SqliteRow) -> Result<PriceBookItemDto, String> {
+    Ok(PriceBookItemDto {
+        id: row.try_get("id").map_err(|e| e.to_string())?,
+        product_category: row.try_get("product_category").map_err(|e| e.to_string())?,
+        group_name: row.try_get("group_name").map_err(|e| e.to_string())?,
+        sub_group: row.try_get("sub_group").map_err(|e| e.to_string())?,
+        description: row.try_get("description").map_err(|e| e.to_string())?,
+        product_code: row.try_get("product_code").map_err(|e| e.to_string())?,
+        unit_of_sale: row.try_get("unit_of_sale").map_err(|e| e.to_string())?,
+        unit_price: row.try_get("unit_price").map_err(|e| e.to_string())?,
+        effective_date: row.try_get("effective_date").map_err(|e| e.to_string())?,
+    })
+}
+
+fn row_to_price_book_import(row: &sqlx::sqlite::SqliteRow) -> Result<PriceBookImportDto, String> {
+    Ok(PriceBookImportDto {
+        id: row.try_get("id").map_err(|e| e.to_string())?,
+        source_filename: row.try_get("source_filename").map_err(|e| e.to_string())?,
+        price_book_name: row.try_get("price_book_name").map_err(|e| e.to_string())?,
+        account_number: row.try_get("account_number").map_err(|e| e.to_string())?,
+        account_name: row.try_get("account_name").map_err(|e| e.to_string())?,
+        branch_code: row.try_get("branch_code").map_err(|e| e.to_string())?,
+        download_date: row.try_get("download_date").map_err(|e| e.to_string())?,
+        row_count: row.try_get("row_count").map_err(|e| e.to_string())?,
+        is_current: row.try_get::<i64, _>("is_current").map_err(|e| e.to_string())? != 0,
+        imported_at: row.try_get("imported_at").map_err(|e| e.to_string())?,
+    })
+}
+
+/// Parses the Carters export's `d/m/y` (2-digit year) date columns into `YYYY-MM-DD` so
+/// the management console can sort/display them consistently. Falls back to the raw
+/// string unchanged for anything that doesn't match — a format surprise should never
+/// hard-fail the ingest, only look a little odd in the console.
+fn normalize_price_book_date(raw: &str) -> String {
+    let parts: Vec<&str> = raw.trim().split('/').collect();
+    if let [d, m, y] = parts.as_slice() {
+        if let (Ok(d), Ok(m), Ok(y)) = (d.parse::<u32>(), m.parse::<u32>(), y.parse::<u32>()) {
+            let year = if y < 100 { 2000 + y } else { y };
+            return format!("{year:04}-{m:02}-{d:02}");
+        }
+    }
+    raw.trim().to_string()
+}
+
+#[tauri::command]
+async fn list_price_book_imports(state: State<'_, AppState>) -> Result<Vec<PriceBookImportDto>, String> {
+    let rows = sqlx::query(
+        "SELECT id, source_filename, price_book_name, account_number, account_name, branch_code, download_date, row_count, is_current, imported_at
+         FROM price_book_imports ORDER BY imported_at DESC",
+    )
+    .fetch_all(&state.registry_db)
+    .await
+    .map_err(|e| format!("list_price_book_imports: {e}"))?;
+    rows.iter().map(row_to_price_book_import).collect()
+}
+
+#[tauri::command]
+async fn get_current_price_book(state: State<'_, AppState>) -> Result<Option<PriceBookImportDto>, String> {
+    let row = sqlx::query(
+        "SELECT id, source_filename, price_book_name, account_number, account_name, branch_code, download_date, row_count, is_current, imported_at
+         FROM price_book_imports WHERE is_current = 1 LIMIT 1",
+    )
+    .fetch_optional(&state.registry_db)
+    .await
+    .map_err(|e| format!("get_current_price_book: {e}"))?;
+    row.as_ref().map(row_to_price_book_import).transpose()
+}
+
+#[tauri::command]
+async fn list_price_book_categories(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    let rows = sqlx::query(
+        "SELECT DISTINCT product_category FROM price_book_items
+         WHERE import_id = (SELECT id FROM price_book_imports WHERE is_current = 1)
+         ORDER BY product_category",
+    )
+    .fetch_all(&state.registry_db)
+    .await
+    .map_err(|e| format!("list_price_book_categories: {e}"))?;
+    rows.iter()
+        .map(|r| r.try_get::<String, _>("product_category").map_err(|e| e.to_string()))
+        .collect()
+}
+
+#[tauri::command]
+async fn list_price_book_groups(category: String, state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    let rows = sqlx::query(
+        "SELECT DISTINCT group_name FROM price_book_items
+         WHERE import_id = (SELECT id FROM price_book_imports WHERE is_current = 1) AND product_category = ?
+         ORDER BY group_name",
+    )
+    .bind(&category)
+    .fetch_all(&state.registry_db)
+    .await
+    .map_err(|e| format!("list_price_book_groups: {e}"))?;
+    rows.iter()
+        .map(|r| r.try_get::<String, _>("group_name").map_err(|e| e.to_string()))
+        .collect()
+}
+
+#[tauri::command]
+async fn list_price_book_subgroups(
+    category: String,
+    group_name: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    let rows = sqlx::query(
+        "SELECT DISTINCT sub_group FROM price_book_items
+         WHERE import_id = (SELECT id FROM price_book_imports WHERE is_current = 1) AND product_category = ? AND group_name = ?
+         ORDER BY sub_group",
+    )
+    .bind(&category)
+    .bind(&group_name)
+    .fetch_all(&state.registry_db)
+    .await
+    .map_err(|e| format!("list_price_book_subgroups: {e}"))?;
+    rows.iter()
+        .map(|r| r.try_get::<String, _>("sub_group").map_err(|e| e.to_string()))
+        .collect()
+}
+
+#[tauri::command]
+async fn list_price_book_items(
+    category: String,
+    group_name: String,
+    sub_group: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<PriceBookItemDto>, String> {
+    let rows = sqlx::query(
+        "SELECT id, product_category, group_name, sub_group, description, product_code, unit_of_sale, unit_price, effective_date
+         FROM price_book_items
+         WHERE import_id = (SELECT id FROM price_book_imports WHERE is_current = 1)
+           AND product_category = ? AND group_name = ? AND sub_group = ?
+         ORDER BY description",
+    )
+    .bind(&category)
+    .bind(&group_name)
+    .bind(&sub_group)
+    .fetch_all(&state.registry_db)
+    .await
+    .map_err(|e| format!("list_price_book_items: {e}"))?;
+    rows.iter().map(row_to_price_book_item).collect()
+}
+
+/// Live text search across the current price book's description and product code,
+/// capped at 200 rows — the Rate Library pane's search box calls this on every
+/// keystroke (debounced), so it stays a single indexed query rather than a full scan
+/// shipped to the frontend for client-side filtering.
+#[tauri::command]
+async fn search_price_book_items(query: String, state: State<'_, AppState>) -> Result<Vec<PriceBookItemDto>, String> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    // LIKE wildcards aren't meaningful search syntax here — strip them so a query
+    // containing "%" or "_" is treated as a literal substring instead of surprising
+    // the estimator with a broader match than they typed.
+    let sanitized = trimmed.replace('%', "").replace('_', "");
+    let like = format!("%{sanitized}%");
+    let rows = sqlx::query(
+        "SELECT id, product_category, group_name, sub_group, description, product_code, unit_of_sale, unit_price, effective_date
+         FROM price_book_items
+         WHERE import_id = (SELECT id FROM price_book_imports WHERE is_current = 1)
+           AND (description LIKE ? OR product_code LIKE ?)
+         ORDER BY description
+         LIMIT 200",
+    )
+    .bind(&like)
+    .bind(&like)
+    .fetch_all(&state.registry_db)
+    .await
+    .map_err(|e| format!("search_price_book_items: {e}"))?;
+    rows.iter().map(row_to_price_book_item).collect()
+}
+
+#[tauri::command]
+async fn import_price_book(path: String, state: State<'_, AppState>) -> Result<PriceBookImportDto, String> {
+    let file = std::fs::File::open(&path).map_err(|e| format!("Failed to open file: {e}"))?;
+    // `flexible(true)`: Carters' export tacks a few `#`-prefixed single-field disclaimer
+    // lines onto the end of the file (e.g. "#Prices are subject to change without
+    // notice") — a strict reader errors on their field count not matching the header's.
+    // Short rows like these are filtered out below instead.
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .flexible(true)
+        .from_reader(file);
+
+    let headers = reader
+        .headers()
+        .map_err(|e| format!("Failed to read CSV header row: {e}"))?
+        .clone();
+    let column_count = headers.len();
+    // The first header ("Download Date") is exported as "# Download Date" — strip a
+    // leading '#' (and the whitespace around it) before matching column names.
+    let col = |name: &str| -> Result<usize, String> {
+        headers
+            .iter()
+            .position(|h| h.trim().trim_start_matches('#').trim().eq_ignore_ascii_case(name))
+            .ok_or_else(|| format!("CSV is missing the required '{name}' column"))
+    };
+    let idx_download_date = col("Download Date")?;
+    let idx_price_book_name = col("Price Book Name")?;
+    let idx_account_number = col("Account Number")?;
+    let idx_account_name = col("Account Name")?;
+    let idx_branch_code = col("Branch Code")?;
+    let idx_category = col("Product Category")?;
+    let idx_group = col("Group")?;
+    let idx_sub_group = col("Sub Group")?;
+    let idx_description = col("Product Description")?;
+    let idx_product_code = col("Product Code")?;
+    let idx_unit = col("Unit of Sale")?;
+    let idx_price = col("Unit Price Ex GST")?;
+    let idx_effective_date = col("Effective Date")?;
+
+    struct ParsedItem {
+        category: String,
+        group: String,
+        sub_group: String,
+        description: String,
+        product_code: String,
+        unit: String,
+        price: f64,
+        effective_date: String,
+    }
+
+    let mut items: Vec<ParsedItem> = Vec::new();
+    let mut header_meta: Option<(String, String, String, String, String)> = None;
+
+    for result in reader.records() {
+        let record = result.map_err(|e| format!("Failed to parse CSV row: {e}"))?;
+        // Trailing disclaimer lines parse as a single short field under `flexible(true)`
+        // — not a real price book row, so skip it rather than reading past the record.
+        if record.len() < column_count {
+            continue;
+        }
+        let get = |i: usize| -> String {
+            record.get(i).unwrap_or("").trim().replace(['\n', '\r'], " ")
+        };
+        if header_meta.is_none() {
+            header_meta = Some((
+                get(idx_download_date),
+                get(idx_price_book_name),
+                get(idx_account_number),
+                get(idx_account_name),
+                get(idx_branch_code),
+            ));
+        }
+        items.push(ParsedItem {
+            category: get(idx_category),
+            group: get(idx_group),
+            sub_group: get(idx_sub_group),
+            description: get(idx_description),
+            product_code: get(idx_product_code),
+            unit: get(idx_unit),
+            price: get(idx_price).parse().unwrap_or(0.0),
+            effective_date: normalize_price_book_date(&get(idx_effective_date)),
+        });
+    }
+    if items.is_empty() {
+        return Err("CSV contains no data rows".to_string());
+    }
+    let (download_date, price_book_name, account_number, account_name, branch_code) =
+        header_meta.unwrap_or_default();
+    let download_date = normalize_price_book_date(&download_date);
+    let source_filename = Path::new(&path)
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.clone());
+    let row_count = items.len() as i64;
+
+    let mut tx = state
+        .registry_db
+        .begin()
+        .await
+        .map_err(|e| format!("import_price_book: {e}"))?;
+
+    sqlx::query("UPDATE price_book_imports SET is_current = 0")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("import_price_book: {e}"))?;
+
+    let insert_result = sqlx::query(
+        "INSERT INTO price_book_imports (source_filename, price_book_name, account_number, account_name, branch_code, download_date, row_count, is_current)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
+    )
+    .bind(&source_filename)
+    .bind(&price_book_name)
+    .bind(&account_number)
+    .bind(&account_name)
+    .bind(&branch_code)
+    .bind(&download_date)
+    .bind(row_count)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("import_price_book: {e}"))?;
+    let import_id = insert_result.last_insert_rowid();
+
+    for item in &items {
+        sqlx::query(
+            "INSERT INTO price_book_items (import_id, product_category, group_name, sub_group, description, product_code, unit_of_sale, unit_price, effective_date)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(import_id)
+        .bind(&item.category)
+        .bind(&item.group)
+        .bind(&item.sub_group)
+        .bind(&item.description)
+        .bind(&item.product_code)
+        .bind(&item.unit)
+        .bind(item.price)
+        .bind(&item.effective_date)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("import_price_book: {e}"))?;
+    }
+
+    // Only the current import keeps its item rows — older imports stay in the
+    // ingest-history log (price_book_imports) but their line items are dropped.
+    sqlx::query("DELETE FROM price_book_items WHERE import_id != ?")
+        .bind(import_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("import_price_book: {e}"))?;
+
+    tx.commit().await.map_err(|e| format!("import_price_book: {e}"))?;
+
+    let row = sqlx::query(
+        "SELECT id, source_filename, price_book_name, account_number, account_name, branch_code, download_date, row_count, is_current, imported_at
+         FROM price_book_imports WHERE id = ?",
+    )
+    .bind(import_id)
+    .fetch_one(&state.registry_db)
+    .await
+    .map_err(|e| format!("import_price_book: {e}"))?;
+    row_to_price_book_import(&row)
+}
+
 async fn query_tree_nodes(
     pool: &SqlitePool,
     tree: Option<&str>,
@@ -5052,7 +5487,15 @@ pub fn run() {
             get_rate,
             list_constants,
             set_constant,
-            delete_constant
+            delete_constant,
+            import_price_book,
+            list_price_book_imports,
+            get_current_price_book,
+            list_price_book_categories,
+            list_price_book_groups,
+            list_price_book_subgroups,
+            list_price_book_items,
+            search_price_book_items
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
