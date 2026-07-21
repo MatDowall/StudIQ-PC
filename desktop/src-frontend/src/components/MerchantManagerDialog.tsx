@@ -243,11 +243,17 @@ export function MerchantManagerDialog({ onClose, onChanged }: Props) {
                   </div>
                 ) : null}
 
+                <div style={{ fontSize: 11, color: theme.text.secondary, marginBottom: 6 }}>
+                  Only Description and Unit Price are required — Category/Group/Sub Group are
+                  optional and can be left blank for a merchant whose price list isn't organized
+                  that way.
+                </div>
+
                 <div style={{ maxHeight: 280, overflow: "auto" }}>
                   <div style={{ display: "grid", gridTemplateColumns: "170px 1fr", rowGap: 6, columnGap: 8, alignItems: "center" }}>
                     {PRICE_BOOK_FIELDS.map((field) => (
                       <div key={field.key} style={{ display: "contents" }}>
-                        <label style={{ fontSize: 12, color: theme.text.secondary }}>
+                        <label style={{ fontSize: 12, color: theme.text.secondary }} title={field.hint}>
                           {field.label}
                           {field.required ? <span style={{ color: theme.danger }}> *</span> : null}
                         </label>
@@ -255,7 +261,7 @@ export function MerchantManagerDialog({ onClose, onChanged }: Props) {
                           value={draft.columnMap[field.key] ?? ""}
                           onChange={(event) => updateField(field.key, event.target.value)}
                           list={`merchant-headers-${field.key}`}
-                          placeholder={field.required ? "Required — exact CSV column name" : "Optional"}
+                          placeholder={field.required ? "Required — exact CSV column name" : field.hint ?? "Optional"}
                           style={{
                             height: 24,
                             padding: "0 6px",

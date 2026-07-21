@@ -42,14 +42,19 @@ export interface MerchantDto {
 /** Canonical price-book fields, shared by the merchant format editor and the import
  *  validation error messages on the backend — keep in sync with
  *  REQUIRED_PRICE_BOOK_FIELDS / OPTIONAL_PRICE_BOOK_FIELDS in desktop/src/lib.rs. */
-export const PRICE_BOOK_FIELDS: Array<{ key: string; label: string; required: boolean }> = [
-  { key: "category", label: "Product Category", required: true },
-  { key: "group_name", label: "Group", required: true },
-  { key: "sub_group", label: "Sub Group", required: true },
-  { key: "description", label: "Product Description", required: true },
-  { key: "product_code", label: "Product Code", required: true },
-  { key: "unit_of_sale", label: "Unit of Sale", required: true },
+export const PRICE_BOOK_FIELDS: Array<{ key: string; label: string; required: boolean; hint?: string }> = [
+  { key: "description", label: "Description", required: true },
   { key: "unit_price", label: "Unit Price", required: true },
+  { key: "unit_of_sale", label: "Unit", required: false },
+  { key: "product_code", label: "Item Code", required: false },
+  {
+    key: "category",
+    label: "Category",
+    required: false,
+    hint: "Leave blank if this merchant doesn't group items into categories",
+  },
+  { key: "group_name", label: "Group", required: false, hint: "Leave blank if this merchant has no sub-level under Category" },
+  { key: "sub_group", label: "Sub Group", required: false, hint: "Leave blank if this merchant has no further sub-level under Group" },
   { key: "effective_date", label: "Effective Date", required: false },
   { key: "download_date", label: "Download / Ingest Date", required: false },
   { key: "price_book_name", label: "Price Book Name", required: false },
@@ -148,107 +153,139 @@ function ExpandRow({
   );
 }
 
-/** A "Group" node — the CSV's `Sub Group` column groups items directly under a Group in
- *  this price book (Group and Sub Group are frequently identical), so a Group expands
- *  straight to its distinct sub-groups, one level of drill-down each. */
-function GroupNode({ category, group }: { category: string; group: string }) {
-  const [expanded, setExpanded] = useState(false);
-  const [subGroups, setSubGroups] = useState<string[] | null>(null);
-  const [loading, setLoading] = useState(false);
+/** Matches the backend's PRICE_BOOK_BROWSE_LIMIT (desktop/src/lib.rs) — used only to
+ *  decide whether to show a "showing first N" hint under a browsed (not searched) item
+ *  list, which only fires in practice for a merchant with no meaningful grouping at all. */
+const ITEM_BROWSE_LIMIT = 300;
 
-  async function toggle() {
-    const next = !expanded;
-    setExpanded(next);
-    if (next && subGroups === null && !loading) {
-      setLoading(true);
-      try {
-        const rows = await invoke<string[]>("list_price_book_subgroups", { category, groupName: group });
-        setSubGroups(rows);
-      } finally {
-        setLoading(false);
-      }
-    }
+/** category/group/subGroup are `null` when that level isn't filtered — either because
+ *  the merchant's format doesn't map it, or because a shallower level has already
+ *  collapsed past it (see TreeBranch). An empty string `""` is a real, distinct filter
+ *  value: the "(Uncategorised)"/"(Ungrouped)"/"(No Sub Group)" bucket. */
+interface TreeFilters {
+  category: string | null;
+  group: string | null;
+  subGroup: string | null;
+}
+
+const BLANK_BUCKET_LABELS = ["(Uncategorised)", "(Ungrouped)", "(No Sub Group)"];
+
+function fetchLevelValues(level: 0 | 1 | 2, filters: TreeFilters): Promise<string[]> {
+  if (level === 0) return invoke<string[]>("list_price_book_categories");
+  if (level === 1) return invoke<string[]>("list_price_book_groups", { category: filters.category });
+  return invoke<string[]>("list_price_book_subgroups", { category: filters.category, groupName: filters.group });
+}
+
+function withLevelValue(filters: TreeFilters, level: 0 | 1 | 2, value: string): TreeFilters {
+  if (level === 0) return { ...filters, category: value };
+  if (level === 1) return { ...filters, group: value };
+  return { ...filters, subGroup: value };
+}
+
+/** Renders one level of the Category → Group → Sub Group hierarchy (or, at level 3,
+ *  the items themselves). Different merchants use this hierarchy to different depths —
+ *  some don't categorize at all — so a level whose values are *all* blank (the field
+ *  isn't mapped for this merchant, or every item under the current filters leaves it
+ *  blank) is invisible: instead of rendering a single pointless "(Uncategorised)" node,
+ *  it passes straight through to the next level at the same tree depth. This is what
+ *  lets the same tree component handle a full Carters-style hierarchy, a flat
+ *  description+price-only catalog, and everything in between, driven entirely by what
+ *  the data actually contains. */
+function TreeBranch({ level, filters, depth }: { level: 0 | 1 | 2 | 3; filters: TreeFilters; depth: number }) {
+  const [values, setValues] = useState<string[] | null>(null);
+
+  useEffect(() => {
+    if (level === 3) return;
+    let cancelled = false;
+    setValues(null);
+    fetchLevelValues(level, filters).then((rows) => {
+      if (!cancelled) setValues(rows);
+    });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [level, filters.category, filters.group, filters.subGroup]);
+
+  if (level === 3) return <ItemsLeaf filters={filters} depth={depth} />;
+
+  if (values === null) {
+    return <div style={{ paddingLeft: theme.treeIndent * depth, fontSize: 11, color: theme.text.secondary }}>Loading...</div>;
+  }
+
+  if (values.every((v) => v === "")) {
+    return <TreeBranch level={(level + 1) as 1 | 2 | 3} filters={filters} depth={depth} />;
   }
 
   return (
     <>
-      <ExpandRow depth={1} label={group} expanded={expanded} onToggle={() => void toggle()} />
-      {expanded && loading ? (
-        <div style={{ paddingLeft: theme.treeIndent * 2, fontSize: 11, color: theme.text.secondary }}>Loading...</div>
-      ) : null}
-      {expanded && subGroups
-        ? subGroups.map((sg) => <SubGroupLeaf key={sg} category={category} group={group} subGroup={sg} />)
-        : null}
+      {values.map((value) => (
+        <TreeBranchNode key={value} level={level} value={value} filters={filters} depth={depth} />
+      ))}
     </>
   );
 }
 
-function SubGroupLeaf({ category, group, subGroup }: { category: string; group: string; subGroup: string }) {
+function TreeBranchNode({
+  level,
+  value,
+  filters,
+  depth,
+}: {
+  level: 0 | 1 | 2;
+  value: string;
+  filters: TreeFilters;
+  depth: number;
+}) {
   const [expanded, setExpanded] = useState(false);
+  return (
+    <>
+      <ExpandRow depth={depth} label={value || BLANK_BUCKET_LABELS[level]} expanded={expanded} onToggle={() => setExpanded((e) => !e)} />
+      {expanded ? (
+        <TreeBranch level={(level + 1) as 1 | 2 | 3} filters={withLevelValue(filters, level, value)} depth={depth + 1} />
+      ) : null}
+    </>
+  );
+}
+
+function ItemsLeaf({ filters, depth }: { filters: TreeFilters; depth: number }) {
   const [items, setItems] = useState<PriceBookItemDto[] | null>(null);
-  const [loading, setLoading] = useState(false);
 
-  async function toggle() {
-    const next = !expanded;
-    setExpanded(next);
-    if (next && items === null && !loading) {
-      setLoading(true);
-      try {
-        const rows = await invoke<PriceBookItemDto[]>("list_price_book_items", {
-          category,
-          groupName: group,
-          subGroup,
-        });
-        setItems(rows);
-      } finally {
-        setLoading(false);
-      }
-    }
+  useEffect(() => {
+    let cancelled = false;
+    invoke<PriceBookItemDto[]>("list_price_book_items", {
+      category: filters.category,
+      groupName: filters.group,
+      subGroup: filters.subGroup,
+    }).then((rows) => {
+      if (!cancelled) setItems(rows);
+    });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filters.category, filters.group, filters.subGroup]);
+
+  if (items === null) {
+    return <div style={{ paddingLeft: theme.treeIndent * depth, fontSize: 11, color: theme.text.secondary }}>Loading...</div>;
   }
-
   return (
     <>
-      <ExpandRow depth={2} label={subGroup} expanded={expanded} onToggle={() => void toggle()} count={items?.length} />
-      {expanded && loading ? (
-        <div style={{ paddingLeft: theme.treeIndent * 3, fontSize: 11, color: theme.text.secondary }}>Loading...</div>
+      {items.map((item) => (
+        <ItemRow key={item.id} item={item} />
+      ))}
+      {items.length >= ITEM_BROWSE_LIMIT ? (
+        <div style={{ paddingLeft: theme.treeIndent * depth, fontSize: 11, color: theme.text.secondary }}>
+          Showing first {ITEM_BROWSE_LIMIT} — use search to find more
+        </div>
       ) : null}
-      {expanded && items ? items.map((item) => <ItemRow key={item.id} item={item} />) : null}
     </>
   );
 }
 
-function CategoryNode({ category }: { category: string }) {
-  const [expanded, setExpanded] = useState(false);
-  const [groups, setGroups] = useState<string[] | null>(null);
-  const [loading, setLoading] = useState(false);
-
-  async function toggle() {
-    const next = !expanded;
-    setExpanded(next);
-    if (next && groups === null && !loading) {
-      setLoading(true);
-      try {
-        const rows = await invoke<string[]>("list_price_book_groups", { category });
-        setGroups(rows);
-      } finally {
-        setLoading(false);
-      }
-    }
-  }
-
-  return (
-    <>
-      <ExpandRow depth={0} label={category} expanded={expanded} onToggle={() => void toggle()} />
-      {expanded && loading ? (
-        <div style={{ paddingLeft: theme.treeIndent, fontSize: 11, color: theme.text.secondary }}>Loading...</div>
-      ) : null}
-      {expanded && groups ? groups.map((g) => <GroupNode key={g} category={category} group={g} />) : null}
-    </>
-  );
-}
+const ROOT_FILTERS: TreeFilters = { category: null, group: null, subGroup: null };
 
 export function RateLibraryPane() {
-  const [categories, setCategories] = useState<string[] | null>(null);
   const [currentBook, setCurrentBook] = useState<PriceBookImportDto | null>(null);
   const [query, setQuery] = useState("");
   const [searchResults, setSearchResults] = useState<PriceBookItemDto[] | null>(null);
@@ -260,12 +297,8 @@ export function RateLibraryPane() {
   async function refresh() {
     setStatus("Loading price book...");
     try {
-      const [book, cats] = await Promise.all([
-        invoke<PriceBookImportDto | null>("get_current_price_book"),
-        invoke<string[]>("list_price_book_categories"),
-      ]);
+      const book = await invoke<PriceBookImportDto | null>("get_current_price_book");
       setCurrentBook(book);
-      setCategories(cats);
       setStatus("");
     } catch (error) {
       setStatus(`ERROR: ${error}`);
@@ -370,15 +403,12 @@ export function RateLibraryPane() {
             ) : null}
             {searchResults?.map((item) => <ItemRow key={item.id} item={item} />)}
           </>
+        ) : currentBook ? (
+          <TreeBranch key={currentBook.id} level={0} filters={ROOT_FILTERS} depth={0} />
         ) : (
-          <>
-            {categories?.length === 0 ? (
-              <div style={{ padding: 8, color: theme.text.secondary, fontSize: 12 }}>
-                No price book loaded — click Manage to upload one
-              </div>
-            ) : null}
-            {categories?.map((category) => <CategoryNode key={category} category={category} />)}
-          </>
+          <div style={{ padding: 8, color: theme.text.secondary, fontSize: 12 }}>
+            No price book loaded — click Manage to upload one
+          </div>
         )}
       </div>
 

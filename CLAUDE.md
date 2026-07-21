@@ -169,21 +169,34 @@ a live link (`setCellLink`) back to the group.
 
 The CSV's `Group`/`Sub Group` columns drive the Rate Library tree (Category → Group → Sub Group →
 items), lazy-loaded per level the same way `DrawingRegisterPane`/`DimensionGroupPane` lazy-load
-their trees.
+their trees. Only `description` and `unit_price` are actually required of a merchant format —
+`category`/`group_name`/`sub_group` are optional, since some suppliers don't organize their price
+list into a category hierarchy at all. `RateLibraryPane.tsx`'s `TreeBranch` renders the tree
+generically off whatever the data actually contains: at each level it asks the backend for the
+distinct values (`list_price_book_categories`/`_groups`/`_subgroups`, each accepting the parent
+filters as `Option<String>` — `None` means "not filtered", `Some("")` means the deliberate
+"(Uncategorised)"/"(Ungrouped)"/"(No Sub Group)" bucket for items that do have sibling values at
+that level but are blank there). If a level's values are *all* blank — the field isn't mapped for
+this merchant, or every item under the current filters leaves it blank — `TreeBranch` skips
+rendering that level entirely and passes straight through to the next one, so the same component
+handles a full Carters-style hierarchy, a flat description+price-only catalog, and anything in
+between. `list_price_book_items` (and `search_price_book_items`) cap browse/search results at
+`PRICE_BOOK_BROWSE_LIMIT`/200 rows respectively — only reachable in practice for a merchant with
+no meaningful grouping, where "browse" would otherwise mean "list everything".
 
 #### Merchants: pluggable per-supplier CSV formats
 
 Every supplier names/orders its export columns differently (Carters' first header cell is
 literally `# Download Date`; another merchant's file might not carry a `Sub Group` column at
-all), so the parser doesn't hardcode one CSV layout. `price_book_merchants` stores, per
-merchant, a `column_map_json` — a JSON object mapping each canonical field (`category`,
-`group_name`, `sub_group`, `description`, `product_code`, `unit_of_sale`, `unit_price`, plus
-optional metadata fields — the full list is `REQUIRED_PRICE_BOOK_FIELDS` /
-`OPTIONAL_PRICE_BOOK_FIELDS` in `desktop/src/lib.rs`, mirrored in `PRICE_BOOK_FIELDS` in
-`RateLibraryPane.tsx`) to that merchant's literal CSV header text. A "Carters" merchant is
-seeded on registry init with the mapping this feature originally shipped with (including the
-literal `# Download Date` header — the leading `#` is just part of the stored mapping now, not
-a special-cased strip).
+all, or any category hierarchy whatsoever), so the parser doesn't hardcode one CSV layout.
+`price_book_merchants` stores, per merchant, a `column_map_json` — a JSON object mapping each
+canonical field to that merchant's literal CSV header text. The full field list is
+`REQUIRED_PRICE_BOOK_FIELDS` (`description`, `unit_price` — nothing else) /
+`OPTIONAL_PRICE_BOOK_FIELDS` (`category`, `group_name`, `sub_group`, `product_code`,
+`unit_of_sale`, plus metadata fields) in `desktop/src/lib.rs`, mirrored in `PRICE_BOOK_FIELDS` in
+`RateLibraryPane.tsx`. A "Carters" merchant is seeded on registry init with the mapping this
+feature originally shipped with (including the literal `# Download Date` header — the leading
+`#` is just part of the stored mapping now, not a special-cased strip).
 
 `MerchantManagerDialog.tsx` (opened from the management console) is where formats are
 authored: "Load Sample CSV" calls `preview_price_book_headers` to read just the header row of a

@@ -4668,20 +4668,20 @@ fn row_to_merchant(row: &sqlx::sqlite::SqliteRow) -> Result<MerchantDto, String>
 /// of the app actually reads (category/group/sub-group tree, description, code, unit,
 /// price). A merchant's format can't be saved without all of these mapped, and an
 /// import fails fast if the mapped header isn't actually present in the uploaded CSV.
-const REQUIRED_PRICE_BOOK_FIELDS: [&str; 7] = [
+const REQUIRED_PRICE_BOOK_FIELDS: [&str; 2] = ["description", "unit_price"];
+
+/// Everything else — including `category`/`group_name`/`sub_group` — is optional and
+/// mapped per merchant only if that merchant's catalog actually has it: some suppliers
+/// don't organize their price book into a category → sub-category hierarchy at all, so
+/// this can't be a hard requirement. An unmapped field reads as blank for every item,
+/// which the Rate Library tree (`RateLibraryPane.tsx`'s `TreeBranch`) treats as "this
+/// level doesn't apply" and skips straight through to the next one.
+const OPTIONAL_PRICE_BOOK_FIELDS: [&str; 11] = [
     "category",
     "group_name",
     "sub_group",
-    "description",
     "product_code",
     "unit_of_sale",
-    "unit_price",
-];
-
-/// Metadata fields shown in the management console but not required for the price book
-/// to function — mapped optionally per merchant and left blank if the merchant doesn't
-/// map them (or the mapped column happens to be missing from a given upload).
-const OPTIONAL_PRICE_BOOK_FIELDS: [&str; 6] = [
     "effective_date",
     "download_date",
     "price_book_name",
@@ -4843,12 +4843,18 @@ async fn preview_price_book_headers(path: String) -> Result<Vec<String>, String>
     Ok(headers.iter().map(|h| h.trim().to_string()).collect())
 }
 
+/// Caps how many items `list_price_book_items` returns when browsing (as opposed to
+/// searching) — only reachable in practice for a merchant whose catalog has no
+/// meaningful category/group/sub-group breakdown at all, where "browse" degenerates to
+/// "list everything". Matches the cap on `search_price_book_items`.
+const PRICE_BOOK_BROWSE_LIMIT: i64 = 300;
+
 #[tauri::command]
 async fn list_price_book_categories(state: State<'_, AppState>) -> Result<Vec<String>, String> {
     let rows = sqlx::query(
         "SELECT DISTINCT product_category FROM price_book_items
          WHERE import_id = (SELECT id FROM price_book_imports WHERE is_current = 1)
-         ORDER BY product_category",
+         ORDER BY (product_category = ''), product_category",
     )
     .fetch_all(&state.registry_db)
     .await
@@ -4858,17 +4864,29 @@ async fn list_price_book_categories(state: State<'_, AppState>) -> Result<Vec<St
         .collect()
 }
 
+/// `category: None` browses groups across the whole price book (used when the Rate
+/// Library tree has determined the merchant's format doesn't map `category` at all, or
+/// every item under the current filters leaves it blank — see `TreeBranch` in
+/// `RateLibraryPane.tsx`). `Some(value)` — including `Some("")` for the "(Uncategorised)"
+/// bucket — scopes to that exact category.
 #[tauri::command]
-async fn list_price_book_groups(category: String, state: State<'_, AppState>) -> Result<Vec<String>, String> {
-    let rows = sqlx::query(
+async fn list_price_book_groups(category: Option<String>, state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    let mut sql = String::from(
         "SELECT DISTINCT group_name FROM price_book_items
-         WHERE import_id = (SELECT id FROM price_book_imports WHERE is_current = 1) AND product_category = ?
-         ORDER BY group_name",
-    )
-    .bind(&category)
-    .fetch_all(&state.registry_db)
-    .await
-    .map_err(|e| format!("list_price_book_groups: {e}"))?;
+         WHERE import_id = (SELECT id FROM price_book_imports WHERE is_current = 1)",
+    );
+    if category.is_some() {
+        sql.push_str(" AND product_category = ?");
+    }
+    sql.push_str(" ORDER BY (group_name = ''), group_name");
+    let mut q = sqlx::query(&sql);
+    if let Some(c) = &category {
+        q = q.bind(c);
+    }
+    let rows = q
+        .fetch_all(&state.registry_db)
+        .await
+        .map_err(|e| format!("list_price_book_groups: {e}"))?;
     rows.iter()
         .map(|r| r.try_get::<String, _>("group_name").map_err(|e| e.to_string()))
         .collect()
@@ -4876,20 +4894,32 @@ async fn list_price_book_groups(category: String, state: State<'_, AppState>) ->
 
 #[tauri::command]
 async fn list_price_book_subgroups(
-    category: String,
-    group_name: String,
+    category: Option<String>,
+    group_name: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<String>, String> {
-    let rows = sqlx::query(
+    let mut sql = String::from(
         "SELECT DISTINCT sub_group FROM price_book_items
-         WHERE import_id = (SELECT id FROM price_book_imports WHERE is_current = 1) AND product_category = ? AND group_name = ?
-         ORDER BY sub_group",
-    )
-    .bind(&category)
-    .bind(&group_name)
-    .fetch_all(&state.registry_db)
-    .await
-    .map_err(|e| format!("list_price_book_subgroups: {e}"))?;
+         WHERE import_id = (SELECT id FROM price_book_imports WHERE is_current = 1)",
+    );
+    if category.is_some() {
+        sql.push_str(" AND product_category = ?");
+    }
+    if group_name.is_some() {
+        sql.push_str(" AND group_name = ?");
+    }
+    sql.push_str(" ORDER BY (sub_group = ''), sub_group");
+    let mut q = sqlx::query(&sql);
+    if let Some(c) = &category {
+        q = q.bind(c);
+    }
+    if let Some(g) = &group_name {
+        q = q.bind(g);
+    }
+    let rows = q
+        .fetch_all(&state.registry_db)
+        .await
+        .map_err(|e| format!("list_price_book_subgroups: {e}"))?;
     rows.iter()
         .map(|r| r.try_get::<String, _>("sub_group").map_err(|e| e.to_string()))
         .collect()
@@ -4897,24 +4927,40 @@ async fn list_price_book_subgroups(
 
 #[tauri::command]
 async fn list_price_book_items(
-    category: String,
-    group_name: String,
-    sub_group: String,
+    category: Option<String>,
+    group_name: Option<String>,
+    sub_group: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<PriceBookItemDto>, String> {
-    let rows = sqlx::query(
+    let mut sql = String::from(
         "SELECT id, product_category, group_name, sub_group, description, product_code, unit_of_sale, unit_price, effective_date
          FROM price_book_items
-         WHERE import_id = (SELECT id FROM price_book_imports WHERE is_current = 1)
-           AND product_category = ? AND group_name = ? AND sub_group = ?
-         ORDER BY description",
-    )
-    .bind(&category)
-    .bind(&group_name)
-    .bind(&sub_group)
-    .fetch_all(&state.registry_db)
-    .await
-    .map_err(|e| format!("list_price_book_items: {e}"))?;
+         WHERE import_id = (SELECT id FROM price_book_imports WHERE is_current = 1)",
+    );
+    if category.is_some() {
+        sql.push_str(" AND product_category = ?");
+    }
+    if group_name.is_some() {
+        sql.push_str(" AND group_name = ?");
+    }
+    if sub_group.is_some() {
+        sql.push_str(" AND sub_group = ?");
+    }
+    sql.push_str(&format!(" ORDER BY description LIMIT {PRICE_BOOK_BROWSE_LIMIT}"));
+    let mut q = sqlx::query(&sql);
+    if let Some(c) = &category {
+        q = q.bind(c);
+    }
+    if let Some(g) = &group_name {
+        q = q.bind(g);
+    }
+    if let Some(s) = &sub_group {
+        q = q.bind(s);
+    }
+    let rows = q
+        .fetch_all(&state.registry_db)
+        .await
+        .map_err(|e| format!("list_price_book_items: {e}"))?;
     rows.iter().map(row_to_price_book_item).collect()
 }
 
