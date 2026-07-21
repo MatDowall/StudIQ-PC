@@ -5052,12 +5052,12 @@ async fn import_price_book(path: String, merchant_id: i64, state: State<'_, AppS
     let require = |field: &str| -> Result<usize, String> {
         Ok(resolve(field)?.unwrap_or_else(|| unreachable!("resolve() errors instead of returning None for a required field")))
     };
-    let idx_category = require("category")?;
-    let idx_group = require("group_name")?;
-    let idx_sub_group = require("sub_group")?;
+    let idx_category = resolve("category")?;
+    let idx_group = resolve("group_name")?;
+    let idx_sub_group = resolve("sub_group")?;
     let idx_description = require("description")?;
-    let idx_product_code = require("product_code")?;
-    let idx_unit = require("unit_of_sale")?;
+    let idx_product_code = resolve("product_code")?;
+    let idx_unit = resolve("unit_of_sale")?;
     let idx_price = require("unit_price")?;
     let idx_effective_date = resolve("effective_date")?;
     let idx_download_date = resolve("download_date")?;
@@ -5101,12 +5101,12 @@ async fn import_price_book(path: String, merchant_id: i64, state: State<'_, AppS
             ));
         }
         items.push(ParsedItem {
-            category: get(idx_category),
-            group: get(idx_group),
-            sub_group: get(idx_sub_group),
+            category: get_opt(idx_category),
+            group: get_opt(idx_group),
+            sub_group: get_opt(idx_sub_group),
             description: get(idx_description),
-            product_code: get(idx_product_code),
-            unit: get(idx_unit),
+            product_code: get_opt(idx_product_code),
+            unit: get_opt(idx_unit),
             price: get(idx_price).parse().unwrap_or(0.0),
             effective_date: normalize_price_book_date(&get_opt(idx_effective_date)),
         });
