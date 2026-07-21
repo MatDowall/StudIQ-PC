@@ -199,11 +199,15 @@ feature originally shipped with (including the literal `# Download Date` header 
 `#` is just part of the stored mapping now, not a special-cased strip).
 
 `MerchantManagerDialog.tsx` (opened from the management console) is where formats are
-authored: "Load Sample CSV" calls `preview_price_book_headers` to read just the header row of a
-real file, and each field's mapping input gets a `<datalist>` of those detected headers so
-you're picking a real column name, not typing one blind. Saving a merchant
-(`create_price_book_merchant`/`update_price_book_merchant`) requires every required field to
-be mapped, or the save is rejected listing which ones are missing.
+authored, and it's data-driven rather than schema-first: a brand-new merchant starts with *no*
+canonical field list shown at all — only "Load Sample CSV" (calling `preview_price_book_headers`
+to read just the header row of a real file). Once loaded, the editor renders one row **per
+column that file actually has** and asks what each one represents (a `<select>` of the
+canonical fields, defaulting to "Not used"), rather than the old approach of listing every
+canonical field up front and asking the estimator to match one of their columns to it — the
+latter implicitly pigeonholed every merchant into Carters' own shape. Saving a merchant
+(`create_price_book_merchant`/`update_price_book_merchant`) only requires Description and Unit
+Price to have been assigned to some column; everything else can be left "Not used".
 
 The management console's upload flow requires picking a merchant first (`import_price_book`
 now takes a `merchant_id`). At import time, every column that merchant's format maps to must

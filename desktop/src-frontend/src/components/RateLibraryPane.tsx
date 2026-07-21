@@ -42,19 +42,14 @@ export interface MerchantDto {
 /** Canonical price-book fields, shared by the merchant format editor and the import
  *  validation error messages on the backend — keep in sync with
  *  REQUIRED_PRICE_BOOK_FIELDS / OPTIONAL_PRICE_BOOK_FIELDS in desktop/src/lib.rs. */
-export const PRICE_BOOK_FIELDS: Array<{ key: string; label: string; required: boolean; hint?: string }> = [
+export const PRICE_BOOK_FIELDS: Array<{ key: string; label: string; required: boolean }> = [
   { key: "description", label: "Description", required: true },
   { key: "unit_price", label: "Unit Price", required: true },
   { key: "unit_of_sale", label: "Unit", required: false },
   { key: "product_code", label: "Item Code", required: false },
-  {
-    key: "category",
-    label: "Category",
-    required: false,
-    hint: "Leave blank if this merchant doesn't group items into categories",
-  },
-  { key: "group_name", label: "Group", required: false, hint: "Leave blank if this merchant has no sub-level under Category" },
-  { key: "sub_group", label: "Sub Group", required: false, hint: "Leave blank if this merchant has no further sub-level under Group" },
+  { key: "category", label: "Category", required: false },
+  { key: "group_name", label: "Group", required: false },
+  { key: "sub_group", label: "Sub Group", required: false },
   { key: "effective_date", label: "Effective Date", required: false },
   { key: "download_date", label: "Download / Ingest Date", required: false },
   { key: "price_book_name", label: "Price Book Name", required: false },
