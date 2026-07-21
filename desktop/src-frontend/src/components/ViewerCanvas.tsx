@@ -690,6 +690,23 @@ function flipMeasurements(measurements: MeasurementDto[], centroid: PagePoint, a
   });
 }
 
+/** Rotate a set of measurements 90° about a centroid; ccw=false rotates clockwise. */
+function rotateMeasurements(measurements: MeasurementDto[], centroid: PagePoint, ccw: boolean): MeasurementDto[] {
+  return measurements.map((m) => {
+    try {
+      const pts = JSON.parse(m.geometry_json) as PagePoint[];
+      const rotated = pts.map((p) => {
+        const rx = p.x - centroid.x;
+        const ry = p.y - centroid.y;
+        return ccw ? { x: centroid.x - ry, y: centroid.y + rx } : { x: centroid.x + ry, y: centroid.y - rx };
+      });
+      return { ...m, geometry_json: JSON.stringify(rotated) };
+    } catch {
+      return m;
+    }
+  });
+}
+
 /** Centroid (average of all vertices) of a set of measurements, in PDF points. */
 function measurementsCentroid(measurements: MeasurementDto[]): PagePoint {
   let sumX = 0;
@@ -1284,6 +1301,7 @@ export function ViewerCanvas({
   const dragRef = useRef<{ pointerId: number; startX: number; startY: number; panX: number; panY: number } | null>(null);
   const snapFrameRef = useRef<number | null>(null);
   const latestSnapPointerRef = useRef<{ clientX: number; clientY: number } | null>(null);
+  const lastViewerCommandSeq = useRef(0);
 
   const lightMode = useAppStore((state) => state.lightMode);
   const snapPoint = useAppStore((state) => state.snapPoint);
@@ -1297,6 +1315,7 @@ export function ViewerCanvas({
   const snapEnabled = useAppStore((state) => state.snapEnabled);
   const createMeasurement = useAppStore((state) => state.createMeasurement);
   const updateMeasurementGeometry = useAppStore((state) => state.updateMeasurementGeometry);
+  const viewerCommand = useAppStore((state) => state.viewerCommand);
   const updateMeasurementFraming = useAppStore((state) => state.updateMeasurementFraming);
   const deleteMeasurement = useAppStore((state) => state.deleteMeasurement);
   const openingPlacement = useAppStore((state) => state.openingPlacement);
@@ -3305,6 +3324,31 @@ export function ViewerCanvas({
     setClipboard(selected);
     clipboardRef.current = selected;
   }
+
+  // Ribbon Takeoff Item group: rotate or flip the selected measurement(s) about their
+  // shared centroid and persist. Same geometry math as the paste-ghost arrow-key
+  // flip/rotate, just applied to an existing selection instead of the clipboard.
+  async function rotateOrFlipSelected(action: "rotateCcw" | "rotateCw" | "flipH" | "flipV") {
+    const pageIds = selectedMeasurementIds.filter((id) => overlayMeasurements.find((m) => m.id === id)?.page_index === pageIndex);
+    if (pageIds.length === 0) return;
+    const selected = overlayMeasurements.filter((m) => pageIds.includes(m.id));
+    const centroid = measurementsCentroid(selected);
+    const transformed =
+      action === "rotateCcw" || action === "rotateCw"
+        ? rotateMeasurements(selected, centroid, action === "rotateCcw")
+        : flipMeasurements(selected, centroid, action === "flipH" ? "x" : "y");
+    for (const m of transformed) {
+      await updateMeasurementGeometry(m.id, m.geometry_json).catch((e) => onStatusChange(`ERROR: ${e}`));
+    }
+  }
+
+  // Ribbon → viewer bridge: the ribbon's Takeoff Item buttons bump `viewerCommand.seq`.
+  useEffect(() => {
+    if (!viewerCommand || viewerCommand.seq === lastViewerCommandSeq.current) return;
+    lastViewerCommandSeq.current = viewerCommand.seq;
+    void rotateOrFlipSelected(viewerCommand.action);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [viewerCommand]);
 
   function startMove() {
     const pageIds = selectedMeasurementIds.filter((id) => overlayMeasurements.find((m) => m.id === id)?.page_index === pageIndex);

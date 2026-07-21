@@ -17,6 +17,17 @@ const BUTTON_ICONS: Record<string, string> = {
   Dim: "contrast",
   Geometry: "my_location",
   "Elevation PDF": "picture_as_pdf",
+  "Rotate Left": "rotate_90_degrees_ccw",
+  "Rotate Right": "rotate_90_degrees_cw",
+  "Flip Horizontal": "flip",
+  "Flip Vertical": "flip",
+  Pitch: "signal_cellular_null",
+};
+
+// Flip Vertical reuses the "flip" glyph (which is drawn horizontal) rotated 90° — per
+// the CostX icon reference, there's no separate vertical-flip glyph in Material Symbols.
+const ICON_ROTATION: Record<string, number> = {
+  "Flip Vertical": 90,
 };
 
 const groups = [
@@ -24,7 +35,15 @@ const groups = [
   { label: "Type", tools: ["Point", "Line"] },
   { label: "Drawing", tools: ["Plan View", "View in 3D", "Dim", "Elevation PDF"] },
   { label: "Snap", tools: ["Geometry"] },
+  { label: "Takeoff Item", tools: ["Rotate Left", "Rotate Right", "Flip Horizontal", "Flip Vertical", "Pitch"] },
 ];
+
+const TAKEOFF_ITEM_COMMANDS: Record<string, "rotateCcw" | "rotateCw" | "flipH" | "flipV"> = {
+  "Rotate Left": "rotateCcw",
+  "Rotate Right": "rotateCw",
+  "Flip Horizontal": "flipH",
+  "Flip Vertical": "flipV",
+};
 
 const DIMENSION_GROUP_TOOLS: Record<string, "add" | "properties" | "copy"> = {
   Add: "add",
@@ -32,11 +51,17 @@ const DIMENSION_GROUP_TOOLS: Record<string, "add" | "properties" | "copy"> = {
   Copy: "copy",
 };
 
-function Icon({ name, size = 14 }: { name: string; size?: number }) {
+function Icon({ name, size = 14, rotate = 0 }: { name: string; size?: number; rotate?: number }) {
   return (
     <span
       className="material-symbols-outlined"
-      style={{ fontSize: size, lineHeight: 1, userSelect: "none", flexShrink: 0 }}
+      style={{
+        fontSize: size,
+        lineHeight: 1,
+        userSelect: "none",
+        flexShrink: 0,
+        transform: rotate ? `rotate(${rotate}deg)` : undefined,
+      }}
     >
       {name}
     </span>
@@ -48,6 +73,8 @@ export function Ribbon() {
   const exportFramingElevations = useAppStore((state) => state.exportFramingElevations);
   const activeDimensionGroupId = useAppStore((state) => state.activeDimensionGroupId);
   const requestDgPaneCommand = useAppStore((state) => state.requestDgPaneCommand);
+  const requestViewerCommand = useAppStore((state) => state.requestViewerCommand);
+  const selectedMeasurementIds = useAppStore((state) => state.selectedMeasurementIds);
   const drawingType = useAppStore((state) => state.drawingType);
   const setDrawingType = useAppStore((state) => state.setDrawingType);
   const view3d = useAppStore((state) => state.view3d);
@@ -111,25 +138,28 @@ export function Ribbon() {
         ) : (
           groups.map((group, groupIndex) => {
             const isDrawingGroup = group.label === "Drawing";
+            const isTakeoffItemGroup = group.label === "Takeoff Item";
             return (
               <div
                 key={group.label}
                 style={{
                   display: "flex",
                   flexDirection: "column",
-                  minWidth: groupIndex === 0 ? 138 : isDrawingGroup ? 196 : 72,
+                  minWidth: groupIndex === 0 ? 138 : isDrawingGroup ? 196 : isTakeoffItemGroup ? 244 : 72,
                   padding: "4px 8px 0",
                   borderRight: `1px solid ${theme.border.divider}`,
                 }}
               >
                 <div style={{ display: "flex", gap: 5, alignItems: "center", overflow: "hidden" }}>
-                  {group.tools.slice(0, isDrawingGroup ? 4 : 3).map((tool, toolIndex) => {
+                  {group.tools.slice(0, isDrawingGroup ? 4 : isTakeoffItemGroup ? 5 : 3).map((tool, toolIndex) => {
                     const dgCommand = groupIndex === 0 ? DIMENSION_GROUP_TOOLS[tool] : undefined;
                     const isTypeToggle = group.label === "Type" && (tool === "Point" || tool === "Line");
                     const isViewToggle = group.label === "Drawing" && (tool === "Plan View" || tool === "View in 3D");
                     const isDimToggle = group.label === "Drawing" && tool === "Dim";
                     const isSnapToggle = group.label === "Snap" && tool === "Geometry";
                     const isElevationExport = group.label === "Drawing" && tool === "Elevation PDF";
+                    const takeoffCommand = isTakeoffItemGroup ? TAKEOFF_ITEM_COMMANDS[tool] : undefined;
+                    const isPitchStub = isTakeoffItemGroup && tool === "Pitch";
 
                     let enabled: boolean;
                     let cursor: string;
@@ -159,6 +189,14 @@ export function Ribbon() {
                       enabled = !view3d;
                       active = false;
                       cursor = enabled ? "pointer" : "not-allowed";
+                    } else if (takeoffCommand !== undefined) {
+                      enabled = selectedMeasurementIds.length > 0;
+                      active = false;
+                      cursor = enabled ? "pointer" : "not-allowed";
+                    } else if (isPitchStub) {
+                      enabled = false;
+                      active = false;
+                      cursor = "not-allowed";
                     } else {
                       enabled = toolIndex === 0;
                       active = enabled;
@@ -167,7 +205,9 @@ export function Ribbon() {
 
                     const handleClick = dgCommand !== undefined && enabled
                       ? () => requestDgPaneCommand(dgCommand)
-                      : isTypeToggle
+                      : takeoffCommand !== undefined && enabled
+                        ? () => requestViewerCommand(takeoffCommand)
+                        : isTypeToggle
                         ? () => setDrawingType(tool === "Line" ? "line" : "point")
                         : isViewToggle
                           ? () => {
@@ -195,7 +235,7 @@ export function Ribbon() {
                         key={`${group.label}-${tool}`}
                         disabled={isDisabled}
                         onClick={handleClick}
-                        title={tool}
+                        title={isPitchStub ? "Pitch (not yet implemented)" : takeoffCommand !== undefined && !enabled ? `${tool} (select a takeoff item first)` : tool}
                         style={{
                           minWidth: 44,
                           height: 50,
@@ -215,7 +255,7 @@ export function Ribbon() {
                           flexShrink: 0,
                         }}
                       >
-                        {iconName ? <Icon name={iconName} size={32} /> : null}
+                        {iconName ? <Icon name={iconName} size={32} rotate={ICON_ROTATION[tool] ?? 0} /> : null}
                         <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", lineHeight: 1 }}>
                           {tool}
                         </span>

@@ -234,6 +234,9 @@ export interface FolderOption {
 /** Ribbon-triggered actions handled by the dimension-group pane (which owns the dialogs). */
 export type DgPaneCommand = "add" | "properties" | "copy";
 
+/** Ribbon-triggered actions handled by the viewer canvas (rotate/flip the selected takeoff item). */
+export type ViewerCommand = "rotateCcw" | "rotateCw" | "flipH" | "flipV";
+
 export type SnapType = "endpoint" | "midpoint" | "intersection";
 
 /** Viewer interaction mode: place new dimensions, or select/edit existing ones. */
@@ -336,6 +339,9 @@ interface AppStore {
   // Ribbon → dimension-group pane bridge: the pane watches `seq` and opens the matching
   // dialog for the active group (the pane owns the Add / Properties / Copy dialogs).
   dgPaneCommand: { action: DgPaneCommand; seq: number } | null;
+  // Ribbon → viewer canvas bridge: the canvas watches `seq` and rotates/flips the
+  // currently selected measurement(s) on the active page about their centroid.
+  viewerCommand: { action: ViewerCommand; seq: number } | null;
 
   workbooks: WorkbookDto[];
   activeRevisionId: number | null;
@@ -403,6 +409,7 @@ interface AppStore {
   listDimensionFolders: () => Promise<FolderOption[]>;
   copyDimensionGroup: (sourceNodeId: number, targetFolderId: number, name: string, copyDimensions: boolean) => Promise<void>;
   requestDgPaneCommand: (action: DgPaneCommand) => void;
+  requestViewerCommand: (action: ViewerCommand) => void;
   deleteNode: (node: TreeNodeDto) => Promise<void>;
   renameNode: (node: TreeNodeDto, name: string) => Promise<void>;
   updateDimensionGroupColour: (nodeId: number, colour: string) => Promise<void>;
@@ -801,6 +808,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
   scaleCache: {},
   drawPolarity: 1,
   dgPaneCommand: null,
+  viewerCommand: null,
 
   workbooks: [],
   activeRevisionId: null,
@@ -1235,6 +1243,10 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   requestDgPaneCommand: (action) => {
     set((state) => ({ dgPaneCommand: { action, seq: (state.dgPaneCommand?.seq ?? 0) + 1 } }));
+  },
+
+  requestViewerCommand: (action) => {
+    set((state) => ({ viewerCommand: { action, seq: (state.viewerCommand?.seq ?? 0) + 1 } }));
   },
 
   deleteNode: async (node) => {
