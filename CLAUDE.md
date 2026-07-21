@@ -147,25 +147,38 @@ must be prefixed with `_xlpm.` by hand in the formula string, or Excel won't rec
 ### Rate library is a supplier price book, shared across every project
 
 The sidebar's **Rate Library** tab (`DimensionGroupPane.tsx`'s pane-level tab bar, beside
-"Dimension Groups") browses a supplier price book — a per-merchant CSV export (Carters
-seeded by default; more can be added, see below) — that's uploaded via the "Manage" console
-(`PriceBookManagerDialog.tsx`) and shared across every project. It lives in `registry.db`
-(`price_book_imports` + `price_book_items` + `price_book_merchants`), **not** the per-project
-`.tcop` database — the same registry DB that already holds `recent_projects` — because a price
-book is company-wide reference data, not project data. This is a different table from the
-older, per-project `rate_library` table (`RateConstantsDialog.tsx` / `STUDIQ.RATE()`), which holds
-hand-entered project-specific rates; the two are unrelated despite the similar name.
+"Dimension Groups") browses supplier price books — one per merchant (Carters seeded by default;
+more can be added, see below) — uploaded via the "Manage" console (`PriceBookManagerDialog.tsx`)
+and shared across every project. It lives in `registry.db` (`price_book_imports` +
+`price_book_items` + `price_book_merchants`), **not** the per-project `.tcop` database — the same
+registry DB that already holds `recent_projects` — because a price book is company-wide reference
+data, not project data. This is a different table from the older, per-project `rate_library` table
+(`RateConstantsDialog.tsx` / `STUDIQ.RATE()`), which holds hand-entered project-specific rates; the
+two are unrelated despite the similar name.
 
-Every CSV upload replaces the live item set: `price_book_items` only ever holds rows for the
-most recent import (`price_book_imports.is_current = 1`); older imports stay in
-`price_book_imports` as ingest-history metadata (filename, merchant, the CSV's own "Download
-Date", row count, upload timestamp) but their item rows are deleted. This is safe because
-dragging a rate into the workbook (`WorkbookView.tsx`'s `applyRateImport`, MIME type
+**Every merchant keeps its own independent rate library.** `price_book_imports.is_current` is
+scoped per `merchant_id`, not app-wide — uploading a revised price book for one merchant only
+resets *that* merchant's `is_current` flag and purges *that* merchant's old item rows
+(`import_price_book`'s `UPDATE ... WHERE merchant_id = ?` / `DELETE ... WHERE import_id IN (SELECT
+... WHERE merchant_id = ? AND id != ?)`), leaving every other merchant's current book untouched.
+`list_current_price_books` returns one row per merchant with an active book — this drives
+`RateLibraryPane.tsx`'s per-merchant tab strip, and every browse/search command
+(`list_price_book_categories`/`_groups`/`_subgroups`/`_items`/`search_price_book_items`) takes a
+`merchant_id` to scope to whichever tab is active. This is safe to replace freely because dragging
+a rate into the workbook (`WorkbookView.tsx`'s `applyRateImport`, MIME type
 `application/x-studiq-rate-item`) copies the code/description/unit/price values into the cell at
-drop time — there is no live link back to the source row, so replacing the price book can never
-retroactively change a rate a workbook has already borrowed. Contrast this with the dimension-group
-→ Quantity-column drag (`application/x-studiq-dimension-group`, `handleGroupDrop`), which does keep
-a live link (`setCellLink`) back to the group.
+drop time — there is no live link back to the source row, so replacing a merchant's price book can
+never retroactively change a rate a workbook has already borrowed. Contrast this with the
+dimension-group → Quantity-column drag (`application/x-studiq-dimension-group`,
+`handleGroupDrop`), which does keep a live link (`setCellLink`) back to the group.
+
+Deleting a merchant (`delete_price_book_merchant`) deletes its *entire* rate library — every
+import it ever had, current or historical, with item rows cascading away via their `import_id`
+FK — rather than being blocked while it has ingest history, since every merchant permanently
+owns its own library now; the frontend's confirm dialog spells this out before calling it. A
+one-time startup migration (`init_registry_database`) clears `is_current` on any leftover
+pre-merchant import (`merchant_id IS NULL`) from before this per-merchant model existed — nothing
+else would ever reset that flag, since every reset path scopes to a real `merchant_id`.
 
 The CSV's `Group`/`Sub Group` columns drive the Rate Library tree (Category → Group → Sub Group →
 items), lazy-loaded per level the same way `DrawingRegisterPane`/`DimensionGroupPane` lazy-load
@@ -199,11 +212,15 @@ feature originally shipped with (including the literal `# Download Date` header 
 `#` is just part of the stored mapping now, not a special-cased strip).
 
 `MerchantManagerDialog.tsx` (opened from the management console) is where formats are
-authored: "Load Sample CSV" calls `preview_price_book_headers` to read just the header row of a
-real file, and each field's mapping input gets a `<datalist>` of those detected headers so
-you're picking a real column name, not typing one blind. Saving a merchant
-(`create_price_book_merchant`/`update_price_book_merchant`) requires every required field to
-be mapped, or the save is rejected listing which ones are missing.
+authored, and it's data-driven rather than schema-first: a brand-new merchant starts with *no*
+canonical field list shown at all — only "Load Sample CSV" (calling `preview_price_book_headers`
+to read just the header row of a real file). Once loaded, the editor renders one row **per
+column that file actually has** and asks what each one represents (a `<select>` of the
+canonical fields, defaulting to "Not used"), rather than the old approach of listing every
+canonical field up front and asking the estimator to match one of their columns to it — the
+latter implicitly pigeonholed every merchant into Carters' own shape. Saving a merchant
+(`create_price_book_merchant`/`update_price_book_merchant`) only requires Description and Unit
+Price to have been assigned to some column; everything else can be left "Not used".
 
 The management console's upload flow requires picking a merchant first (`import_price_book`
 now takes a `merchant_id`). At import time, every column that merchant's format maps to must

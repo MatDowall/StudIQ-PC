@@ -14,6 +14,7 @@ interface Props {
 }
 
 const NEW_DRAFT_ID = -1;
+const NOT_USED = "";
 
 interface Draft {
   id: number;
@@ -29,11 +30,17 @@ function blankDraft(): Draft {
   return { id: NEW_DRAFT_ID, name: "", columnMap: {} };
 }
 
+function fieldLabel(key: string): string {
+  return PRICE_BOOK_FIELDS.find((f) => f.key === key)?.label ?? key;
+}
+
 export function MerchantManagerDialog({ onClose, onChanged }: Props) {
   const [merchants, setMerchants] = useState<MerchantDto[]>([]);
   const [loading, setLoading] = useState(true);
   const [draft, setDraft] = useState<Draft | null>(null);
-  const [detectedHeaders, setDetectedHeaders] = useState<string[]>([]);
+  // null = no sample loaded yet this editing session (nothing to detect columns from);
+  // [] = a sample was loaded but its header row was empty.
+  const [detectedHeaders, setDetectedHeaders] = useState<string[] | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null);
@@ -57,13 +64,13 @@ export function MerchantManagerDialog({ onClose, onChanged }: Props) {
   function selectMerchant(m: MerchantDto) {
     setError(null);
     setDraft(draftFromMerchant(m));
-    setDetectedHeaders([]);
+    setDetectedHeaders(null);
   }
 
   function startNew() {
     setError(null);
     setDraft(blankDraft());
-    setDetectedHeaders([]);
+    setDetectedHeaders(null);
   }
 
   async function loadSample() {
@@ -77,10 +84,31 @@ export function MerchantManagerDialog({ onClose, onChanged }: Props) {
     }
   }
 
-  function updateField(key: string, value: string) {
-    if (!draft) return;
-    setDraft({ ...draft, columnMap: { ...draft.columnMap, [key]: value } });
+  /** What canonical field (if any) a given detected CSV column is currently assigned to
+   *  represent. Each header can represent at most one field. */
+  function roleForHeader(draft: Draft, header: string): string {
+    return PRICE_BOOK_FIELDS.find((f) => draft.columnMap[f.key] === header)?.key ?? NOT_USED;
   }
+
+  /** Assigns `header` to represent `fieldKey` (or un-assigns it if fieldKey is empty),
+   *  first clearing out any other field that was previously pointing at this same header
+   *  — a single CSV column can only mean one thing, so re-assigning it here is what
+   *  causes its old role's row to flip back to "Not used". */
+  function assignHeader(header: string, fieldKey: string) {
+    if (!draft) return;
+    const nextMap = { ...draft.columnMap };
+    for (const key of Object.keys(nextMap)) {
+      if (nextMap[key] === header) delete nextMap[key];
+    }
+    if (fieldKey) nextMap[fieldKey] = header;
+    setDraft({ ...draft, columnMap: nextMap });
+  }
+
+  const savedMappingEntries = draft
+    ? Object.entries(draft.columnMap).filter(([, header]) => header.trim() !== "")
+    : [];
+  const canSave =
+    !!draft && draft.name.trim() !== "" && !!draft.columnMap.description && !!draft.columnMap.unit_price;
 
   async function handleSave() {
     if (!draft) return;
@@ -117,7 +145,7 @@ export function MerchantManagerDialog({ onClose, onChanged }: Props) {
 
   return (
     <>
-      <DialogShell title="Manage Merchants" width={620} zIndex={1260} onClose={onClose}>
+      <DialogShell title="Manage Merchants" width={640} zIndex={1260} onClose={onClose}>
         <div style={{ padding: 12, display: "flex", gap: 12 }}>
           <div style={{ width: 170, flexShrink: 0 }}>
             <div
@@ -235,52 +263,82 @@ export function MerchantManagerDialog({ onClose, onChanged }: Props) {
                   }}
                 >
                   <span className="material-symbols-outlined" style={{ fontSize: 16 }}>upload_file</span>
-                  Load Sample CSV to Pick Columns From...
+                  {detectedHeaders === null ? "Load Sample CSV..." : "Load a Different Sample CSV..."}
                 </button>
-                {detectedHeaders.length > 0 ? (
-                  <div style={{ fontSize: 11, color: theme.text.secondary, marginBottom: 8 }}>
-                    {detectedHeaders.length} columns detected — start typing in a field below to see matches
-                  </div>
-                ) : null}
 
-                <div style={{ fontSize: 11, color: theme.text.secondary, marginBottom: 6 }}>
-                  Only Description and Unit Price are required — Category/Group/Sub Group are
-                  optional and can be left blank for a merchant whose price list isn't organized
-                  that way.
-                </div>
-
-                <div style={{ maxHeight: 280, overflow: "auto" }}>
-                  <div style={{ display: "grid", gridTemplateColumns: "170px 1fr", rowGap: 6, columnGap: 8, alignItems: "center" }}>
-                    {PRICE_BOOK_FIELDS.map((field) => (
-                      <div key={field.key} style={{ display: "contents" }}>
-                        <label style={{ fontSize: 12, color: theme.text.secondary }} title={field.hint}>
-                          {field.label}
-                          {field.required ? <span style={{ color: theme.danger }}> *</span> : null}
-                        </label>
-                        <input
-                          value={draft.columnMap[field.key] ?? ""}
-                          onChange={(event) => updateField(field.key, event.target.value)}
-                          list={`merchant-headers-${field.key}`}
-                          placeholder={field.required ? "Required — exact CSV column name" : field.hint ?? "Optional"}
-                          style={{
-                            height: 24,
-                            padding: "0 6px",
-                            background: theme.bg.input,
-                            color: theme.text.primary,
-                            border: `1px solid ${theme.border.divider}`,
-                            fontSize: 12,
-                            outline: "none",
-                          }}
-                        />
-                        <datalist id={`merchant-headers-${field.key}`}>
-                          {detectedHeaders.map((h) => (
-                            <option key={h} value={h} />
-                          ))}
-                        </datalist>
+                {detectedHeaders === null ? (
+                  <>
+                    <div style={{ fontSize: 11, color: theme.text.secondary, marginBottom: 8 }}>
+                      Load a sample of this merchant's price book so StudIQ can read its actual column
+                      names — nothing is assumed about how this merchant lays out its CSV. Only
+                      Description and Unit Price will be required; everything else (including
+                      Category/Group/Sub Group) is only assigned if this merchant's file actually has it.
+                    </div>
+                    {savedMappingEntries.length > 0 ? (
+                      <div style={{ fontSize: 12, border: `1px solid ${theme.border.subtle}`, padding: 8 }}>
+                        <div style={{ color: theme.text.secondary, marginBottom: 4 }}>Current saved mapping:</div>
+                        {savedMappingEntries.map(([key, header]) => (
+                          <div key={key} style={{ color: theme.text.primary }}>
+                            {fieldLabel(key)} → "{header}"
+                          </div>
+                        ))}
                       </div>
-                    ))}
-                  </div>
-                </div>
+                    ) : null}
+                  </>
+                ) : detectedHeaders.length === 0 ? (
+                  <div style={{ fontSize: 12, color: theme.danger }}>No columns were detected in that file.</div>
+                ) : (
+                  <>
+                    <div style={{ fontSize: 11, color: theme.text.secondary, marginBottom: 6 }}>
+                      For each column this merchant's CSV actually has, choose what it represents. Leave
+                      "Not used" for anything that doesn't apply (e.g. this merchant has no Category).
+                    </div>
+                    <div style={{ maxHeight: 280, overflow: "auto" }}>
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 200px", rowGap: 6, columnGap: 8, alignItems: "center" }}>
+                        <div style={{ fontSize: 11, color: theme.text.disabled }}>CSV column</div>
+                        <div style={{ fontSize: 11, color: theme.text.disabled }}>Represents</div>
+                        {detectedHeaders.map((header) => {
+                          const role = roleForHeader(draft, header);
+                          return (
+                            <div key={header} style={{ display: "contents" }}>
+                              <div
+                                style={{
+                                  fontSize: 12,
+                                  color: theme.text.primary,
+                                  overflow: "hidden",
+                                  textOverflow: "ellipsis",
+                                  whiteSpace: "nowrap",
+                                }}
+                                title={header}
+                              >
+                                {header}
+                              </div>
+                              <select
+                                value={role}
+                                onChange={(event) => assignHeader(header, event.target.value)}
+                                style={{
+                                  height: 24,
+                                  background: theme.bg.input,
+                                  color: theme.text.primary,
+                                  border: `1px solid ${theme.border.divider}`,
+                                  fontSize: 12,
+                                }}
+                              >
+                                <option value={NOT_USED}>— Not used —</option>
+                                {PRICE_BOOK_FIELDS.map((field) => (
+                                  <option key={field.key} value={field.key}>
+                                    {field.label}
+                                    {field.required ? " *" : ""}
+                                  </option>
+                                ))}
+                              </select>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  </>
+                )}
               </>
             ) : (
               <div style={{ color: theme.text.secondary, fontSize: 12, padding: 8 }}>
@@ -298,14 +356,15 @@ export function MerchantManagerDialog({ onClose, onChanged }: Props) {
           {draft ? (
             <button
               onClick={() => void handleSave()}
-              disabled={saving || !draft.name.trim()}
+              disabled={saving || !canSave}
+              title={!canSave ? "Name, and a column mapped to Description and Unit Price, are required" : undefined}
               style={{
                 height: 28,
                 padding: "0 12px",
                 background: theme.bg.active,
-                color: theme.text.primary,
+                color: canSave ? theme.text.primary : theme.text.disabled,
                 border: `1px solid ${theme.accent}`,
-                cursor: saving ? "default" : "pointer",
+                cursor: saving || !canSave ? "default" : "pointer",
                 fontSize: 12,
               }}
             >
@@ -331,7 +390,7 @@ export function MerchantManagerDialog({ onClose, onChanged }: Props) {
       {confirmDeleteId !== null && (
         <ConfirmDialog
           title="Delete Merchant"
-          body="This removes the merchant's saved CSV format. This cannot be undone.\n\nContinue?"
+          body="This deletes the merchant's saved CSV format AND its entire rate library — every price book ever uploaded for it, including its current one. This cannot be undone.\n\nContinue?"
           confirmLabel="Delete"
           onCancel={() => setConfirmDeleteId(null)}
           onConfirm={() => void handleDelete(confirmDeleteId)}
