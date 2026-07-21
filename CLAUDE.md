@@ -144,6 +144,86 @@ When writing formulas that use these functions, function names (`LET`, `FILTER`,
 auto-prefixed with `_xlfn.`/`_xlfn._xlws.` by the crate — but `LET`/`LAMBDA`-bound variable names
 must be prefixed with `_xlpm.` by hand in the formula string, or Excel won't recognize them.
 
+### Rate library is a supplier price book, shared across every project
+
+The sidebar's **Rate Library** tab (`DimensionGroupPane.tsx`'s pane-level tab bar, beside
+"Dimension Groups") browses a supplier price book — a per-merchant CSV export (Carters
+seeded by default; more can be added, see below) — that's uploaded via the "Manage" console
+(`PriceBookManagerDialog.tsx`) and shared across every project. It lives in `registry.db`
+(`price_book_imports` + `price_book_items` + `price_book_merchants`), **not** the per-project
+`.tcop` database — the same registry DB that already holds `recent_projects` — because a price
+book is company-wide reference data, not project data. This is a different table from the
+older, per-project `rate_library` table (`RateConstantsDialog.tsx` / `STUDIQ.RATE()`), which holds
+hand-entered project-specific rates; the two are unrelated despite the similar name.
+
+Every CSV upload replaces the live item set: `price_book_items` only ever holds rows for the
+most recent import (`price_book_imports.is_current = 1`); older imports stay in
+`price_book_imports` as ingest-history metadata (filename, merchant, the CSV's own "Download
+Date", row count, upload timestamp) but their item rows are deleted. This is safe because
+dragging a rate into the workbook (`WorkbookView.tsx`'s `applyRateImport`, MIME type
+`application/x-studiq-rate-item`) copies the code/description/unit/price values into the cell at
+drop time — there is no live link back to the source row, so replacing the price book can never
+retroactively change a rate a workbook has already borrowed. Contrast this with the dimension-group
+→ Quantity-column drag (`application/x-studiq-dimension-group`, `handleGroupDrop`), which does keep
+a live link (`setCellLink`) back to the group.
+
+The CSV's `Group`/`Sub Group` columns drive the Rate Library tree (Category → Group → Sub Group →
+items), lazy-loaded per level the same way `DrawingRegisterPane`/`DimensionGroupPane` lazy-load
+their trees. Only `description` and `unit_price` are actually required of a merchant format —
+`category`/`group_name`/`sub_group` are optional, since some suppliers don't organize their price
+list into a category hierarchy at all. `RateLibraryPane.tsx`'s `TreeBranch` renders the tree
+generically off whatever the data actually contains: at each level it asks the backend for the
+distinct values (`list_price_book_categories`/`_groups`/`_subgroups`, each accepting the parent
+filters as `Option<String>` — `None` means "not filtered", `Some("")` means the deliberate
+"(Uncategorised)"/"(Ungrouped)"/"(No Sub Group)" bucket for items that do have sibling values at
+that level but are blank there). If a level's values are *all* blank — the field isn't mapped for
+this merchant, or every item under the current filters leaves it blank — `TreeBranch` skips
+rendering that level entirely and passes straight through to the next one, so the same component
+handles a full Carters-style hierarchy, a flat description+price-only catalog, and anything in
+between. `list_price_book_items` (and `search_price_book_items`) cap browse/search results at
+`PRICE_BOOK_BROWSE_LIMIT`/200 rows respectively — only reachable in practice for a merchant with
+no meaningful grouping, where "browse" would otherwise mean "list everything".
+
+#### Merchants: pluggable per-supplier CSV formats
+
+Every supplier names/orders its export columns differently (Carters' first header cell is
+literally `# Download Date`; another merchant's file might not carry a `Sub Group` column at
+all, or any category hierarchy whatsoever), so the parser doesn't hardcode one CSV layout.
+`price_book_merchants` stores, per merchant, a `column_map_json` — a JSON object mapping each
+canonical field to that merchant's literal CSV header text. The full field list is
+`REQUIRED_PRICE_BOOK_FIELDS` (`description`, `unit_price` — nothing else) /
+`OPTIONAL_PRICE_BOOK_FIELDS` (`category`, `group_name`, `sub_group`, `product_code`,
+`unit_of_sale`, plus metadata fields) in `desktop/src/lib.rs`, mirrored in `PRICE_BOOK_FIELDS` in
+`RateLibraryPane.tsx`. A "Carters" merchant is seeded on registry init with the mapping this
+feature originally shipped with (including the literal `# Download Date` header — the leading
+`#` is just part of the stored mapping now, not a special-cased strip).
+
+`MerchantManagerDialog.tsx` (opened from the management console) is where formats are
+authored: "Load Sample CSV" calls `preview_price_book_headers` to read just the header row of a
+real file, and each field's mapping input gets a `<datalist>` of those detected headers so
+you're picking a real column name, not typing one blind. Saving a merchant
+(`create_price_book_merchant`/`update_price_book_merchant`) requires every required field to
+be mapped, or the save is rejected listing which ones are missing.
+
+The management console's upload flow requires picking a merchant first (`import_price_book`
+now takes a `merchant_id`). At import time, every column that merchant's format maps to must
+actually exist in the uploaded CSV (case-insensitive, trimmed match) — a required field whose
+mapped header is missing fails the whole ingest with a message naming the expected column and
+suggesting the estimator either picked the wrong merchant or the merchant's export layout
+changed; nothing is written to `price_book_imports`/`price_book_items` when this happens
+(the mapping is validated before the transaction opens). Optional metadata fields degrade
+gracefully instead — if mapped but not found in a given upload, the value is just left blank
+rather than failing the ingest. A merchant can't be deleted once it has ingest history
+(`delete_price_book_merchant` checks `price_book_imports.merchant_id` first); the ingest
+history table shows "Unknown" for `merchant_name` on imports predating the merchant column or
+whose merchant has since been deleted.
+
+Two CSV-hygiene quirks the parser (`import_price_book`) applies regardless of merchant: the
+file may end with a few single-field disclaimer lines (Carters' export does) that a
+strict-width CSV reader would error on (`flexible(true)`, then rows shorter than the header are
+skipped), and multi-line quoted description fields are flattened to single-line (`\n`/`\r`
+replaced with a space).
+
 ## Docs & process
 
 `docs/` holds the phase **prompts** (specs), **handovers** (architecture/state between

@@ -35,6 +35,7 @@ rustls-pemfile = "2"
 rustls = { version = "0.23", features = ["ring"] }
 base64 = "0.22"
 rust_xlsxwriter = "0.96.0"
+csv = "1"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"

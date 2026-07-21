@@ -273,6 +273,7 @@ function namedExprFromValue(value: unknown): string {
 
 const LINK_FONT_COLOUR = "#489c35";
 const DIMENSION_DRAG_MIME = "application/x-studiq-dimension-group";
+const RATE_ITEM_DRAG_MIME = "application/x-studiq-rate-item";
 
 // Dimension-group import/derivation helpers (loadGroupImportContext,
 // buildImportOptions, deriveLinkedQuantity, possibleImportDisplays,
@@ -2174,19 +2175,48 @@ export function WorkbookView() {
     event.dataTransfer.dropEffect = "copy";
   }
 
+  /** Drops a rate library item onto the Rate column: copies its code/description/unit/
+   *  rate into the row as plain values (same one-shot-copy semantics as typing them in
+   *  by hand) — there is no live link back to the price book, so a later price book
+   *  re-upload never silently changes a rate already committed to a workbook. */
+  function applyRateImport(row: number, item: { code: string; description: string; unit: string; rate: number }) {
+    const hot = hotRef.current?.hotInstance;
+    if (!hot) return;
+    const changes: Array<[number, number, string | number]> = [];
+    if (!hot.getDataAtCell(row, COL_CODE)) changes.push([row, COL_CODE, item.code]);
+    if (!hot.getDataAtCell(row, COL_DESC)) changes.push([row, COL_DESC, item.description]);
+    changes.push([row, COL_UNIT, item.unit]);
+    changes.push([row, COL_RATE, item.rate]);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    hot.setDataAtCell(changes as any);
+    hot.render();
+    scheduleSaveRef.current();
+  }
+
   function handleGridDrop(event: React.DragEvent<HTMLDivElement>) {
-    const raw = event.dataTransfer.getData(DIMENSION_DRAG_MIME);
-    if (!raw || levelRef.current === 1) return;
+    if (levelRef.current === 1) return; // groups/rates can only be dropped at Level 2/3
+    const groupRaw = event.dataTransfer.getData(DIMENSION_DRAG_MIME);
+    const rateRaw = event.dataTransfer.getData(RATE_ITEM_DRAG_MIME);
+    if (!groupRaw && !rateRaw) return;
     event.preventDefault();
-    let payload: { groupId: number; name: string };
-    try { payload = JSON.parse(raw); } catch { return; }
     const hot = hotRef.current?.hotInstance;
     if (!hot) return;
     const td = (event.target as HTMLElement | null)?.closest("td");
     if (!td) return;
     const coords = hot.getCoords(td);
-    if (!coords || coords.row < 0 || coords.col !== COL_QTY) return;
-    void handleGroupDrop(payload.groupId, payload.name, coords.row);
+    if (!coords || coords.row < 0) return;
+
+    if (groupRaw && coords.col === COL_QTY) {
+      let payload: { groupId: number; name: string };
+      try { payload = JSON.parse(groupRaw); } catch { return; }
+      void handleGroupDrop(payload.groupId, payload.name, coords.row);
+      return;
+    }
+    if (rateRaw && coords.col === COL_RATE) {
+      let payload: { code: string; description: string; unit: string; rate: number };
+      try { payload = JSON.parse(rateRaw); } catch { return; }
+      applyRateImport(coords.row, payload);
+    }
   }
 
   /** Right-click on a linked C:Quantity / D:Unit cell offers "Show dimension group". */
