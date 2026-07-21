@@ -390,7 +390,7 @@ export function MerchantManagerDialog({ onClose, onChanged }: Props) {
       {confirmDeleteId !== null && (
         <ConfirmDialog
           title="Delete Merchant"
-          body="This removes the merchant's saved CSV format. This cannot be undone.\n\nContinue?"
+          body="This deletes the merchant's saved CSV format AND its entire rate library — every price book ever uploaded for it, including its current one. This cannot be undone.\n\nContinue?"
           confirmLabel="Delete"
           onCancel={() => setConfirmDeleteId(null)}
           onConfirm={() => void handleDelete(confirmDeleteId)}

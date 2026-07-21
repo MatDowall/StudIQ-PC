@@ -3935,6 +3935,18 @@ async fn init_registry_database(
     .execute(&pool)
     .await;
 
+    // One-time cleanup for a registry that ran the rate library before `is_current`
+    // became per-merchant: back then there was only ever one "current" book app-wide,
+    // so a pre-existing import can be stuck with `is_current = 1` and `merchant_id`
+    // NULL. Nothing will ever clear that flag now (every import/delete path scopes its
+    // `is_current` reset to a real merchant_id), so it would otherwise sit forever as a
+    // phantom "current" row with no merchant to attach a tab to. Idempotent — a no-op
+    // once cleared.
+    sqlx::query("UPDATE price_book_imports SET is_current = 0 WHERE merchant_id IS NULL AND is_current = 1")
+        .execute(&pool)
+        .await
+        .map_err(|e| format!("Failed to clear pre-merchant current-import flag: {e}"))?;
+
     // Seed the Carters format this feature originally shipped with, so an existing (or
     // fresh) registry can still ingest a Carters export with zero setup.
     let carters_seeded: bool = sqlx::query_scalar(
@@ -4718,14 +4730,18 @@ async fn list_price_book_imports(state: State<'_, AppState>) -> Result<Vec<Price
     rows.iter().map(row_to_price_book_import).collect()
 }
 
+/// One row per merchant that has an active price book — `is_current` is tracked
+/// per-merchant (see `import_price_book`), so every merchant keeps its own separate
+/// rate library rather than the whole app only ever having one "current" book. This is
+/// what drives the Rate Library pane's per-merchant tab strip.
 #[tauri::command]
-async fn get_current_price_book(state: State<'_, AppState>) -> Result<Option<PriceBookImportDto>, String> {
-    let sql = format!("{PRICE_BOOK_IMPORT_SELECT} WHERE i.is_current = 1 LIMIT 1");
-    let row = sqlx::query(&sql)
-        .fetch_optional(&state.registry_db)
+async fn list_current_price_books(state: State<'_, AppState>) -> Result<Vec<PriceBookImportDto>, String> {
+    let sql = format!("{PRICE_BOOK_IMPORT_SELECT} WHERE i.is_current = 1 ORDER BY m.name");
+    let rows = sqlx::query(&sql)
+        .fetch_all(&state.registry_db)
         .await
-        .map_err(|e| format!("get_current_price_book: {e}"))?;
-    row.as_ref().map(row_to_price_book_import).transpose()
+        .map_err(|e| format!("list_current_price_books: {e}"))?;
+    rows.iter().map(row_to_price_book_import).collect()
 }
 
 // ─── Merchant (price book format) commands ─────────────────────────────────────
@@ -4812,19 +4828,32 @@ async fn update_price_book_merchant(
     row_to_merchant(&row)
 }
 
+/// Deletes a merchant *and* everything it ever ingested — every import (current or
+/// historical) and their item rows. Now that each merchant keeps its own permanent,
+/// independent rate library (see `list_current_price_books`), blocking deletion behind
+/// "has ingest history" would make any merchant that had ever been used effectively
+/// undeletable, which defeats the point of letting estimators manage their merchant
+/// list; the frontend confirms this destructively before calling it.
 #[tauri::command]
 async fn delete_price_book_merchant(id: i64, state: State<'_, AppState>) -> Result<(), String> {
-    let in_use: bool = sqlx::query_scalar("SELECT COUNT(*) > 0 FROM price_book_imports WHERE merchant_id = ?")
-        .bind(id)
-        .fetch_one(&state.registry_db)
+    let mut tx = state
+        .registry_db
+        .begin()
         .await
         .map_err(|e| format!("delete_price_book_merchant: {e}"))?;
-    if in_use {
-        return Err("This merchant has ingest history and can't be deleted".to_string());
-    }
+    // price_book_items rows cascade-delete via their import_id FK once the import rows
+    // that own them are gone.
+    sqlx::query("DELETE FROM price_book_imports WHERE merchant_id = ?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("delete_price_book_merchant: {e}"))?;
     sqlx::query("DELETE FROM price_book_merchants WHERE id = ?")
         .bind(id)
-        .execute(&state.registry_db)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("delete_price_book_merchant: {e}"))?;
+    tx.commit()
         .await
         .map_err(|e| format!("delete_price_book_merchant: {e}"))?;
     Ok(())
@@ -4849,13 +4878,18 @@ async fn preview_price_book_headers(path: String) -> Result<Vec<String>, String>
 /// "list everything". Matches the cap on `search_price_book_items`.
 const PRICE_BOOK_BROWSE_LIMIT: i64 = 300;
 
+/// Every browse/search query below scopes to a specific merchant's current import
+/// (`is_current = 1 AND merchant_id = ?`) rather than a single app-wide current book —
+/// each merchant keeps its own independent rate library, browsed via its own tab in
+/// RateLibraryPane.tsx.
 #[tauri::command]
-async fn list_price_book_categories(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+async fn list_price_book_categories(merchant_id: i64, state: State<'_, AppState>) -> Result<Vec<String>, String> {
     let rows = sqlx::query(
         "SELECT DISTINCT product_category FROM price_book_items
-         WHERE import_id = (SELECT id FROM price_book_imports WHERE is_current = 1)
+         WHERE import_id = (SELECT id FROM price_book_imports WHERE is_current = 1 AND merchant_id = ?)
          ORDER BY (product_category = ''), product_category",
     )
+    .bind(merchant_id)
     .fetch_all(&state.registry_db)
     .await
     .map_err(|e| format!("list_price_book_categories: {e}"))?;
@@ -4870,16 +4904,20 @@ async fn list_price_book_categories(state: State<'_, AppState>) -> Result<Vec<St
 /// `RateLibraryPane.tsx`). `Some(value)` — including `Some("")` for the "(Uncategorised)"
 /// bucket — scopes to that exact category.
 #[tauri::command]
-async fn list_price_book_groups(category: Option<String>, state: State<'_, AppState>) -> Result<Vec<String>, String> {
+async fn list_price_book_groups(
+    merchant_id: i64,
+    category: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
     let mut sql = String::from(
         "SELECT DISTINCT group_name FROM price_book_items
-         WHERE import_id = (SELECT id FROM price_book_imports WHERE is_current = 1)",
+         WHERE import_id = (SELECT id FROM price_book_imports WHERE is_current = 1 AND merchant_id = ?)",
     );
     if category.is_some() {
         sql.push_str(" AND product_category = ?");
     }
     sql.push_str(" ORDER BY (group_name = ''), group_name");
-    let mut q = sqlx::query(&sql);
+    let mut q = sqlx::query(&sql).bind(merchant_id);
     if let Some(c) = &category {
         q = q.bind(c);
     }
@@ -4894,13 +4932,14 @@ async fn list_price_book_groups(category: Option<String>, state: State<'_, AppSt
 
 #[tauri::command]
 async fn list_price_book_subgroups(
+    merchant_id: i64,
     category: Option<String>,
     group_name: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<String>, String> {
     let mut sql = String::from(
         "SELECT DISTINCT sub_group FROM price_book_items
-         WHERE import_id = (SELECT id FROM price_book_imports WHERE is_current = 1)",
+         WHERE import_id = (SELECT id FROM price_book_imports WHERE is_current = 1 AND merchant_id = ?)",
     );
     if category.is_some() {
         sql.push_str(" AND product_category = ?");
@@ -4909,7 +4948,7 @@ async fn list_price_book_subgroups(
         sql.push_str(" AND group_name = ?");
     }
     sql.push_str(" ORDER BY (sub_group = ''), sub_group");
-    let mut q = sqlx::query(&sql);
+    let mut q = sqlx::query(&sql).bind(merchant_id);
     if let Some(c) = &category {
         q = q.bind(c);
     }
@@ -4927,6 +4966,7 @@ async fn list_price_book_subgroups(
 
 #[tauri::command]
 async fn list_price_book_items(
+    merchant_id: i64,
     category: Option<String>,
     group_name: Option<String>,
     sub_group: Option<String>,
@@ -4935,7 +4975,7 @@ async fn list_price_book_items(
     let mut sql = String::from(
         "SELECT id, product_category, group_name, sub_group, description, product_code, unit_of_sale, unit_price, effective_date
          FROM price_book_items
-         WHERE import_id = (SELECT id FROM price_book_imports WHERE is_current = 1)",
+         WHERE import_id = (SELECT id FROM price_book_imports WHERE is_current = 1 AND merchant_id = ?)",
     );
     if category.is_some() {
         sql.push_str(" AND product_category = ?");
@@ -4947,7 +4987,7 @@ async fn list_price_book_items(
         sql.push_str(" AND sub_group = ?");
     }
     sql.push_str(&format!(" ORDER BY description LIMIT {PRICE_BOOK_BROWSE_LIMIT}"));
-    let mut q = sqlx::query(&sql);
+    let mut q = sqlx::query(&sql).bind(merchant_id);
     if let Some(c) = &category {
         q = q.bind(c);
     }
@@ -4964,12 +5004,17 @@ async fn list_price_book_items(
     rows.iter().map(row_to_price_book_item).collect()
 }
 
-/// Live text search across the current price book's description and product code,
-/// capped at 200 rows — the Rate Library pane's search box calls this on every
-/// keystroke (debounced), so it stays a single indexed query rather than a full scan
-/// shipped to the frontend for client-side filtering.
+/// Live text search within one merchant's current price book (description and product
+/// code), capped at 200 rows — the Rate Library pane's search box calls this on every
+/// keystroke (debounced) for whichever merchant tab is active, so it stays a single
+/// indexed query rather than a full scan shipped to the frontend for client-side
+/// filtering.
 #[tauri::command]
-async fn search_price_book_items(query: String, state: State<'_, AppState>) -> Result<Vec<PriceBookItemDto>, String> {
+async fn search_price_book_items(
+    merchant_id: i64,
+    query: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<PriceBookItemDto>, String> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
         return Ok(Vec::new());
@@ -4982,11 +5027,12 @@ async fn search_price_book_items(query: String, state: State<'_, AppState>) -> R
     let rows = sqlx::query(
         "SELECT id, product_category, group_name, sub_group, description, product_code, unit_of_sale, unit_price, effective_date
          FROM price_book_items
-         WHERE import_id = (SELECT id FROM price_book_imports WHERE is_current = 1)
+         WHERE import_id = (SELECT id FROM price_book_imports WHERE is_current = 1 AND merchant_id = ?)
            AND (description LIKE ? OR product_code LIKE ?)
          ORDER BY description
          LIMIT 200",
     )
+    .bind(merchant_id)
     .bind(&like)
     .bind(&like)
     .fetch_all(&state.registry_db)
@@ -5129,7 +5175,10 @@ async fn import_price_book(path: String, merchant_id: i64, state: State<'_, AppS
         .await
         .map_err(|e| format!("import_price_book: {e}"))?;
 
-    sqlx::query("UPDATE price_book_imports SET is_current = 0")
+    // Scoped to this merchant only — every other merchant's current book is untouched,
+    // so each merchant's rate library is independent of the others.
+    sqlx::query("UPDATE price_book_imports SET is_current = 0 WHERE merchant_id = ?")
+        .bind(merchant.id)
         .execute(&mut *tx)
         .await
         .map_err(|e| format!("import_price_book: {e}"))?;
@@ -5170,13 +5219,19 @@ async fn import_price_book(path: String, merchant_id: i64, state: State<'_, AppS
         .map_err(|e| format!("import_price_book: {e}"))?;
     }
 
-    // Only the current import keeps its item rows — older imports stay in the
-    // ingest-history log (price_book_imports) but their line items are dropped.
-    sqlx::query("DELETE FROM price_book_items WHERE import_id != ?")
-        .bind(import_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| format!("import_price_book: {e}"))?;
+    // Only this merchant's current import keeps its item rows — its older imports stay
+    // in the ingest-history log (price_book_imports) but their line items are dropped.
+    // Scoped to merchant_id so this never touches another merchant's current items.
+    sqlx::query(
+        "DELETE FROM price_book_items WHERE import_id IN (
+             SELECT id FROM price_book_imports WHERE merchant_id = ? AND id != ?
+         )",
+    )
+    .bind(merchant.id)
+    .bind(import_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("import_price_book: {e}"))?;
 
     tx.commit().await.map_err(|e| format!("import_price_book: {e}"))?;
 
@@ -5802,7 +5857,7 @@ pub fn run() {
             delete_constant,
             import_price_book,
             list_price_book_imports,
-            get_current_price_book,
+            list_current_price_books,
             list_price_book_categories,
             list_price_book_groups,
             list_price_book_subgroups,

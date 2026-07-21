@@ -165,10 +165,10 @@ interface TreeFilters {
 
 const BLANK_BUCKET_LABELS = ["(Uncategorised)", "(Ungrouped)", "(No Sub Group)"];
 
-function fetchLevelValues(level: 0 | 1 | 2, filters: TreeFilters): Promise<string[]> {
-  if (level === 0) return invoke<string[]>("list_price_book_categories");
-  if (level === 1) return invoke<string[]>("list_price_book_groups", { category: filters.category });
-  return invoke<string[]>("list_price_book_subgroups", { category: filters.category, groupName: filters.group });
+function fetchLevelValues(merchantId: number, level: 0 | 1 | 2, filters: TreeFilters): Promise<string[]> {
+  if (level === 0) return invoke<string[]>("list_price_book_categories", { merchantId });
+  if (level === 1) return invoke<string[]>("list_price_book_groups", { merchantId, category: filters.category });
+  return invoke<string[]>("list_price_book_subgroups", { merchantId, category: filters.category, groupName: filters.group });
 }
 
 function withLevelValue(filters: TreeFilters, level: 0 | 1 | 2, value: string): TreeFilters {
@@ -186,47 +186,59 @@ function withLevelValue(filters: TreeFilters, level: 0 | 1 | 2, value: string): 
  *  lets the same tree component handle a full Carters-style hierarchy, a flat
  *  description+price-only catalog, and everything in between, driven entirely by what
  *  the data actually contains. */
-function TreeBranch({ level, filters, depth }: { level: 0 | 1 | 2 | 3; filters: TreeFilters; depth: number }) {
+function TreeBranch({
+  merchantId,
+  level,
+  filters,
+  depth,
+}: {
+  merchantId: number;
+  level: 0 | 1 | 2 | 3;
+  filters: TreeFilters;
+  depth: number;
+}) {
   const [values, setValues] = useState<string[] | null>(null);
 
   useEffect(() => {
     if (level === 3) return;
     let cancelled = false;
     setValues(null);
-    fetchLevelValues(level, filters).then((rows) => {
+    fetchLevelValues(merchantId, level, filters).then((rows) => {
       if (!cancelled) setValues(rows);
     });
     return () => {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [level, filters.category, filters.group, filters.subGroup]);
+  }, [merchantId, level, filters.category, filters.group, filters.subGroup]);
 
-  if (level === 3) return <ItemsLeaf filters={filters} depth={depth} />;
+  if (level === 3) return <ItemsLeaf merchantId={merchantId} filters={filters} depth={depth} />;
 
   if (values === null) {
     return <div style={{ paddingLeft: theme.treeIndent * depth, fontSize: 11, color: theme.text.secondary }}>Loading...</div>;
   }
 
   if (values.every((v) => v === "")) {
-    return <TreeBranch level={(level + 1) as 1 | 2 | 3} filters={filters} depth={depth} />;
+    return <TreeBranch merchantId={merchantId} level={(level + 1) as 1 | 2 | 3} filters={filters} depth={depth} />;
   }
 
   return (
     <>
       {values.map((value) => (
-        <TreeBranchNode key={value} level={level} value={value} filters={filters} depth={depth} />
+        <TreeBranchNode key={value} merchantId={merchantId} level={level} value={value} filters={filters} depth={depth} />
       ))}
     </>
   );
 }
 
 function TreeBranchNode({
+  merchantId,
   level,
   value,
   filters,
   depth,
 }: {
+  merchantId: number;
   level: 0 | 1 | 2;
   value: string;
   filters: TreeFilters;
@@ -237,18 +249,24 @@ function TreeBranchNode({
     <>
       <ExpandRow depth={depth} label={value || BLANK_BUCKET_LABELS[level]} expanded={expanded} onToggle={() => setExpanded((e) => !e)} />
       {expanded ? (
-        <TreeBranch level={(level + 1) as 1 | 2 | 3} filters={withLevelValue(filters, level, value)} depth={depth + 1} />
+        <TreeBranch
+          merchantId={merchantId}
+          level={(level + 1) as 1 | 2 | 3}
+          filters={withLevelValue(filters, level, value)}
+          depth={depth + 1}
+        />
       ) : null}
     </>
   );
 }
 
-function ItemsLeaf({ filters, depth }: { filters: TreeFilters; depth: number }) {
+function ItemsLeaf({ merchantId, filters, depth }: { merchantId: number; filters: TreeFilters; depth: number }) {
   const [items, setItems] = useState<PriceBookItemDto[] | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     invoke<PriceBookItemDto[]>("list_price_book_items", {
+      merchantId,
       category: filters.category,
       groupName: filters.group,
       subGroup: filters.subGroup,
@@ -259,7 +277,7 @@ function ItemsLeaf({ filters, depth }: { filters: TreeFilters; depth: number }) 
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filters.category, filters.group, filters.subGroup]);
+  }, [merchantId, filters.category, filters.group, filters.subGroup]);
 
   if (items === null) {
     return <div style={{ paddingLeft: theme.treeIndent * depth, fontSize: 11, color: theme.text.secondary }}>Loading...</div>;
@@ -280,8 +298,15 @@ function ItemsLeaf({ filters, depth }: { filters: TreeFilters; depth: number }) 
 
 const ROOT_FILTERS: TreeFilters = { category: null, group: null, subGroup: null };
 
+/** A current book that's actually attached to a merchant — the only kind the tab strip
+ *  can render a tab for. */
+type CurrentBook = PriceBookImportDto & { merchant_id: number };
+
 export function RateLibraryPane() {
-  const [currentBook, setCurrentBook] = useState<PriceBookImportDto | null>(null);
+  // One entry per merchant that has an active price book — each is its own
+  // independent rate library, switched between via the tab strip below.
+  const [currentBooks, setCurrentBooks] = useState<CurrentBook[]>([]);
+  const [activeMerchantId, setActiveMerchantId] = useState<number | null>(null);
   const [query, setQuery] = useState("");
   const [searchResults, setSearchResults] = useState<PriceBookItemDto[] | null>(null);
   const [searching, setSearching] = useState(false);
@@ -290,10 +315,18 @@ export function RateLibraryPane() {
   const searchSeq = useRef(0);
 
   async function refresh() {
-    setStatus("Loading price book...");
+    setStatus("Loading price books...");
     try {
-      const book = await invoke<PriceBookImportDto | null>("get_current_price_book");
-      setCurrentBook(book);
+      const rows = await invoke<PriceBookImportDto[]>("list_current_price_books");
+      // Defensive: a book with no merchant_id has nothing to attach a tab to. Shouldn't
+      // occur (the backend clears any pre-merchant leftover "current" flag on startup),
+      // but a tab list is the wrong place to find out otherwise.
+      const books = rows.filter((b): b is CurrentBook => b.merchant_id != null);
+      setCurrentBooks(books);
+      setActiveMerchantId((current) => {
+        if (current != null && books.some((b) => b.merchant_id === current)) return current;
+        return books[0]?.merchant_id ?? null;
+      });
       setStatus("");
     } catch (error) {
       setStatus(`ERROR: ${error}`);
@@ -304,9 +337,11 @@ export function RateLibraryPane() {
     void refresh();
   }, []);
 
+  const activeBook = currentBooks.find((b) => b.merchant_id === activeMerchantId) ?? null;
+
   useEffect(() => {
     const trimmed = query.trim();
-    if (!trimmed) {
+    if (!trimmed || activeMerchantId == null) {
       setSearchResults(null);
       setSearching(false);
       return;
@@ -314,7 +349,7 @@ export function RateLibraryPane() {
     const seq = ++searchSeq.current;
     setSearching(true);
     const handle = setTimeout(() => {
-      invoke<PriceBookItemDto[]>("search_price_book_items", { query: trimmed })
+      invoke<PriceBookItemDto[]>("search_price_book_items", { merchantId: activeMerchantId, query: trimmed })
         .then((rows) => {
           if (searchSeq.current === seq) setSearchResults(rows);
         })
@@ -323,7 +358,7 @@ export function RateLibraryPane() {
         });
     }, 200);
     return () => clearTimeout(handle);
-  }, [query]);
+  }, [query, activeMerchantId]);
 
   return (
     <section style={{ display: "flex", minHeight: 0, flexDirection: "column", background: theme.bg.pane }}>
@@ -364,6 +399,36 @@ export function RateLibraryPane() {
         </button>
       </div>
 
+      {currentBooks.length > 0 ? (
+        <div style={{ display: "flex", overflowX: "auto", borderBottom: `1px solid ${theme.border.subtle}`, background: theme.bg.tabBar, flexShrink: 0 }}>
+          {currentBooks.map((book) => {
+            const active = book.merchant_id === activeMerchantId;
+            return (
+              <button
+                key={book.merchant_id}
+                onClick={() => setActiveMerchantId(book.merchant_id)}
+                title={`${book.merchant_name ?? "Price book"} — ingested ${book.download_date} (${book.row_count} items)`}
+                style={{
+                  height: 26,
+                  padding: "0 10px",
+                  flexShrink: 0,
+                  background: active ? theme.bg.pane : "transparent",
+                  color: active ? theme.text.primary : theme.text.secondary,
+                  border: "none",
+                  borderRight: `1px solid ${theme.border.subtle}`,
+                  borderBottom: active ? `2px solid ${theme.accent}` : "2px solid transparent",
+                  cursor: "pointer",
+                  fontSize: 12,
+                  whiteSpace: "nowrap",
+                }}
+              >
+                {book.merchant_name ?? book.price_book_name ?? "Price book"}
+              </button>
+            );
+          })}
+        </div>
+      ) : null}
+
       <div
         style={{
           padding: "4px 8px",
@@ -375,9 +440,9 @@ export function RateLibraryPane() {
           whiteSpace: "nowrap",
         }}
       >
-        {currentBook
-          ? `${currentBook.merchant_name ?? currentBook.price_book_name ?? "Price book"} — ingested ${currentBook.download_date} (${currentBook.row_count} items)`
-          : "No price book uploaded yet"}
+        {activeBook
+          ? `ingested ${activeBook.download_date} (${activeBook.row_count} items)`
+          : "No price books uploaded yet"}
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: ROW_GRID, minWidth: 320, height: 24, borderBottom: `1px solid ${theme.border.subtle}`, background: theme.bg.shell, color: theme.text.primary, fontSize: 12 }}>
@@ -398,8 +463,8 @@ export function RateLibraryPane() {
             ) : null}
             {searchResults?.map((item) => <ItemRow key={item.id} item={item} />)}
           </>
-        ) : currentBook ? (
-          <TreeBranch key={currentBook.id} level={0} filters={ROOT_FILTERS} depth={0} />
+        ) : activeBook ? (
+          <TreeBranch key={activeBook.id} merchantId={activeBook.merchant_id} level={0} filters={ROOT_FILTERS} depth={0} />
         ) : (
           <div style={{ padding: 8, color: theme.text.secondary, fontSize: 12 }}>
             No price book loaded — click Manage to upload one

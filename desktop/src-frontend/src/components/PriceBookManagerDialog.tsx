@@ -70,8 +70,6 @@ export function PriceBookManagerDialog({ onClose }: Props) {
     }
   }
 
-  const current = imports.find((i) => i.is_current) ?? null;
-
   return (
     <>
       <DialogShell title="Rate Library — Manage Price Books" width={700} zIndex={1240} onClose={onClose}>
@@ -84,20 +82,10 @@ export function PriceBookManagerDialog({ onClose }: Props) {
               border: `1px solid ${theme.border.subtle}`,
             }}
           >
-            <div style={{ fontSize: 12, marginBottom: 10 }}>
-              {current ? (
-                <>
-                  <div style={{ fontWeight: 600, color: theme.text.primary }}>
-                    Current: {current.merchant_name ?? current.price_book_name ?? "Price book"} — {current.account_name}
-                    {current.branch_code ? ` (${current.branch_code})` : ""}
-                  </div>
-                  <div style={{ color: theme.text.secondary, marginTop: 2 }}>
-                    CSV ingest date {current.download_date} · {current.row_count} items · uploaded {current.imported_at}
-                  </div>
-                </>
-              ) : (
-                <div style={{ color: theme.text.secondary }}>No price book uploaded yet</div>
-              )}
+            <div style={{ fontSize: 11, color: theme.text.secondary, marginBottom: 8 }}>
+              Every merchant keeps its own separate rate library — uploading here replaces only the
+              selected merchant's current book. The "Current" column below shows each merchant's
+              active book.
             </div>
 
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
