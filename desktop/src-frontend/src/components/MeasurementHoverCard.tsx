@@ -23,7 +23,7 @@ export interface HoverCardData {
   rows: HoverCardRow[];
 }
 
-const CARD_BG = "#eef3c6";
+const CARD_BG = "#fff6b4";
 const CARD_BORDER = "#bfc5a2";
 const DIVIDER = "#888";
 const TEXT_MUTED = "#444";
