@@ -28,7 +28,35 @@ export interface PriceBookImportDto {
   row_count: number;
   is_current: boolean;
   imported_at: string;
+  merchant_id: number | null;
+  merchant_name: string | null;
 }
+
+export interface MerchantDto {
+  id: number;
+  name: string;
+  column_map: Record<string, string>;
+  created_at: string;
+}
+
+/** Canonical price-book fields, shared by the merchant format editor and the import
+ *  validation error messages on the backend — keep in sync with
+ *  REQUIRED_PRICE_BOOK_FIELDS / OPTIONAL_PRICE_BOOK_FIELDS in desktop/src/lib.rs. */
+export const PRICE_BOOK_FIELDS: Array<{ key: string; label: string; required: boolean }> = [
+  { key: "category", label: "Product Category", required: true },
+  { key: "group_name", label: "Group", required: true },
+  { key: "sub_group", label: "Sub Group", required: true },
+  { key: "description", label: "Product Description", required: true },
+  { key: "product_code", label: "Product Code", required: true },
+  { key: "unit_of_sale", label: "Unit of Sale", required: true },
+  { key: "unit_price", label: "Unit Price", required: true },
+  { key: "effective_date", label: "Effective Date", required: false },
+  { key: "download_date", label: "Download / Ingest Date", required: false },
+  { key: "price_book_name", label: "Price Book Name", required: false },
+  { key: "account_number", label: "Account Number", required: false },
+  { key: "account_name", label: "Account Name", required: false },
+  { key: "branch_code", label: "Branch / Store Code", required: false },
+];
 
 const ROW_GRID = "18px minmax(120px, 1fr) 56px 64px";
 
@@ -320,7 +348,7 @@ export function RateLibraryPane() {
         }}
       >
         {currentBook
-          ? `${currentBook.price_book_name || "Price book"} — ingested ${currentBook.download_date} (${currentBook.row_count} items)`
+          ? `${currentBook.merchant_name ?? currentBook.price_book_name ?? "Price book"} — ingested ${currentBook.download_date} (${currentBook.row_count} items)`
           : "No price book uploaded yet"}
       </div>
 

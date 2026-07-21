@@ -420,6 +420,23 @@ pub struct PriceBookImportDto {
     pub row_count: i64,
     pub is_current: bool,
     pub imported_at: String,
+    pub merchant_id: Option<i64>,
+    /// Null for imports ingested before the merchant column existed, or whose merchant
+    /// has since been deleted.
+    pub merchant_name: Option<String>,
+}
+
+/// A supplier's CSV format: `column_map` maps each canonical price-book field (see
+/// `REQUIRED_PRICE_BOOK_FIELDS`/`OPTIONAL_PRICE_BOOK_FIELDS`) to the literal column
+/// header text that merchant's export uses for it — different suppliers name and order
+/// their columns differently, so this is what lets `import_price_book` parse any of
+/// them with the same code path.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct MerchantDto {
+    pub id: i64,
+    pub name: String,
+    pub column_map: std::collections::BTreeMap<String, String>,
+    pub created_at: String,
 }
 
 /// A single line from the current supplier price book — one product/code/rate.
@@ -3890,6 +3907,69 @@ async fn init_registry_database(
         .await
         .map_err(|e| format!("Failed to create price_book_items description index: {e}"))?;
 
+    // Merchant CSV formats: each merchant maps canonical price-book fields (category,
+    // group_name, sub_group, ...) to the literal column header text used in *their*
+    // export, since different suppliers name/order columns differently. The mapping is
+    // looked up per import (`import_price_book`) so the same ingest logic works for any
+    // merchant without hardcoding one CSV layout.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS price_book_merchants (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            name             TEXT    NOT NULL UNIQUE,
+            column_map_json  TEXT    NOT NULL,
+            created_at       TEXT    NOT NULL DEFAULT (datetime('now'))
+        );
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .map_err(|e| format!("Failed to create price_book_merchants: {e}"))?;
+
+    // Additive migration: link each import to the merchant format it was ingested
+    // under. Nullable — rows from before this column existed just show "Unknown" in
+    // the management console's ingest history.
+    let _ = sqlx::query(
+        "ALTER TABLE price_book_imports ADD COLUMN merchant_id INTEGER REFERENCES price_book_merchants(id)",
+    )
+    .execute(&pool)
+    .await;
+
+    // Seed the Carters format this feature originally shipped with, so an existing (or
+    // fresh) registry can still ingest a Carters export with zero setup.
+    let carters_seeded: bool = sqlx::query_scalar(
+        "SELECT COUNT(*) > 0 FROM price_book_merchants WHERE name = 'Carters'",
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| format!("Failed to check for seeded Carters merchant: {e}"))?;
+    if !carters_seeded {
+        let carters_map: std::collections::BTreeMap<&str, &str> = [
+            ("category", "Product Category"),
+            ("group_name", "Group"),
+            ("sub_group", "Sub Group"),
+            ("description", "Product Description"),
+            ("product_code", "Product Code"),
+            ("unit_of_sale", "Unit of Sale"),
+            ("unit_price", "Unit Price Ex GST"),
+            ("effective_date", "Effective Date"),
+            // Carters' export literally has a leading "# " on its first header cell.
+            ("download_date", "# Download Date"),
+            ("price_book_name", "Price Book Name"),
+            ("account_number", "Account Number"),
+            ("account_name", "Account Name"),
+            ("branch_code", "Branch Code"),
+        ]
+        .into_iter()
+        .collect();
+        let carters_map_json = serde_json::to_string(&carters_map).map_err(|e| e.to_string())?;
+        sqlx::query("INSERT INTO price_book_merchants (name, column_map_json) VALUES ('Carters', ?)")
+            .bind(&carters_map_json)
+            .execute(&pool)
+            .await
+            .map_err(|e| format!("Failed to seed Carters merchant: {e}"))?;
+    }
+
     let projects = load_recent_projects_from_registry(&pool).await?;
 
     Ok((pool, projects))
@@ -4567,13 +4647,53 @@ fn row_to_price_book_import(row: &sqlx::sqlite::SqliteRow) -> Result<PriceBookIm
         row_count: row.try_get("row_count").map_err(|e| e.to_string())?,
         is_current: row.try_get::<i64, _>("is_current").map_err(|e| e.to_string())? != 0,
         imported_at: row.try_get("imported_at").map_err(|e| e.to_string())?,
+        merchant_id: row.try_get("merchant_id").map_err(|e| e.to_string())?,
+        merchant_name: row.try_get("merchant_name").map_err(|e| e.to_string())?,
     })
 }
 
-/// Parses the Carters export's `d/m/y` (2-digit year) date columns into `YYYY-MM-DD` so
-/// the management console can sort/display them consistently. Falls back to the raw
-/// string unchanged for anything that doesn't match — a format surprise should never
-/// hard-fail the ingest, only look a little odd in the console.
+fn row_to_merchant(row: &sqlx::sqlite::SqliteRow) -> Result<MerchantDto, String> {
+    let column_map_json: String = row.try_get("column_map_json").map_err(|e| e.to_string())?;
+    let column_map = serde_json::from_str(&column_map_json)
+        .map_err(|e| format!("Corrupt merchant column map: {e}"))?;
+    Ok(MerchantDto {
+        id: row.try_get("id").map_err(|e| e.to_string())?,
+        name: row.try_get("name").map_err(|e| e.to_string())?,
+        column_map,
+        created_at: row.try_get("created_at").map_err(|e| e.to_string())?,
+    })
+}
+
+/// Canonical price-book fields every merchant format must map — the columns the rest
+/// of the app actually reads (category/group/sub-group tree, description, code, unit,
+/// price). A merchant's format can't be saved without all of these mapped, and an
+/// import fails fast if the mapped header isn't actually present in the uploaded CSV.
+const REQUIRED_PRICE_BOOK_FIELDS: [&str; 7] = [
+    "category",
+    "group_name",
+    "sub_group",
+    "description",
+    "product_code",
+    "unit_of_sale",
+    "unit_price",
+];
+
+/// Metadata fields shown in the management console but not required for the price book
+/// to function — mapped optionally per merchant and left blank if the merchant doesn't
+/// map them (or the mapped column happens to be missing from a given upload).
+const OPTIONAL_PRICE_BOOK_FIELDS: [&str; 6] = [
+    "effective_date",
+    "download_date",
+    "price_book_name",
+    "account_number",
+    "account_name",
+    "branch_code",
+];
+
+/// Parses `d/m/y` (2-digit year) dates — the format Carters' Download/Effective Date
+/// columns use — into `YYYY-MM-DD` so the management console can sort/display them
+/// consistently. Falls back to the raw string unchanged for anything that doesn't
+/// match, since other merchants may use a different date format entirely.
 fn normalize_price_book_date(raw: &str) -> String {
     let parts: Vec<&str> = raw.trim().split('/').collect();
     if let [d, m, y] = parts.as_slice() {
@@ -4585,28 +4705,142 @@ fn normalize_price_book_date(raw: &str) -> String {
     raw.trim().to_string()
 }
 
+const PRICE_BOOK_IMPORT_SELECT: &str = "SELECT i.id, i.source_filename, i.price_book_name, i.account_number, i.account_name, i.branch_code, i.download_date, i.row_count, i.is_current, i.imported_at, i.merchant_id, m.name AS merchant_name
+     FROM price_book_imports i LEFT JOIN price_book_merchants m ON m.id = i.merchant_id";
+
 #[tauri::command]
 async fn list_price_book_imports(state: State<'_, AppState>) -> Result<Vec<PriceBookImportDto>, String> {
-    let rows = sqlx::query(
-        "SELECT id, source_filename, price_book_name, account_number, account_name, branch_code, download_date, row_count, is_current, imported_at
-         FROM price_book_imports ORDER BY imported_at DESC",
-    )
-    .fetch_all(&state.registry_db)
-    .await
-    .map_err(|e| format!("list_price_book_imports: {e}"))?;
+    let sql = format!("{PRICE_BOOK_IMPORT_SELECT} ORDER BY i.imported_at DESC");
+    let rows = sqlx::query(&sql)
+        .fetch_all(&state.registry_db)
+        .await
+        .map_err(|e| format!("list_price_book_imports: {e}"))?;
     rows.iter().map(row_to_price_book_import).collect()
 }
 
 #[tauri::command]
 async fn get_current_price_book(state: State<'_, AppState>) -> Result<Option<PriceBookImportDto>, String> {
-    let row = sqlx::query(
-        "SELECT id, source_filename, price_book_name, account_number, account_name, branch_code, download_date, row_count, is_current, imported_at
-         FROM price_book_imports WHERE is_current = 1 LIMIT 1",
-    )
-    .fetch_optional(&state.registry_db)
-    .await
-    .map_err(|e| format!("get_current_price_book: {e}"))?;
+    let sql = format!("{PRICE_BOOK_IMPORT_SELECT} WHERE i.is_current = 1 LIMIT 1");
+    let row = sqlx::query(&sql)
+        .fetch_optional(&state.registry_db)
+        .await
+        .map_err(|e| format!("get_current_price_book: {e}"))?;
     row.as_ref().map(row_to_price_book_import).transpose()
+}
+
+// ─── Merchant (price book format) commands ─────────────────────────────────────
+
+#[tauri::command]
+async fn list_price_book_merchants(state: State<'_, AppState>) -> Result<Vec<MerchantDto>, String> {
+    let rows = sqlx::query("SELECT id, name, column_map_json, created_at FROM price_book_merchants ORDER BY name")
+        .fetch_all(&state.registry_db)
+        .await
+        .map_err(|e| format!("list_price_book_merchants: {e}"))?;
+    rows.iter().map(row_to_merchant).collect()
+}
+
+fn validate_merchant_column_map(column_map: &std::collections::BTreeMap<String, String>) -> Result<(), String> {
+    let missing: Vec<&str> = REQUIRED_PRICE_BOOK_FIELDS
+        .iter()
+        .filter(|field| column_map.get(**field).map(|v| v.trim().is_empty()).unwrap_or(true))
+        .copied()
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "This format is missing a column mapping for: {}",
+            missing.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn create_price_book_merchant(
+    name: String,
+    column_map: std::collections::BTreeMap<String, String>,
+    state: State<'_, AppState>,
+) -> Result<MerchantDto, String> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("Merchant name is required".to_string());
+    }
+    validate_merchant_column_map(&column_map)?;
+    let column_map_json = serde_json::to_string(&column_map).map_err(|e| e.to_string())?;
+    let result = sqlx::query("INSERT INTO price_book_merchants (name, column_map_json) VALUES (?, ?)")
+        .bind(&name)
+        .bind(&column_map_json)
+        .execute(&state.registry_db)
+        .await
+        .map_err(|e| format!("A merchant named '{name}' already exists: {e}"))?;
+    let row = sqlx::query("SELECT id, name, column_map_json, created_at FROM price_book_merchants WHERE id = ?")
+        .bind(result.last_insert_rowid())
+        .fetch_one(&state.registry_db)
+        .await
+        .map_err(|e| format!("create_price_book_merchant: {e}"))?;
+    row_to_merchant(&row)
+}
+
+#[tauri::command]
+async fn update_price_book_merchant(
+    id: i64,
+    name: String,
+    column_map: std::collections::BTreeMap<String, String>,
+    state: State<'_, AppState>,
+) -> Result<MerchantDto, String> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("Merchant name is required".to_string());
+    }
+    validate_merchant_column_map(&column_map)?;
+    let column_map_json = serde_json::to_string(&column_map).map_err(|e| e.to_string())?;
+    let rows = sqlx::query("UPDATE price_book_merchants SET name = ?, column_map_json = ? WHERE id = ?")
+        .bind(&name)
+        .bind(&column_map_json)
+        .bind(id)
+        .execute(&state.registry_db)
+        .await
+        .map_err(|e| format!("A merchant named '{name}' already exists: {e}"))?
+        .rows_affected();
+    if rows == 0 {
+        return Err(format!("Merchant {id} not found"));
+    }
+    let row = sqlx::query("SELECT id, name, column_map_json, created_at FROM price_book_merchants WHERE id = ?")
+        .bind(id)
+        .fetch_one(&state.registry_db)
+        .await
+        .map_err(|e| format!("update_price_book_merchant: {e}"))?;
+    row_to_merchant(&row)
+}
+
+#[tauri::command]
+async fn delete_price_book_merchant(id: i64, state: State<'_, AppState>) -> Result<(), String> {
+    let in_use: bool = sqlx::query_scalar("SELECT COUNT(*) > 0 FROM price_book_imports WHERE merchant_id = ?")
+        .bind(id)
+        .fetch_one(&state.registry_db)
+        .await
+        .map_err(|e| format!("delete_price_book_merchant: {e}"))?;
+    if in_use {
+        return Err("This merchant has ingest history and can't be deleted".to_string());
+    }
+    sqlx::query("DELETE FROM price_book_merchants WHERE id = ?")
+        .bind(id)
+        .execute(&state.registry_db)
+        .await
+        .map_err(|e| format!("delete_price_book_merchant: {e}"))?;
+    Ok(())
+}
+
+/// Reads just the header row of a CSV file — used by the merchant format editor so the
+/// estimator can map each field to one of the file's *actual* column headers instead of
+/// typing them blind.
+#[tauri::command]
+async fn preview_price_book_headers(path: String) -> Result<Vec<String>, String> {
+    let file = std::fs::File::open(&path).map_err(|e| format!("Failed to open file: {e}"))?;
+    let mut reader = csv::ReaderBuilder::new().has_headers(true).flexible(true).from_reader(file);
+    let headers = reader
+        .headers()
+        .map_err(|e| format!("Failed to read CSV header row: {e}"))?;
+    Ok(headers.iter().map(|h| h.trim().to_string()).collect())
 }
 
 #[tauri::command]
@@ -4716,12 +4950,20 @@ async fn search_price_book_items(query: String, state: State<'_, AppState>) -> R
 }
 
 #[tauri::command]
-async fn import_price_book(path: String, state: State<'_, AppState>) -> Result<PriceBookImportDto, String> {
+async fn import_price_book(path: String, merchant_id: i64, state: State<'_, AppState>) -> Result<PriceBookImportDto, String> {
+    let merchant_row = sqlx::query("SELECT id, name, column_map_json, created_at FROM price_book_merchants WHERE id = ?")
+        .bind(merchant_id)
+        .fetch_optional(&state.registry_db)
+        .await
+        .map_err(|e| format!("import_price_book: {e}"))?
+        .ok_or_else(|| "Selected merchant not found".to_string())?;
+    let merchant = row_to_merchant(&merchant_row)?;
+
     let file = std::fs::File::open(&path).map_err(|e| format!("Failed to open file: {e}"))?;
-    // `flexible(true)`: Carters' export tacks a few `#`-prefixed single-field disclaimer
-    // lines onto the end of the file (e.g. "#Prices are subject to change without
-    // notice") — a strict reader errors on their field count not matching the header's.
-    // Short rows like these are filtered out below instead.
+    // `flexible(true)`: exports like Carters' tack a few single-field disclaimer lines
+    // onto the end of the file (e.g. "#Prices are subject to change without notice") —
+    // a strict reader errors on their field count not matching the header's. Short rows
+    // like these are filtered out below instead.
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(true)
         .flexible(true)
@@ -4732,27 +4974,51 @@ async fn import_price_book(path: String, state: State<'_, AppState>) -> Result<P
         .map_err(|e| format!("Failed to read CSV header row: {e}"))?
         .clone();
     let column_count = headers.len();
-    // The first header ("Download Date") is exported as "# Download Date" — strip a
-    // leading '#' (and the whitespace around it) before matching column names.
-    let col = |name: &str| -> Result<usize, String> {
-        headers
-            .iter()
-            .position(|h| h.trim().trim_start_matches('#').trim().eq_ignore_ascii_case(name))
-            .ok_or_else(|| format!("CSV is missing the required '{name}' column"))
+    // Resolves a canonical field to a column index via the *selected merchant's* mapping
+    // — this is the "check the ingest format matches the selected merchant" step: if the
+    // header that merchant's format expects isn't in this file, the wrong merchant was
+    // probably picked (or the merchant's export layout changed), so fail with a message
+    // that says exactly which expected column is missing.
+    let resolve = |field: &str| -> Result<Option<usize>, String> {
+        let required = REQUIRED_PRICE_BOOK_FIELDS.contains(&field);
+        let expected_header = merchant.column_map.get(field).map(|s| s.trim()).filter(|s| !s.is_empty());
+        let Some(expected_header) = expected_header else {
+            if required {
+                return Err(format!(
+                    "The '{}' format has no column mapped for '{field}' — fix this in Manage Merchants.",
+                    merchant.name
+                ));
+            }
+            return Ok(None);
+        };
+        let idx = headers.iter().position(|h| h.trim().eq_ignore_ascii_case(expected_header));
+        if idx.is_none() && required {
+            return Err(format!(
+                "This CSV doesn't match the '{}' format: expected a column named '{expected_header}' but it wasn't found. \
+                 Check you selected the right merchant, or update its format in Manage Merchants.",
+                merchant.name
+            ));
+        }
+        Ok(idx)
     };
-    let idx_download_date = col("Download Date")?;
-    let idx_price_book_name = col("Price Book Name")?;
-    let idx_account_number = col("Account Number")?;
-    let idx_account_name = col("Account Name")?;
-    let idx_branch_code = col("Branch Code")?;
-    let idx_category = col("Product Category")?;
-    let idx_group = col("Group")?;
-    let idx_sub_group = col("Sub Group")?;
-    let idx_description = col("Product Description")?;
-    let idx_product_code = col("Product Code")?;
-    let idx_unit = col("Unit of Sale")?;
-    let idx_price = col("Unit Price Ex GST")?;
-    let idx_effective_date = col("Effective Date")?;
+    // Required fields are guaranteed `Some` here: `resolve` returns `Err` above for any
+    // required field it can't resolve, so `?` alone (no unwrap/panic) is enough.
+    let require = |field: &str| -> Result<usize, String> {
+        Ok(resolve(field)?.unwrap_or_else(|| unreachable!("resolve() errors instead of returning None for a required field")))
+    };
+    let idx_category = require("category")?;
+    let idx_group = require("group_name")?;
+    let idx_sub_group = require("sub_group")?;
+    let idx_description = require("description")?;
+    let idx_product_code = require("product_code")?;
+    let idx_unit = require("unit_of_sale")?;
+    let idx_price = require("unit_price")?;
+    let idx_effective_date = resolve("effective_date")?;
+    let idx_download_date = resolve("download_date")?;
+    let idx_price_book_name = resolve("price_book_name")?;
+    let idx_account_number = resolve("account_number")?;
+    let idx_account_name = resolve("account_name")?;
+    let idx_branch_code = resolve("branch_code")?;
 
     struct ParsedItem {
         category: String,
@@ -4778,13 +5044,14 @@ async fn import_price_book(path: String, state: State<'_, AppState>) -> Result<P
         let get = |i: usize| -> String {
             record.get(i).unwrap_or("").trim().replace(['\n', '\r'], " ")
         };
+        let get_opt = |i: Option<usize>| -> String { i.map(get).unwrap_or_default() };
         if header_meta.is_none() {
             header_meta = Some((
-                get(idx_download_date),
-                get(idx_price_book_name),
-                get(idx_account_number),
-                get(idx_account_name),
-                get(idx_branch_code),
+                get_opt(idx_download_date),
+                get_opt(idx_price_book_name),
+                get_opt(idx_account_number),
+                get_opt(idx_account_name),
+                get_opt(idx_branch_code),
             ));
         }
         items.push(ParsedItem {
@@ -4795,7 +5062,7 @@ async fn import_price_book(path: String, state: State<'_, AppState>) -> Result<P
             product_code: get(idx_product_code),
             unit: get(idx_unit),
             price: get(idx_price).parse().unwrap_or(0.0),
-            effective_date: normalize_price_book_date(&get(idx_effective_date)),
+            effective_date: normalize_price_book_date(&get_opt(idx_effective_date)),
         });
     }
     if items.is_empty() {
@@ -4822,8 +5089,8 @@ async fn import_price_book(path: String, state: State<'_, AppState>) -> Result<P
         .map_err(|e| format!("import_price_book: {e}"))?;
 
     let insert_result = sqlx::query(
-        "INSERT INTO price_book_imports (source_filename, price_book_name, account_number, account_name, branch_code, download_date, row_count, is_current)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
+        "INSERT INTO price_book_imports (source_filename, price_book_name, account_number, account_name, branch_code, download_date, row_count, is_current, merchant_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)",
     )
     .bind(&source_filename)
     .bind(&price_book_name)
@@ -4832,6 +5099,7 @@ async fn import_price_book(path: String, state: State<'_, AppState>) -> Result<P
     .bind(&branch_code)
     .bind(&download_date)
     .bind(row_count)
+    .bind(merchant.id)
     .execute(&mut *tx)
     .await
     .map_err(|e| format!("import_price_book: {e}"))?;
@@ -4866,14 +5134,12 @@ async fn import_price_book(path: String, state: State<'_, AppState>) -> Result<P
 
     tx.commit().await.map_err(|e| format!("import_price_book: {e}"))?;
 
-    let row = sqlx::query(
-        "SELECT id, source_filename, price_book_name, account_number, account_name, branch_code, download_date, row_count, is_current, imported_at
-         FROM price_book_imports WHERE id = ?",
-    )
-    .bind(import_id)
-    .fetch_one(&state.registry_db)
-    .await
-    .map_err(|e| format!("import_price_book: {e}"))?;
+    let sql = format!("{PRICE_BOOK_IMPORT_SELECT} WHERE i.id = ?");
+    let row = sqlx::query(&sql)
+        .bind(import_id)
+        .fetch_one(&state.registry_db)
+        .await
+        .map_err(|e| format!("import_price_book: {e}"))?;
     row_to_price_book_import(&row)
 }
 
@@ -5495,7 +5761,12 @@ pub fn run() {
             list_price_book_groups,
             list_price_book_subgroups,
             list_price_book_items,
-            search_price_book_items
+            search_price_book_items,
+            list_price_book_merchants,
+            create_price_book_merchant,
+            update_price_book_merchant,
+            delete_price_book_merchant,
+            preview_price_book_headers
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
