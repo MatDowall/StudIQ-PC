@@ -5110,7 +5110,14 @@ async fn import_price_book(path: String, merchant_id: i64, state: State<'_, AppS
         .ok_or_else(|| "Selected merchant not found".to_string())?;
     let merchant = row_to_merchant(&merchant_row)?;
 
-    let file = std::fs::File::open(&path).map_err(|e| format!("Failed to open file: {e}"))?;
+    let raw_bytes = std::fs::read(&path).map_err(|e| format!("Failed to open file: {e}"))?;
+    // Some merchant exports aren't valid UTF-8 (observed: stray Windows-1252 bytes like
+    // 0xA0 non-breaking space). Windows-1252 decodes every byte, so this is a safe
+    // fallback that doesn't corrupt files that are already valid UTF-8.
+    let text = match String::from_utf8(raw_bytes) {
+        Ok(s) => s,
+        Err(e) => encoding_rs::WINDOWS_1252.decode(e.as_bytes()).0.into_owned(),
+    };
     // `flexible(true)`: exports like Carters' tack a few single-field disclaimer lines
     // onto the end of the file (e.g. "#Prices are subject to change without notice") —
     // a strict reader errors on their field count not matching the header's. Short rows
@@ -5118,7 +5125,7 @@ async fn import_price_book(path: String, merchant_id: i64, state: State<'_, AppS
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(true)
         .flexible(true)
-        .from_reader(file);
+        .from_reader(text.as_bytes());
 
     let headers = reader
         .headers()
