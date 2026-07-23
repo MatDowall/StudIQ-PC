@@ -27,6 +27,7 @@ import {
   openingPreview,
   orthogonalConstrain,
   parseFramingSettings,
+  parseJoistRafterSettings,
   parseWallFraming,
   projectOntoPath,
   reindexFramingForVertexDeletion,
@@ -34,12 +35,14 @@ import {
   serializeWallFraming,
   wallMembers,
   wallStudPositions,
+  STUD_THICKNESS_MM,
   type Opening,
   type OpeningTemplate,
   type WallFraming,
 } from "../lib/framing";
 import {
   computeAreaMesh3D,
+  computeArrayMembers3D,
   computeCountMarker3D,
   computeLengthMembers3D,
   computeWall3D,
@@ -509,7 +512,7 @@ function drawOverlays(
     if (measurement.measurement_type === "array") {
       if (points.length >= 2) {
         const meta = parseArrayMeta(measurement.framing_json ?? null);
-        drawArray(ctx, [points[0], points[1]], meta, colour, style, pan, zoom, page, selected, false);
+        drawArray(ctx, [points[0], points[1]], meta, colour, style, pan, zoom, page, selected, false, mmPerPoint);
       }
       continue;
     }
@@ -923,7 +926,45 @@ function trimAffectsSegment(seg: [PagePoint, PagePoint], trim: ArrayTrim): boole
   return !same;
 }
 
-/** Render a committed or draft array onto the canvas. */
+/** A member rectangle (4 corners) for a Joist/Rafter member run from `a` to `b`, `halfWidthPts`
+ *  either side of the centreline — the same "45mm wide" plan-view footprint used by Timber
+ *  Framing's studs (STUD_THICKNESS_MM is constant across every FRAMING_SIZES option). */
+function arrayMemberRect(a: PagePoint, b: PagePoint, halfWidthPts: number): PagePoint[] {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const len = Math.hypot(dx, dy) || 1;
+  const nx = -dy / len;
+  const ny = dx / len;
+  return [
+    { x: a.x + nx * halfWidthPts, y: a.y + ny * halfWidthPts },
+    { x: b.x + nx * halfWidthPts, y: b.y + ny * halfWidthPts },
+    { x: b.x - nx * halfWidthPts, y: b.y - ny * halfWidthPts },
+    { x: a.x - nx * halfWidthPts, y: a.y - ny * halfWidthPts },
+  ];
+}
+
+/** Fill+stroke one member as a plain dimensional rectangle (no corner-to-corner cross — unlike
+ *  Timber Framing's stud symbol, a Joist/Rafter member is just its real-world footprint).
+ *  `screenRect` is already in screen space. */
+function fillArrayMemberRect(ctx: CanvasRenderingContext2D, screenRect: { x: number; y: number }[], colour: string, lineWidth: number) {
+  const [c0, c1, c2, c3] = screenRect;
+  ctx.beginPath();
+  ctx.moveTo(c0.x, c0.y);
+  ctx.lineTo(c1.x, c1.y);
+  ctx.lineTo(c2.x, c2.y);
+  ctx.lineTo(c3.x, c3.y);
+  ctx.closePath();
+  ctx.fillStyle = `${colour}22`;
+  ctx.fill();
+  ctx.strokeStyle = colour;
+  ctx.lineWidth = lineWidth;
+  ctx.stroke();
+}
+
+/** Render a committed or draft array onto the canvas. Each (trimmed) member is drawn as a
+ *  dimensional rectangle at the timber's real-world 45mm plan-view width when a page scale is
+ *  available, falling back to a plain centreline (like Timber Framing's own no-scale fallback)
+ *  otherwise. */
 function drawArray(
   ctx: CanvasRenderingContext2D,
   baseline: [PagePoint, PagePoint],
@@ -935,27 +976,41 @@ function drawArray(
   page: PageMeta,
   selected: boolean,
   showVertices: boolean,
+  mmPerPoint: number | null,
 ) {
   const members = getArrayMembers(baseline[0], baseline[1], meta);
   const absTrimsList = absTrims(meta.trims, baseline[0]);
   ctx.save();
-  ctx.strokeStyle = colour;
-  const arrayWidth = selected ? MEASURE_LINE_WIDTH + 1.5 : MEASURE_LINE_WIDTH;
-  ctx.lineWidth = arrayWidth;
-  ctx.setLineDash(lineDash(style, arrayWidth));
+  ctx.lineJoin = "round";
   ctx.lineCap = "round";
 
-  for (const member of members) {
-    for (const clipped of applyTrimsToSegment(member, absTrimsList)) {
-      const a = pageToScreen(clipped[0].x, clipped[0].y, page.height_pts, pan, zoom);
-      const b = pageToScreen(clipped[1].x, clipped[1].y, page.height_pts, pan, zoom);
-      ctx.beginPath();
-      ctx.moveTo(a.x, a.y);
-      ctx.lineTo(b.x, b.y);
-      ctx.stroke();
+  const halfWidthPts = mmPerPoint && mmPerPoint > 0 ? STUD_THICKNESS_MM / mmPerPoint / 2 : 0;
+
+  if (halfWidthPts > 0) {
+    const lineWidth = selected ? 1.8 : 1.3;
+    for (const member of members) {
+      for (const clipped of applyTrimsToSegment(member, absTrimsList)) {
+        const rect = arrayMemberRect(clipped[0], clipped[1], halfWidthPts).map((p) => pageToScreen(p.x, p.y, page.height_pts, pan, zoom));
+        fillArrayMemberRect(ctx, rect, colour, lineWidth);
+      }
     }
+  } else {
+    ctx.strokeStyle = colour;
+    const arrayWidth = selected ? MEASURE_LINE_WIDTH + 1.5 : MEASURE_LINE_WIDTH;
+    ctx.lineWidth = arrayWidth;
+    ctx.setLineDash(lineDash(style, arrayWidth));
+    for (const member of members) {
+      for (const clipped of applyTrimsToSegment(member, absTrimsList)) {
+        const a = pageToScreen(clipped[0].x, clipped[0].y, page.height_pts, pan, zoom);
+        const b = pageToScreen(clipped[1].x, clipped[1].y, page.height_pts, pan, zoom);
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.y);
+        ctx.lineTo(b.x, b.y);
+        ctx.stroke();
+      }
+    }
+    ctx.setLineDash([]);
   }
-  ctx.setLineDash([]);
 
   if (showVertices || selected) {
     const screenPts = baseline.map((p) => pageToScreen(p.x, p.y, page.height_pts, pan, zoom));
@@ -975,24 +1030,33 @@ function drawArrayDraft(
   pan: { x: number; y: number },
   zoom: number,
   page: PageMeta,
+  mmPerPoint: number | null,
 ) {
   const meta: ArrayMeta = { extraMembers, spacingPts, direction, trims: [] };
   const members = getArrayMembers(baseline[0], baseline[1], meta);
   ctx.save();
+  ctx.lineJoin = "round";
   ctx.lineCap = "round";
   ctx.setLineDash([]);
 
+  const halfWidthPts = mmPerPoint && mmPerPoint > 0 ? STUD_THICKNESS_MM / mmPerPoint / 2 : 0;
+
   // Baseline drawn at full opacity; extra members at reduced opacity.
   for (let i = 0; i < members.length; i += 1) {
-    const a = pageToScreen(members[i][0].x, members[i][0].y, page.height_pts, pan, zoom);
-    const b = pageToScreen(members[i][1].x, members[i][1].y, page.height_pts, pan, zoom);
     ctx.globalAlpha = i === 0 ? 1 : 0.7;
-    ctx.strokeStyle = colour;
-    ctx.lineWidth = MEASURE_LINE_WIDTH;
-    ctx.beginPath();
-    ctx.moveTo(a.x, a.y);
-    ctx.lineTo(b.x, b.y);
-    ctx.stroke();
+    if (halfWidthPts > 0) {
+      const rect = arrayMemberRect(members[i][0], members[i][1], halfWidthPts).map((p) => pageToScreen(p.x, p.y, page.height_pts, pan, zoom));
+      fillArrayMemberRect(ctx, rect, colour, 1.3);
+    } else {
+      const a = pageToScreen(members[i][0].x, members[i][0].y, page.height_pts, pan, zoom);
+      const b = pageToScreen(members[i][1].x, members[i][1].y, page.height_pts, pan, zoom);
+      ctx.strokeStyle = colour;
+      ctx.lineWidth = MEASURE_LINE_WIDTH;
+      ctx.beginPath();
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
+      ctx.stroke();
+    }
   }
   ctx.globalAlpha = 1;
   ctx.restore();
@@ -2157,7 +2221,7 @@ export function ViewerCanvas({
         if (draftPoints.length >= 2) {
           // Extruding phase: show ghost array based on cursor's perpendicular offset.
           const baseline: [PagePoint, PagePoint] = [draftPoints[0], draftPoints[1]];
-          drawArrayDraft(ctx, baseline, arrayExtraMembers, arrayDirection, arraySpacingPts, draftColour, pan, zoom, page);
+          drawArrayDraft(ctx, baseline, arrayExtraMembers, arrayDirection, arraySpacingPts, draftColour, pan, zoom, page, pageScale?.mm_per_point ?? null);
         } else {
           // Baseline phase: rubber-band the first segment.
           drawDraft(ctx, draftPoints, livePoint, draftColour, pan, zoom, page, draftStyle, false);
@@ -2552,6 +2616,13 @@ export function ViewerCanvas({
 
       // Array in extruding phase (baseline already drawn): ignore further clicks.
       if (drawingArray && draftPointsRef.current.length >= 2) {
+        return;
+      }
+
+      // Default Spacing is required before a Joist/Rafter group can be drawn — block starting a
+      // new baseline until it's set (via the group's Properties).
+      if (drawingArray && draftPointsRef.current.length === 0 && arraySpacingPts <= 0) {
+        onStatusChange("Set a Default Spacing for this Joist / Rafter group before drawing (Properties).");
         return;
       }
 
@@ -4438,7 +4509,15 @@ export function ViewerCanvas({
               } else if (m.measurement_type === "area" && pts.length >= 3) {
                 const mesh = computeAreaMesh3D(pts, mmpp, { heightM: props?.default_height ?? 0, offsetM, color });
                 if (mesh) areas = [mesh];
-              } else if ((m.measurement_type === "length" || m.measurement_type === "array") && pts.length >= 2) {
+              } else if (m.measurement_type === "array" && pts.length >= 2) {
+                const meta = parseArrayMeta(m.framing_json ?? null);
+                const joistRafter = parseJoistRafterSettings(props?.framing_props_json ?? null);
+                members = computeArrayMembers3D(pts, mmpp, meta, joistRafter.framingSize, {
+                  offsetM,
+                  color,
+                  pitchAngleDeg: props?.pitch_angle_deg ?? 0,
+                });
+              } else if (m.measurement_type === "length" && pts.length >= 2) {
                 members = computeLengthMembers3D(pts, mmpp, {
                   widthM: props?.default_width ?? 0,
                   heightM: props?.default_height ?? 0,

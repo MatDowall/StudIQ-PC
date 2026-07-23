@@ -5333,7 +5333,7 @@ async fn query_tree_nodes(
                     n.colour,
                     p.measurement_type,
                     p.default_display,
-                    CASE WHEN p.measurement_type = 'timber_framing'
+                    CASE WHEN p.measurement_type IN ('timber_framing', 'array')
                          THEN json_extract(p.framing_props_json, '$.framingSize') END AS framing_size
                 FROM tree_nodes n
                 LEFT JOIN dimension_group_props p ON p.node_id = n.id
@@ -5362,7 +5362,7 @@ async fn query_tree_nodes(
                     n.colour,
                     p.measurement_type,
                     p.default_display,
-                    CASE WHEN p.measurement_type = 'timber_framing'
+                    CASE WHEN p.measurement_type IN ('timber_framing', 'array')
                          THEN json_extract(p.framing_props_json, '$.framingSize') END AS framing_size
                 FROM tree_nodes n
                 LEFT JOIN dimension_group_props p ON p.node_id = n.id
@@ -5629,7 +5629,7 @@ async fn get_tree_node(pool: &SqlitePool, node_id: i64) -> Result<TreeNodeDto, S
             n.colour,
             p.measurement_type,
             p.default_display,
-            CASE WHEN p.measurement_type = 'timber_framing'
+            CASE WHEN p.measurement_type IN ('timber_framing', 'array')
                  THEN json_extract(p.framing_props_json, '$.framingSize') END AS framing_size
         FROM tree_nodes n
         LEFT JOIN dimension_group_props p ON p.node_id = n.id

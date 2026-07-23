@@ -11,8 +11,10 @@ import {
   aggregateFramingGroup,
   dwangRowCount,
   parseFramingSettings,
+  parseJoistRafterSettings,
   plateLayerCount,
   serializeFramingSettings,
+  serializeJoistRafterSettings,
   studHeightMm,
 } from "../lib/framing";
 
@@ -21,7 +23,7 @@ const MEASUREMENT_TYPES = [
   { value: "length", label: "Length" },
   { value: "area", label: "Area" },
   { value: "timber_framing", label: "Timber Framing" },
-  { value: "array", label: "Array" },
+  { value: "array", label: "Joist / Rafter" },
 ] as const;
 const COUNT_TYPES = [
   { value: "marker", label: "Marker" },
@@ -132,6 +134,10 @@ export function DimensionGroupPropertiesDialog({
   const [dwangCentres, setDwangCentres] = useState(String(initialFraming.dwangCentresMm));
   const [dwangsOn, setDwangsOn] = useState(initialFraming.dwangsOn);
 
+  // Joist/Rafter (Array) timber size — shown only when measurement type = Joist / Rafter.
+  const initialJoistRafter = parseJoistRafterSettings(initial.framing_props_json);
+  const [joistRafterSize, setJoistRafterSize] = useState<FramingSize>(initialJoistRafter.framingSize);
+
   const isFraming = measurementType === "timber_framing";
   const isArray = measurementType === "array";
   const isCount = measurementType === "count";
@@ -203,8 +209,13 @@ export function DimensionGroupPropertiesDialog({
       // Array has no direction concept, so it always stores 0 (along-X) regardless of pitchDirection.
       pitch_angle_deg: showsPitch ? Math.min(89.9, Math.max(0, parseNumber(pitchAngle, 0))) : 0,
       pitch_direction_deg: showsPitchDirection && pitchDirection === "y" ? 90 : 0,
-      // Persist framing settings when this is a framing group; otherwise keep any existing blob.
-      framing_props_json: isFraming ? serializeFramingSettings(framingSettings) : initial.framing_props_json,
+      // Persist framing settings when this is a framing group, the joist/rafter timber size when
+      // this is a Joist/Rafter (array) group; otherwise keep any existing blob.
+      framing_props_json: isFraming
+        ? serializeFramingSettings(framingSettings)
+        : isArray
+          ? serializeJoistRafterSettings({ framingSize: joistRafterSize })
+          : initial.framing_props_json,
       count_type: isCount ? countType : initial.count_type,
     };
   }
@@ -275,12 +286,22 @@ export function DimensionGroupPropertiesDialog({
                 <input type="number" value={width} onChange={(e) => setWidth(e.target.value)} style={{ ...inputStyle, flex: 1 }} title={isArray ? "Centre-to-centre spacing between array members (metres)" : undefined} />
                 <span style={{ color: theme.text.secondary, fontSize: 12 }}>m</span>
               </Field>
-              {!isArray ? (
+              {isArray ? (
+                <Field label="Timber Size">
+                  <select value={joistRafterSize} onChange={(e) => setJoistRafterSize(e.target.value as FramingSize)} style={{ ...inputStyle, flex: 1 }}>
+                    {FRAMING_SIZES.map((size) => (
+                      <option key={size} value={size}>
+                        {size.replace("x", " × ")}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+              ) : (
                 <Field label="Default Height">
                   <input type="number" value={height} onChange={(e) => setHeight(e.target.value)} style={{ ...inputStyle, flex: 1 }} />
                   <span style={{ color: theme.text.secondary, fontSize: 12 }}>m</span>
                 </Field>
-              ) : null}
+              )}
               {showsPitch ? (
                 <>
                   <Field label="Pitch Angle">

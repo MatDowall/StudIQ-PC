@@ -5,8 +5,8 @@
 // "PDF Y → world -Z" convention. Each box member is rotated `yaw` about Y and `pitch` about its
 // across-axis.
 
-import type { PagePoint } from "./quantity";
-import { wallMembers, type FramingComponentKind, type FramingSettings, type WallFraming } from "./framing";
+import { absArrayTrims, applyArrayTrims, type ArrayMeta, type PagePoint } from "./quantity";
+import { framingDepthMm, wallMembers, STUD_THICKNESS_MM, type FramingComponentKind, type FramingSettings, type FramingSize, type WallFraming } from "./framing";
 
 export interface Member3D {
   kind: FramingComponentKind | "generic";
@@ -161,6 +161,70 @@ export function computeLengthMembers3D(
       pitch: 0,
       color: opts.color,
     });
+  }
+  return members;
+}
+
+/** A Joist/Rafter ("array") measurement's 3D extrusion: one sized box per (trimmed) member —
+ *  the baseline plus every extruded extra member, offset and clipped exactly like
+ *  `getArrayMembers`/`drawArray` in ViewerCanvas.tsx, so 2D and 3D never disagree on member
+ *  count. Each box stands with the group's timber size's depth (D) vertical and the constant
+ *  45mm thickness (T) as its plan-view width, matching the 2D dimensional rendering. A non-zero
+ *  pitch tilts each member about its own width axis and stretches it to the true sloped length,
+ *  rising from `points[0]` (drawn first) to `points[1]` — the same low-to-high convention as
+ *  drawing a rafter directly along the slope. */
+export function computeArrayMembers3D(
+  points: PagePoint[],
+  mmPerPoint: number | null,
+  meta: ArrayMeta,
+  framingSize: FramingSize,
+  opts: { offsetM: number; color: string; pitchAngleDeg: number },
+): Member3D[] {
+  if (!mmPerPoint || !(mmPerPoint > 0) || points.length < 2) return [];
+  const S = mmPerPoint / 1000;
+  const [p1, p2] = points;
+  const dx = p2.x - p1.x;
+  const dy = p2.y - p1.y;
+  const baseLen = Math.hypot(dx, dy);
+  if (baseLen < 1e-9) return [];
+  const perpX = -dy / baseLen;
+  const perpY = dx / baseLen;
+  const absTrimsList = absArrayTrims(meta.trims, p1);
+  const depthM = framingDepthMm(framingSize) / 1000;
+  const widthM = STUD_THICKNESS_MM / 1000;
+  const pitchRad = Math.min(89.9, Math.max(0, opts.pitchAngleDeg)) * (Math.PI / 180);
+  const tan = pitchRad !== 0 ? Math.tan(pitchRad) : 0;
+  const cos = pitchRad !== 0 ? Math.cos(pitchRad) : 1;
+
+  const members: Member3D[] = [];
+  for (let i = 0; i <= meta.extraMembers; i += 1) {
+    const off = i * meta.spacingPts * meta.direction;
+    const a: PagePoint = { x: p1.x + perpX * off, y: p1.y + perpY * off };
+    const b: PagePoint = { x: p2.x + perpX * off, y: p2.y + perpY * off };
+    for (const [ca, cb] of applyArrayTrims([a, b], absTrimsList)) {
+      const [x1, z1] = pageToWorld(ca, S);
+      const [x2, z2] = pageToWorld(cb, S);
+      const runDx = x2 - x1;
+      const runDz = z2 - z1;
+      const planLen = Math.hypot(runDx, runDz);
+      if (planLen <= 0) continue;
+      // Unlike computeLengthMembers3D (whose box puts its length on local Z, paired with
+      // yaw = atan2(dx, dz)), this box's length is on local X (size[0]) so pitch — which rotates
+      // about local Z per Framing3DView's quaternionFor — pivots the length axis about the width
+      // axis, not the other way round. Aligning local X (not Z) to the run direction needs the
+      // complementary formula: atan2(-dz, dx).
+      const yaw = Math.atan2(-runDz, runDx);
+      const lengthM = pitchRad !== 0 ? planLen / cos : planLen;
+      const riseM = pitchRad !== 0 ? planLen * tan : 0;
+      members.push({
+        kind: "generic",
+        position: [(x1 + x2) / 2, opts.offsetM + depthM / 2 + riseM / 2, (z1 + z2) / 2],
+        size: [lengthM, depthM, widthM],
+        yaw,
+        pitch: pitchRad,
+        color: opts.color,
+      });
+    }
   }
   return members;
 }

@@ -62,6 +62,31 @@ export function serializeFramingSettings(settings: FramingSettings): string {
   return JSON.stringify(settings);
 }
 
+/** Group-level settings for a Joist/Rafter group (persisted as framing_props_json, same column
+ *  as Timber Framing's FramingSettings — the two measurement types never coexist on one group).
+ *  Stored under the same "framingSize" JSON key as FramingSettings so the sidebar name-suffix
+ *  query (`json_extract(framing_props_json, '$.framingSize')`) works for both types uniformly. */
+export interface JoistRafterSettings {
+  framingSize: FramingSize;
+}
+
+export const DEFAULT_JOIST_RAFTER_SETTINGS: JoistRafterSettings = { framingSize: "90x45" };
+
+export function parseJoistRafterSettings(json: string | null | undefined): JoistRafterSettings {
+  if (!json) return { ...DEFAULT_JOIST_RAFTER_SETTINGS };
+  try {
+    const parsed = JSON.parse(json) as Partial<JoistRafterSettings>;
+    const size = parsed.framingSize;
+    return { framingSize: (FRAMING_SIZES as readonly string[]).includes(size ?? "") ? (size as FramingSize) : DEFAULT_JOIST_RAFTER_SETTINGS.framingSize };
+  } catch {
+    return { ...DEFAULT_JOIST_RAFTER_SETTINGS };
+  }
+}
+
+export function serializeJoistRafterSettings(settings: JoistRafterSettings): string {
+  return JSON.stringify(settings);
+}
+
 /** Stud depth D in mm (the "90" of "90x45") — the plate/wall thickness in plan view. */
 export function framingDepthMm(size: FramingSize): number {
   return Number.parseInt(size.split("x")[0], 10) || 90;

@@ -52,7 +52,7 @@ export const MEASUREMENT_TYPE_LABELS: Record<string, string> = {
   area: "Area",
   count: "Count",
   length: "Length",
-  array: "Array",
+  array: "Joist / Rafter",
 };
 
 export interface Quantity {
@@ -261,8 +261,10 @@ function _clipSegmentToTrim(seg: [PagePoint, PagePoint], trim: ArrayTrim): [Page
   return aKept ? [[seg[0], { x: ix, y: iy }]] : [[{ x: ix, y: iy }, seg[1]]];
 }
 
-/** Apply all trims sequentially. Each trim may split a segment into multiple pieces. */
-function _applyTrims(seg: [PagePoint, PagePoint], trims: ArrayTrim[]): [PagePoint, PagePoint][] {
+/** Apply all trims sequentially. Each trim may split a segment into multiple pieces. Exported for
+ *  reuse by the 3D array-member builder (lib/framing3d.ts), which needs the same trimmed member
+ *  set as the 2D render/quantity paths so 2D, 3D, and quantities never disagree. */
+export function applyArrayTrims(seg: [PagePoint, PagePoint], trims: ArrayTrim[]): [PagePoint, PagePoint][] {
   let segments: [PagePoint, PagePoint][] = [seg];
   for (const trim of trims) {
     const next: [PagePoint, PagePoint][] = [];
@@ -273,8 +275,9 @@ function _applyTrims(seg: [PagePoint, PagePoint], trims: ArrayTrim[]): [PagePoin
   return segments;
 }
 
-/** Convert relative-stored trims to absolute page coords by adding the baseline origin. */
-function _absTrims(trims: ArrayTrim[], origin: PagePoint): ArrayTrim[] {
+/** Convert relative-stored trims to absolute page coords by adding the baseline origin. Exported
+ *  alongside `applyArrayTrims` for the 3D array-member builder. */
+export function absArrayTrims(trims: ArrayTrim[], origin: PagePoint): ArrayTrim[] {
   if (trims.length === 0) return trims;
   return trims.map((t): ArrayTrim => {
     if (t.kind === "box") {
@@ -301,7 +304,7 @@ function arrayTrimmedLengthPts(p1: PagePoint, p2: PagePoint, meta: ArrayMeta): n
   const perpX = -dy / len;
   const perpY = dx / len;
   // Convert relative trims to absolute using p1 as origin.
-  const absTrimsList = _absTrims(meta.trims, p1);
+  const absTrimsList = absArrayTrims(meta.trims, p1);
   let total = 0;
   for (let i = 0; i <= meta.extraMembers; i++) {
     const off = i * meta.spacingPts * meta.direction;
@@ -309,7 +312,7 @@ function arrayTrimmedLengthPts(p1: PagePoint, p2: PagePoint, meta: ArrayMeta): n
       { x: p1.x + perpX * off, y: p1.y + perpY * off },
       { x: p2.x + perpX * off, y: p2.y + perpY * off },
     ];
-    const clipped = _applyTrims(seg, absTrimsList);
+    const clipped = applyArrayTrims(seg, absTrimsList);
     for (const c of clipped) total += Math.hypot(c[1].x - c[0].x, c[1].y - c[0].y);
   }
   return total;

@@ -6,9 +6,11 @@ import { DocumentMeta, ViewerCanvas } from "./ViewerCanvas";
 import { FramingBreakdownPanel } from "./FramingBreakdownPanel";
 import { OpeningDialog } from "./OpeningDialog";
 import { Framing3DView, type Framing3DPage } from "./Framing3DView";
-import { DEFAULT_DOOR, DEFAULT_WINDOW, parseFramingSettings, parseWallFraming, type OpeningTemplate } from "../lib/framing";
+import { DEFAULT_DOOR, DEFAULT_WINDOW, parseFramingSettings, parseJoistRafterSettings, parseWallFraming, type OpeningTemplate } from "../lib/framing";
+import { parseArrayMeta } from "../lib/quantity";
 import {
   computeAreaMesh3D,
+  computeArrayMembers3D,
   computeCountMarker3D,
   computeLengthMembers3D,
   computeWall3D,
@@ -105,7 +107,18 @@ export function Viewer() {
       } else if (mz.measurement_type === "area") {
         const mesh = computeAreaMesh3D(pts, mmpp, { heightM: props?.default_height ?? 0, offsetM, color });
         if (mesh) areas.push(mesh);
-      } else if (mz.measurement_type === "length" || mz.measurement_type === "array") {
+      } else if (mz.measurement_type === "array") {
+        if (pts.length < 2) continue;
+        const meta = parseArrayMeta(mz.framing_json ?? null);
+        const joistRafter = parseJoistRafterSettings(props?.framing_props_json ?? null);
+        members.push(
+          ...computeArrayMembers3D(pts, mmpp, meta, joistRafter.framingSize, {
+            offsetM,
+            color,
+            pitchAngleDeg: props?.pitch_angle_deg ?? 0,
+          }),
+        );
+      } else if (mz.measurement_type === "length") {
         members.push(
           ...computeLengthMembers3D(pts, mmpp, {
             widthM: props?.default_width ?? 0,
@@ -158,7 +171,18 @@ export function Viewer() {
             } else if (g.measurementType === "area") {
               const mesh = computeAreaMesh3D(pts, p.mmPerPoint, { heightM: g.defaultHeightM, offsetM: g.defaultOffsetM, color });
               if (mesh) areas.push(mesh);
-            } else if (g.measurementType === "length" || g.measurementType === "array") {
+            } else if (g.measurementType === "array") {
+              if (pts.length < 2) continue;
+              const meta = parseArrayMeta(mz.framing_json ?? null);
+              const joistRafter = parseJoistRafterSettings(g.framingPropsJson);
+              members.push(
+                ...computeArrayMembers3D(pts, p.mmPerPoint, meta, joistRafter.framingSize, {
+                  offsetM: g.defaultOffsetM,
+                  color,
+                  pitchAngleDeg: g.pitchAngleDeg,
+                }),
+              );
+            } else if (g.measurementType === "length") {
               members.push(
                 ...computeLengthMembers3D(pts, p.mmPerPoint, {
                   widthM: g.defaultWidthM,

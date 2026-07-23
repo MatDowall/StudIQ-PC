@@ -470,10 +470,16 @@ export function DimensionGroupPane() {
     setView3d(true);
   }
 
-  async function confirmAddGroup(folderPath: string, name: string, colour: string, measurementType: string) {
+  async function confirmAddGroup(
+    folderPath: string,
+    name: string,
+    colour: string,
+    measurementType: string,
+    joistRafter?: { spacingM: number; framingSize: string },
+  ) {
     setStatus("Adding dimension group...");
     try {
-      await createDimensionGroupInFolderPath(folderPath, name, colour, measurementType);
+      await createDimensionGroupInFolderPath(folderPath, name, colour, measurementType, joistRafter);
       setPendingAddGroupPath(null);
       setStatus("");
     } catch (error) {
@@ -845,8 +851,8 @@ export function DimensionGroupPane() {
           roots={dimensionRoots}
           childCache={childCache}
           onCancel={() => setPendingAddGroupPath(null)}
-          onConfirm={(folderPath, name, colour, measurementType) => {
-            void confirmAddGroup(folderPath, name, colour, measurementType);
+          onConfirm={(folderPath, name, colour, measurementType, joistRafter) => {
+            void confirmAddGroup(folderPath, name, colour, measurementType, joistRafter);
           }}
         />
       ) : null}

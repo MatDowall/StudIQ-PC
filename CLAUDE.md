@@ -294,7 +294,7 @@ Material Symbols Outlined.
 | Area group | `activity_zone` |
 | Count group | `tag` |
 | Length group | `diagonal_line` |
-| Array group | `texture` |
+| Joist / Rafter group | `texture` |
 | Recalculate workbook | `calculate` |
 | Rotate Left (Page / Takeoff Item) | `rotate_90_degrees_ccw` |
 | Rotate Right (Page / Takeoff Item) | `rotate_90_degrees_cw` |

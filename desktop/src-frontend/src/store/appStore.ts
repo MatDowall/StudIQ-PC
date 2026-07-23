@@ -67,6 +67,7 @@ export interface MultiPage3DGroupEntry {
   defaultOffsetM: number;
   defaultWidthM: number;
   defaultHeightM: number;
+  pitchAngleDeg: number;
   countType: string;
   posColour: string;
   negColour: string;
@@ -415,7 +416,13 @@ interface AppStore {
   addDrawing: (parentId: number | null, name: string, filePath: string) => Promise<void>;
   addDrawingToFolderPath: (folderPath: string, name: string, filePath: string) => Promise<void>;
   relinkDrawing: (nodeId: number, newPath: string) => Promise<void>;
-  createDimensionGroupInFolderPath: (folderPath: string, name: string, colour: string, measurementType: string) => Promise<void>;
+  createDimensionGroupInFolderPath: (
+    folderPath: string,
+    name: string,
+    colour: string,
+    measurementType: string,
+    joistRafter?: { spacingM: number; framingSize: string },
+  ) => Promise<void>;
   listDimensionFolders: () => Promise<FolderOption[]>;
   copyDimensionGroup: (sourceNodeId: number, targetFolderId: number, name: string, copyDimensions: boolean) => Promise<void>;
   requestDgPaneCommand: (action: DgPaneCommand) => void;
@@ -955,6 +962,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
           defaultOffsetM: props.default_offset ?? 0,
           defaultWidthM: props.default_width ?? 0,
           defaultHeightM: props.default_height ?? 0,
+          pitchAngleDeg: props.pitch_angle_deg ?? 0,
           countType: props.count_type,
           posColour: props.pos_colour,
           negColour: props.neg_colour,
@@ -975,6 +983,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
       defaultOffsetM,
       defaultWidthM,
       defaultHeightM,
+      pitchAngleDeg,
       countType,
       posColour,
       negColour,
@@ -997,6 +1006,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
           defaultOffsetM,
           defaultWidthM,
           defaultHeightM,
+          pitchAngleDeg,
           countType,
           posColour,
           negColour,
@@ -1250,8 +1260,18 @@ export const useAppStore = create<AppStore>((set, get) => ({
     await refreshTree("drawings", set);
   },
 
-  createDimensionGroupInFolderPath: async (folderPath, name, colour, measurementType) => {
-    await invoke<TreeNodeDto>("create_dimension_group_in_folder_path", { folderPath, name, colour, measurementType });
+  createDimensionGroupInFolderPath: async (folderPath, name, colour, measurementType, joistRafter) => {
+    const node = await invoke<TreeNodeDto>("create_dimension_group_in_folder_path", { folderPath, name, colour, measurementType });
+    if (joistRafter) {
+      const props = await invoke<DimensionGroupPropsDto>("get_dimension_group_props", { nodeId: node.id });
+      await invoke<DimensionGroupPropsDto>("set_dimension_group_props", {
+        props: {
+          ...props,
+          default_width: joistRafter.spacingM,
+          framing_props_json: JSON.stringify({ framingSize: joistRafter.framingSize }),
+        },
+      });
+    }
     await refreshTree("dimensions", set);
   },
 
