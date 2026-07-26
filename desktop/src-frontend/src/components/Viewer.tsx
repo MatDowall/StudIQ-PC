@@ -3,10 +3,8 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { useAppStore } from "../store/appStore";
 import { theme } from "../theme";
 import { DocumentMeta, ViewerCanvas } from "./ViewerCanvas";
-import { FramingBreakdownPanel } from "./FramingBreakdownPanel";
-import { OpeningDialog } from "./OpeningDialog";
 import { Framing3DView, type Framing3DPage } from "./Framing3DView";
-import { DEFAULT_DOOR, DEFAULT_WINDOW, parseFramingSettings, parseJoistRafterSettings, parseWallFraming, type OpeningTemplate } from "../lib/framing";
+import { parseFramingSettings, parseJoistRafterSettings, parseWallFraming } from "../lib/framing";
 import { parseArrayMeta } from "../lib/quantity";
 import {
   computeAreaMesh3D,
@@ -22,32 +20,17 @@ import {
 export function Viewer() {
   const [doc, setDoc] = useState<DocumentMeta | null>(null);
   const [pageIndex, setPageIndex] = useState(0);
-  const [status, setStatus] = useState("");
   const currentDocument = useAppStore((state) => state.currentDocument);
   const currentPageIndex = useAppStore((state) => state.activePageIndex);
   const overlayMeasurements = useAppStore((state) => state.overlayMeasurements);
   const overlayColour = useAppStore((state) => state.overlayColour);
   const groupColours = useAppStore((state) => state.groupColours);
-  const viewerMode = useAppStore((state) => state.viewerMode);
-  const setViewerMode = useAppStore((state) => state.setViewerMode);
-  const activeDimensionGroupId = useAppStore((state) => state.activeDimensionGroupId);
   const groupProps = useAppStore((state) => state.groupProps);
   const pageScale = useAppStore((state) => state.pageScale);
-  const [showBreakdown, setShowBreakdown] = useState(false);
-  const [openingDialog, setOpeningDialog] = useState<OpeningTemplate | null>(null);
-  const openingPlacement = useAppStore((state) => state.openingPlacement);
-  const setOpeningPlacement = useAppStore((state) => state.setOpeningPlacement);
-  const arrayTrimMode = useAppStore((state) => state.arrayTrimMode);
-  const setArrayTrimMode = useAppStore((state) => state.setArrayTrimMode);
-  const arrayTrimType = useAppStore((state) => state.arrayTrimType);
-  const setArrayTrimType = useAppStore((state) => state.setArrayTrimType);
+  const setViewerStatus = useAppStore((state) => state.setViewerStatus);
   const view3d = useAppStore((state) => state.view3d);
   const view3dMulti = useAppStore((state) => state.view3dMulti);
   const multiPage3DConfig = useAppStore((state) => state.multiPage3DConfig);
-  const activeIsFraming =
-    activeDimensionGroupId !== null && groupProps[activeDimensionGroupId]?.measurement_type === "timber_framing";
-  const activeIsArray =
-    activeDimensionGroupId !== null && groupProps[activeDimensionGroupId]?.measurement_type === "array";
 
   // Preview image URL for the current page — loaded on demand when view3d is active.
   const [previewUrl3d, setPreviewUrl3d] = useState<string | undefined>(undefined);
@@ -257,26 +240,21 @@ export function Viewer() {
     };
   }, []);
 
-  const calibrating = useAppStore((state) => state.calibrating);
-  const setCalibrating = useAppStore((state) => state.setCalibrating);
-  const drawPolarity = useAppStore((state) => state.drawPolarity);
-  const setDrawPolarity = useAppStore((state) => state.setDrawPolarity);
-
   const handleStatusChange = useCallback((nextStatus: string) => {
-    setStatus(nextStatus);
-  }, []);
+    setViewerStatus(nextStatus);
+  }, [setViewerStatus]);
 
   useEffect(() => {
     if (!currentDocument) {
       setDoc(null);
       setPageIndex(0);
-      setStatus("");
+      setViewerStatus("");
       return;
     }
     setDoc(currentDocument);
     setPageIndex(currentPageIndex);
-    setStatus(`Opened: ${currentDocument.page_count} pages`);
-  }, [currentDocument, currentPageIndex]);
+    setViewerStatus(`Opened: ${currentDocument.page_count} pages`);
+  }, [currentDocument, currentPageIndex, setViewerStatus]);
 
   return (
     <div
@@ -291,171 +269,6 @@ export function Viewer() {
         fontFamily: "Segoe UI, sans-serif",
       }}
     >
-      <div
-        style={{
-          height: 42,
-          padding: "0 10px",
-          background: theme.bg.ribbon,
-          display: "flex",
-          gap: 12,
-          alignItems: "center",
-          borderBottom: `1px solid ${theme.border.subtle}`,
-          flexShrink: 0,
-        }}
-      >
-        {doc ? (
-          <button
-            onClick={() => setCalibrating(!calibrating)}
-            title="Set the page scale by drawing a line over a known dimension"
-            style={{
-              height: 24,
-              padding: "0 10px",
-              background: calibrating ? theme.accent : theme.bg.input,
-              color: calibrating ? "#fff" : theme.text.primary,
-              border: `1px solid ${calibrating ? theme.accent : theme.border.divider}`,
-              cursor: "pointer",
-              fontSize: 11,
-            }}
-          >
-            {calibrating ? "Calibrating…" : pageScale ? "Rescale" : "Set Scale"}
-          </button>
-        ) : null}
-        {doc ? (
-          <span style={{ fontSize: 12, color: pageScale ? theme.text.secondary : theme.danger }}>
-            {pageScale ? `Scale: 1 pt = ${pageScale.mm_per_point.toPrecision(4)} mm` : "No scale set"}
-          </span>
-        ) : null}
-        {activeDimensionGroupId !== null ? (
-          <div style={{ display: "flex", border: `1px solid ${theme.border.divider}`, borderRadius: 3, overflow: "hidden" }}>
-            {(["add", "select"] as const).map((mode) => (
-              <button
-                key={mode}
-                onClick={() => setViewerMode(mode)}
-                title={mode === "add" ? "Add dimensions (click to place)" : "Select / edit dimensions (Del to delete, drag vertices to move)"}
-                style={{
-                  height: 24,
-                  padding: "0 10px",
-                  border: "none",
-                  background: viewerMode === mode ? theme.accent : theme.bg.input,
-                  color: viewerMode === mode ? "#fff" : theme.text.secondary,
-                  cursor: "pointer",
-                  fontSize: 11,
-                }}
-              >
-                {mode === "add" ? "Add" : "Select"}
-              </button>
-            ))}
-          </div>
-        ) : null}
-        {activeDimensionGroupId !== null && viewerMode === "add" && !activeIsFraming && !activeIsArray ? (
-          <div style={{ display: "flex", border: `1px solid ${theme.border.divider}`, borderRadius: 3, overflow: "hidden" }}>
-            {([1, -1] as const).map((polarity) => (
-              <button
-                key={polarity}
-                onClick={() => setDrawPolarity(polarity)}
-                title={polarity === 1 ? "Draw positive dimensions (add)" : "Draw negative dimensions (deduct/cutout)"}
-                style={{
-                  height: 24,
-                  padding: "0 10px",
-                  border: "none",
-                  background: drawPolarity === polarity ? (polarity === 1 ? "#1f8f3a" : "#b23030") : theme.bg.input,
-                  color: drawPolarity === polarity ? "#fff" : theme.text.secondary,
-                  cursor: "pointer",
-                  fontSize: 11,
-                }}
-              >
-                {polarity === 1 ? "Positive" : "Negative"}
-              </button>
-            ))}
-          </div>
-        ) : null}
-        {activeIsArray ? (
-          <select
-            value={arrayTrimMode ? arrayTrimType : "off"}
-            onChange={(e) => {
-              const value = e.target.value;
-              if (value === "off") {
-                setArrayTrimMode(false);
-              } else {
-                setArrayTrimType(value as "line" | "box");
-                setArrayTrimMode(true);
-              }
-            }}
-            title="Trim array: draw a cut line or box to clip array members"
-            style={{
-              height: 24,
-              padding: "0 6px",
-              background: arrayTrimMode ? theme.accent : theme.bg.input,
-              color: arrayTrimMode ? "#fff" : theme.text.primary,
-              border: `1px solid ${arrayTrimMode ? theme.accent : theme.border.divider}`,
-              cursor: "pointer",
-              fontSize: 11,
-            }}
-          >
-            <option value="off">Trim</option>
-            <option value="line">Trim: Line</option>
-            <option value="box">Trim: Box</option>
-          </select>
-        ) : null}
-        {activeIsFraming ? (
-          <div style={{ display: "flex", border: `1px solid ${theme.border.divider}`, borderRadius: 3, overflow: "hidden" }}>
-            <button
-              onClick={() => (openingPlacement?.kind === "door" ? setOpeningPlacement(null) : setOpeningDialog(DEFAULT_DOOR))}
-              title="Insert a door: set the opening, then click on a wall to place it"
-              style={{
-                height: 24,
-                padding: "0 10px",
-                border: "none",
-                background: openingPlacement?.kind === "door" ? theme.accent : theme.bg.input,
-                color: openingPlacement?.kind === "door" ? "#fff" : theme.text.primary,
-                cursor: "pointer",
-                fontSize: 11,
-              }}
-            >
-              {openingPlacement?.kind === "door" ? "Placing door…" : "Add Door"}
-            </button>
-            <button
-              onClick={() => (openingPlacement?.kind === "window" ? setOpeningPlacement(null) : setOpeningDialog(DEFAULT_WINDOW))}
-              title="Insert a window: set the opening, then click on a wall to place it"
-              style={{
-                height: 24,
-                padding: "0 10px",
-                border: "none",
-                borderLeft: `1px solid ${theme.border.divider}`,
-                background: openingPlacement?.kind === "window" ? theme.accent : theme.bg.input,
-                color: openingPlacement?.kind === "window" ? "#fff" : theme.text.primary,
-                cursor: "pointer",
-                fontSize: 11,
-              }}
-            >
-              {openingPlacement?.kind === "window" ? "Placing window…" : "Add Window"}
-            </button>
-          </div>
-        ) : null}
-        {activeIsFraming ? (
-          <button
-            onClick={() => setShowBreakdown((v) => !v)}
-            title="Show the framing quantity makeup (studs, plates, dwangs)"
-            style={{
-              height: 24,
-              padding: "0 10px",
-              background: showBreakdown ? theme.accent : theme.bg.input,
-              color: showBreakdown ? "#fff" : theme.text.primary,
-              border: `1px solid ${showBreakdown ? theme.accent : theme.border.divider}`,
-              cursor: "pointer",
-              fontSize: 11,
-            }}
-          >
-            Breakdown
-          </button>
-        ) : null}
-        <span style={{ fontSize: 12 }}>{status}</span>
-        {doc ? (
-          <span style={{ fontSize: 12 }}>
-            Page {pageIndex + 1} of {doc.page_count}
-          </span>
-        ) : null}
-      </div>
       <div style={{ flex: 1, minHeight: 0, position: "relative", display: "flex", flexDirection: "column" }}>
         {view3d ? (
           view3dMulti && multiPage3DConfig ? (
@@ -480,31 +293,16 @@ export function Viewer() {
             </div>
           )
         ) : (
-          <>
-            <ViewerCanvas
-              doc={doc}
-              pageIndex={pageIndex}
-              onStatusChange={handleStatusChange}
-              overlayMeasurements={overlayMeasurements}
-              overlayColour={overlayColour}
-              groupColours={groupColours}
-            />
-            {showBreakdown && activeIsFraming ? <FramingBreakdownPanel onClose={() => setShowBreakdown(false)} /> : null}
-          </>
+          <ViewerCanvas
+            doc={doc}
+            pageIndex={pageIndex}
+            onStatusChange={handleStatusChange}
+            overlayMeasurements={overlayMeasurements}
+            overlayColour={overlayColour}
+            groupColours={groupColours}
+          />
         )}
       </div>
-      {openingDialog ? (
-        <OpeningDialog
-          title={openingDialog.kind === "window" ? "Add Window" : "Add Door"}
-          initial={openingDialog}
-          confirmLabel={openingDialog.kind === "window" ? "Place Window" : "Place Door"}
-          onCancel={() => setOpeningDialog(null)}
-          onConfirm={(template) => {
-            setOpeningPlacement(template);
-            setOpeningDialog(null);
-          }}
-        />
-      ) : null}
     </div>
   );
 }

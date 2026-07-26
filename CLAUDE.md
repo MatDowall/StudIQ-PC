@@ -101,7 +101,11 @@ rendering. See `docs/phase3-completion-report.md`.
 CostX interaction model (authoritative — see `docs/phase3-plan.md`): add-mode is active while a
 group is selected (no tool button); draw is **click-to-place** (right-click/Enter/double-click
 to finish, Ctrl+click resumes from the last point, **middle-drag pans**); Add/Select toggle and
-Positive/Negative toggle live in the viewer toolbar.
+Positive/Negative toggle live in the ribbon's **Takeoff Items** group (`Ribbon.tsx`), not a
+separate viewer toolbar — there is no toolbar between the canvas and the ribbon any more. Page
+scale calibration ("Set Scale"/"Rescale") is a **Drawing** group ribbon button; the page-scale
+readout, page navigation, and render-status text live in the app-wide footer bar (`Footer.tsx`)
+below the canvas instead.
 
 **Later (not yet built):** weight computation (needs a density/rate model), project-wide GFA
 roll-up, persisting quantities, per-dimension overrides ("Use Default"), costing/reporting,
@@ -300,17 +304,40 @@ Material Symbols Outlined.
 | Rotate Right (Page / Takeoff Item) | `rotate_90_degrees_cw` |
 | Flip Horizontal (Page / Takeoff Item) | `flip` |
 | Flip Vertical (Page / Takeoff Item) | `flip` (rotated 90° via `Icon`'s `rotate` prop) |
+| Set Scale / Rescale (Drawing group) | `straighten` |
+| Add mode (Takeoff Items group) | `edit` |
+| Select mode (Takeoff Items group) | `select` |
+| Positive polarity (Takeoff Items group) | `rectangle_add` |
+| Negative polarity (Takeoff Items group) | `low_density` |
+| Add Door (Takeoff Items group) | `door_front` |
+| Add Window (Takeoff Items group) | `window_closed` |
+| Trim array (Takeoff Items group) | `content_cut` |
 
 ### Ribbon layout rules
 - The ribbon uses `display: flex; align-items: stretch` — group divs fill the full ribbon height.
+  The ribbon scrolls horizontally (`overflow-x: auto; overflow-y: hidden`) once its groups exceed
+  the window width — expected now that the Takeoff Items group holds ~11 buttons — but vertical
+  overflow within a group is still clipped, so the next two rules still matter.
 - Each group div uses `flex-direction: column` with **no** `justify-content: space-between`.
   The group label sits at the bottom via `margin-top: auto` on the label element. Using
   `space-between` when content height ≥ container height causes flex items to overlap and get
-  clipped by the ribbon's `overflow: hidden` — avoid it.
-- Ribbon buttons stack the icon **above** the label text (`flex-direction: column`). Icon size
-  is 32 px; label font-size is 9 px. Button height is 50 px.
+  clipped vertically — avoid it.
+- Ribbon buttons stack the icon **above** the label text (`flex-direction: column`). Icon size is
+  30 px; label font-size is 9 px with an explicit 13 px line-height (not the default/`1`, which
+  clips descenders on labels like "Copy" or "Rotate Right"). Button height is 50 px.
+- Buttons default to flat/borderless (`.ribbon-btn` class in `index.css`) and only pick up a
+  background + border on hover, press, or when toggled on (`is-active` class) — this is the
+  Office/native look; don't go back to a permanently-filled background.
+- Icon glyphs render in `theme.iconAccent` (the logo's blue, `#283891` light / `#7986CB` dark),
+  set via the `disabled` prop on each group's local `Icon` component — not the button's `color`,
+  which still governs the label text.
 - Only add a group to `groups` in `Ribbon.tsx` if it has real wired behaviour. Static
   decorative-only groups were removed.
+- A control that's only meaningful some of the time (e.g. Add Door/Window only for a timber-
+  framing group, Trim only for an array group) stays visible and greys out (`enabled={false}` on
+  `RibbonToolButton`) rather than being hidden — consistent with how Rotate/Flip already behaved
+  before a takeoff item was selected. Use `RibbonToolButton` for any new one-off Takeoff Items
+  button rather than hand-rolling the button markup again.
 
 ### Snap group
 The Snap group contains only the **Geometry** button, which toggles `snapEnabled` in the store.

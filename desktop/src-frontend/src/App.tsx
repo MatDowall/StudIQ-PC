@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { Footer } from "./components/Footer";
 import { LeftColumn } from "./components/LeftColumn";
 import { Ribbon } from "./components/Ribbon";
 import { StartScreen } from "./components/StartScreen";
@@ -78,7 +79,7 @@ export default function App() {
       onPointerCancel={stopDrag}
       style={{
         display: "grid",
-        gridTemplateRows: `${theme.tabHeight}px ${theme.ribbonHeight}px 1fr`,
+        gridTemplateRows: `${theme.tabHeight}px ${theme.ribbonHeight}px 1fr ${theme.footerHeight}px`,
         gridTemplateColumns: `${leftWidth}px 1fr`,
         flex: 1,
         minHeight: 0,
@@ -175,6 +176,9 @@ export default function App() {
           </div>
         )}
       </div>
+
+      {/* Footer — spans full width: page navigation (centred) and page scale (right) */}
+      <Footer />
     </div>
     <UpdateBanner />
     </div>

@@ -21,9 +21,11 @@ export const theme = {
   },
   accent: "var(--color-accent)",
   danger: "var(--color-danger)",
+  iconAccent: "var(--icon-accent)",
   treeIndent:    16,
   rowHeight:     22,
   ribbonHeight:  76,
   tabHeight:     28,
+  footerHeight:  24,
   leftPaneWidth: 380,
 };

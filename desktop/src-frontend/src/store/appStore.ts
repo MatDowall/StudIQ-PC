@@ -311,6 +311,9 @@ interface AppStore {
   // "add" = click to place new dimensions; "select" = pick/edit/delete existing ones.
   viewerMode: ViewerMode;
   selectedMeasurementIds: number[];
+  // Footer status line: page-render progress, draw-in-progress hints, and errors from the canvas.
+  viewerStatus: string;
+  setViewerStatus: (status: string) => void;
   // When set, the viewer is placing a door/window opening: hovering a framing wall shows a ghost
   // that commits onto the wall on click. Overrides add/select while active.
   openingPlacement: OpeningTemplate | null;
@@ -445,6 +448,9 @@ interface AppStore {
   deleteMeasurement: (measurementId: number) => Promise<void>;
   openDrawing: (node: TreeNodeDto) => Promise<void>;
   openDrawingPage: (node: TreeNodeDto) => Promise<void>;
+  /** Navigates to a page index within the currently open document (footer page-nav
+   *  buttons), clamped to the document's page range. No-op without an open document. */
+  goToPage: (pageIndex: number) => Promise<void>;
   loadVectors: (pageIndex: number) => Promise<void>;
   setDrawingType: (type: "point" | "line") => void;
   resolveSnap: (cursorPageX: number, cursorPageY: number, pageIndex: number, radiusPts: number) => void;
@@ -811,6 +817,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
   overlayColour: "#4A9EFF",
   viewerMode: "add",
   selectedMeasurementIds: [],
+  viewerStatus: "",
   openingPlacement: null,
   arrayTrimMode: false,
   arrayTrimType: "line",
@@ -901,6 +908,10 @@ export const useAppStore = create<AppStore>((set, get) => ({
   setViewerMode: (mode) => {
     // Switching mode cancels any in-progress door/window placement.
     set((state) => ({ viewerMode: mode, openingPlacement: null, arrayTrimMode: false, selectedMeasurementIds: mode === "add" ? [] : state.selectedMeasurementIds }));
+  },
+
+  setViewerStatus: (status) => {
+    set({ viewerStatus: status });
   },
 
   setOpeningPlacement: (template) => {
@@ -1552,6 +1563,21 @@ export const useAppStore = create<AppStore>((set, get) => ({
       lineSnapResult: null,
     });
     await get().loadVectors(node.sort_order);
+  },
+
+  goToPage: async (pageIndex) => {
+    const state = get();
+    if (!state.currentDocument) return;
+    const clamped = Math.max(0, Math.min(pageIndex, state.currentDocument.page_count - 1));
+    if (clamped === state.activePageIndex) return;
+    set({
+      activePageIndex: clamped,
+      activePageNodeId: state.activeDrawingId !== null ? drawingPageNodeId(state.activeDrawingId, clamped) : null,
+      snapPoint: null,
+      snapType: null,
+      lineSnapResult: null,
+    });
+    await get().loadVectors(clamped);
   },
 
   loadVectors: async (pageIndex) => {

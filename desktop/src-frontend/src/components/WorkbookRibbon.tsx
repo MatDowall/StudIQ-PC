@@ -36,6 +36,7 @@ function FormatToggleButton({
       title={title}
       disabled={disabled}
       onClick={onClick}
+      className={`ribbon-btn${active ? " is-active" : ""}`}
       style={{
         width: 22,
         height: 20,
@@ -43,15 +44,11 @@ function FormatToggleButton({
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
-        borderRadius: 4,
-        border: `1px solid ${active ? theme.accent : theme.border.divider}`,
-        background: active ? theme.bg.active : theme.bg.input,
-        color: disabled ? theme.text.disabled : theme.text.primary,
         cursor: disabled ? "not-allowed" : "pointer",
         flexShrink: 0,
       }}
     >
-      <span className="material-symbols-outlined" style={{ fontSize: 14, lineHeight: 1 }}>{icon}</span>
+      <span className="material-symbols-outlined" style={{ fontSize: 14, lineHeight: 1, color: disabled ? theme.text.disabled : theme.iconAccent }}>{icon}</span>
     </button>
   );
 }
@@ -108,11 +105,11 @@ function FormatToolbar() {
   );
 }
 
-function Icon({ name, size = 32 }: { name: string; size?: number }) {
+function Icon({ name, size = 32, disabled = false }: { name: string; size?: number; disabled?: boolean }) {
   return (
     <span
       className="material-symbols-outlined"
-      style={{ fontSize: size, lineHeight: 1, userSelect: "none", flexShrink: 0 }}
+      style={{ fontSize: size, lineHeight: 1, userSelect: "none", flexShrink: 0, color: disabled ? theme.text.disabled : theme.iconAccent }}
     >
       {name}
     </span>
@@ -134,27 +131,24 @@ function RibbonButton({
       disabled={disabled}
       title={label}
       onClick={onClick}
+      className="ribbon-btn"
       style={{
         minWidth: 44,
         height: 50,
-        padding: "4px 6px 3px",
+        padding: "4px 6px 2px",
         display: "flex",
         flexDirection: "column",
         alignItems: "center",
         justifyContent: "center",
-        gap: 2,
+        gap: 1,
         overflow: "hidden",
-        borderRadius: 4,
-        border: `1px solid ${theme.border.divider}`,
-        background: theme.bg.input,
-        color: disabled ? theme.text.disabled : theme.text.primary,
         fontSize: 9,
         cursor: disabled ? "not-allowed" : "pointer",
         flexShrink: 0,
       }}
     >
-      {iconName ? <Icon name={iconName} size={32} /> : null}
-      <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", lineHeight: 1 }}>
+      {iconName ? <Icon name={iconName} size={30} disabled={disabled} /> : null}
+      <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", lineHeight: "13px" }}>
         {label}
       </span>
     </button>

@@ -42,11 +42,48 @@ body {
   --color-accent: #4A9EFF;
   --color-danger: #F44747;
 
+  /* Logo blue (#283891), lightened for legibility against the dark ribbon. */
+  --icon-accent: #7986CB;
+
   /* Background of the PDF canvas area (the region surrounding PDF pages). */
   --bg-canvas: #15171a;
 
   /* Semi-transparent surface highlight used for hover overlays on dark backgrounds. */
   --hover-overlay: rgba(255, 255, 255, 0.09);
+}
+
+/* ── Ribbon buttons ───────────────────────────────────────────────────────────
+   Office/native-style: flat (no fill, no border) at rest — background and
+   border only appear on hover/press, so idle buttons read as part of the
+   ribbon surface rather than as separate web-style boxes. */
+.ribbon-btn {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  color: var(--text-primary);
+  transition: background-color 0.05s ease-out, border-color 0.05s ease-out;
+}
+.ribbon-btn:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: var(--border-divider);
+}
+.ribbon-btn:active:not(:disabled) {
+  background: var(--bg-active);
+  border-color: var(--color-accent);
+}
+.ribbon-btn.is-active {
+  background: var(--bg-active);
+  border-color: var(--color-accent);
+}
+.ribbon-btn:disabled {
+  color: var(--text-disabled);
+}
+
+.ribbon-menu-item {
+  background: transparent;
+}
+.ribbon-menu-item:hover {
+  background: var(--bg-hover);
 }
 
 [data-theme="light"] {
@@ -69,6 +106,9 @@ body {
 
   --color-accent: #0066CC;
   --color-danger: #D32F2F;
+
+  /* Logo blue — matches the app icon's "IQ" mark exactly. */
+  --icon-accent: #283891;
 
   --bg-canvas: #D0D5DE;
 
