@@ -95,7 +95,7 @@ export function Viewer() {
         const meta = parseArrayMeta(mz.framing_json ?? null);
         const joistRafter = parseJoistRafterSettings(props?.framing_props_json ?? null);
         members.push(
-          ...computeArrayMembers3D(pts, mmpp, meta, joistRafter.framingSize, {
+          ...computeArrayMembers3D(pts, mmpp, meta, joistRafter, {
             offsetM,
             color,
             pitchAngleDeg: props?.pitch_angle_deg ?? 0,
@@ -159,7 +159,7 @@ export function Viewer() {
               const meta = parseArrayMeta(mz.framing_json ?? null);
               const joistRafter = parseJoistRafterSettings(g.framingPropsJson);
               members.push(
-                ...computeArrayMembers3D(pts, p.mmPerPoint, meta, joistRafter.framingSize, {
+                ...computeArrayMembers3D(pts, p.mmPerPoint, meta, joistRafter, {
                   offsetM: g.defaultOffsetM,
                   color,
                   pitchAngleDeg: g.pitchAngleDeg,

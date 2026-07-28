@@ -10,8 +10,17 @@ import { DimensionGroupCopyDialog } from "./DimensionGroupCopyDialog";
 import { DimensionGroupDialog } from "./DimensionGroupDialog";
 import { DimensionGroupPropertiesDialog } from "./DimensionGroupPropertiesDialog";
 import { TextInputDialog } from "./TextInputDialog";
-import { groupNetQuantity, quantityValueText, MEASUREMENT_TYPE_ICONS, type PagePoint, type Quantity } from "../lib/quantity";
-import { aggregateFramingGroup, parseFramingSettings, parseWallFraming, type FramingGroupBreakdown, type FramingWallInput } from "../lib/framing";
+import { groupNetQuantity, parseArrayMeta, quantityValueText, MEASUREMENT_TYPE_ICONS, type PagePoint, type Quantity } from "../lib/quantity";
+import {
+  aggregateArrayGroup,
+  aggregateFramingGroup,
+  parseFramingSettings,
+  parseJoistRafterSettings,
+  parseWallFraming,
+  type ArrayInput,
+  type FramingGroupBreakdown,
+  type FramingWallInput,
+} from "../lib/framing";
 import { RateLibraryPane } from "./RateLibraryPane";
 
 const tabs = ["Dimension Groups", "Rate Library"] as const;
@@ -32,6 +41,24 @@ function summaryForNode(node: TreeNodeDto, total: Quantity | null | undefined) {
   if (node.node_type !== "dimension_group" || !total) return { quantity: "", uom: "" };
   return { quantity: quantityValueText(total), uom: total.uom };
 }
+
+/** A read-only itemised child row shown beneath a loaded dimension group. `components` roll into
+ *  the group's own quantity; `overrides` are separate sub-quantities of a different timber size
+ *  (a framing group's lintels, a joist/rafter group's differently-sized blocking) and are styled
+ *  distinctly because each becomes its own worksheet line item. */
+interface BreakdownRow {
+  key: string;
+  label: string;
+  total: number;
+}
+
+export interface GroupBreakdownRows {
+  components: BreakdownRow[];
+  overrides: BreakdownRow[];
+}
+
+const sizeLabel = (size: string) => size.replace("x", " × ");
+const countSuffix = (count: number) => (Math.abs(count) > 1 ? ` (${Math.abs(Math.round(count))})` : "");
 
 function DimensionNodeIcon({ node, measurementType }: { node: TreeNodeDto; measurementType?: string }) {
   if (node.node_type === "folder") {
@@ -99,7 +126,7 @@ function DimensionTreeRow({
   activeNodeId,
   selectedGroupIds,
   groupTotals,
-  groupFramingBreakdowns,
+  groupBreakdownRows,
   groupProps,
   onNodeClick,
   onContextMenu,
@@ -109,7 +136,7 @@ function DimensionTreeRow({
   activeNodeId: number | null;
   selectedGroupIds: number[];
   groupTotals: Record<number, Quantity | null>;
-  groupFramingBreakdowns: Record<number, FramingGroupBreakdown>;
+  groupBreakdownRows: Record<number, GroupBreakdownRows>;
   groupProps: Record<number, DimensionGroupPropsDto>;
   onNodeClick: (node: TreeNodeDto, event: MouseEvent) => void;
   onContextMenu: (event: MouseEvent, node: TreeNodeDto) => void;
@@ -129,28 +156,12 @@ function DimensionTreeRow({
   // "Framing - 90 × 45". Sourced from the node itself so it shows whether or not the group is
   // selected/loaded.
   const displayName = node.framing_size ? `${node.name} - ${node.framing_size.replace("x", " × ")}` : node.name;
-  // Itemised framing components shown as read-only child rows beneath a loaded framing group.
-  // Lintels (always sizeOverride) are split into separate sub-quantity rows below the main build-up.
-  const framingBreakdown = node.node_type === "dimension_group" ? groupFramingBreakdowns[node.id] : undefined;
-  const framingComponentRows = framingBreakdown
-    ? framingBreakdown.components
-        .filter((c) => !c.sizeOverride)
-        .map((c) => ({
-          key: c.kind,
-          label: c.count > 1 ? `${c.label} (${c.count})` : c.label,
-          total: c.totalM,
-        }))
-    : [];
-  // Lintels — always separate rows, each showing their size (e.g. "Lintels - 90 × 45").
-  const framingOverrideRows = framingBreakdown
-    ? framingBreakdown.components
-        .filter((c) => !!c.sizeOverride)
-        .map((c) => ({
-          key: c.kind + c.sizeOverride,
-          label: c.count > 1 ? `${c.label} (${c.count})` : c.label,
-          total: c.totalM,
-        }))
-    : [];
+  // Itemised component child rows beneath a loaded group (framing build-up; joist/rafter members +
+  // blocking). Rows of a different timber size — framing lintels, differently-sized blocking — are
+  // split out as separate sub-quantity rows below the main build-up.
+  const breakdownRows = node.node_type === "dimension_group" ? groupBreakdownRows[node.id] : undefined;
+  const framingComponentRows = breakdownRows?.components ?? [];
+  const framingOverrideRows = breakdownRows?.overrides ?? [];
 
   useEffect(() => {
     if (!canExpand && expanded) {
@@ -309,7 +320,7 @@ function DimensionTreeRow({
               activeNodeId={activeNodeId}
               selectedGroupIds={selectedGroupIds}
               groupTotals={groupTotals}
-              groupFramingBreakdowns={groupFramingBreakdowns}
+              groupBreakdownRows={groupBreakdownRows}
               groupProps={groupProps}
               onNodeClick={onNodeClick}
               onContextMenu={onContextMenu}
@@ -408,8 +419,54 @@ export function DimensionGroupPane() {
     return out;
   }, [groupProps, framingWallsForGroup]);
 
-  // Live per-group totals. Framing groups roll up total lineal metres of timber; the others use
-  // the standard CostX net quantity.
+  const arraysForGroup = useCallback(
+    (groupId: number): ArrayInput[] => {
+      const arrays: ArrayInput[] = [];
+      for (const measurement of overlayMeasurements) {
+        if (measurement.dimension_group_id !== groupId) continue;
+        let points: PagePoint[];
+        try {
+          points = JSON.parse(measurement.geometry_json);
+        } catch {
+          continue;
+        }
+        if (!Array.isArray(points)) continue;
+        arrays.push({
+          id: measurement.id,
+          points,
+          mmPerPoint: scaleFor(measurement.drawing_id, measurement.page_index),
+          meta: parseArrayMeta(measurement.framing_json ?? null),
+          polarity: measurement.polarity ?? 1,
+        });
+      }
+      return arrays;
+    },
+    [overlayMeasurements, scaleFor],
+  );
+
+  // Member + blocking makeup for the loaded Joist/Rafter groups. Only built when the group
+  // actually has blocking switched on — without it an array group's quantity is exactly what
+  // `groupNetQuantity`/`deriveQuantity` already derive, and there's nothing to itemise.
+  const groupArrayBreakdowns = useMemo(() => {
+    const out: Record<number, ReturnType<typeof aggregateArrayGroup>> = {};
+    for (const idText of Object.keys(groupProps)) {
+      const id = Number(idText);
+      const props = groupProps[id];
+      if (props?.measurement_type !== "array") continue;
+      const settings = parseJoistRafterSettings(props.framing_props_json);
+      if (!settings.blockingOn) continue;
+      out[id] = aggregateArrayGroup(arraysForGroup(id), settings, {
+        pitchAngleDeg: props.pitch_angle_deg ?? 0,
+        multiplier: props.default_multiplier ?? 1,
+      });
+    }
+    return out;
+  }, [groupProps, arraysForGroup]);
+
+  // Live per-group totals. Framing groups roll up total lineal metres of timber, as do Joist/Rafter
+  // groups with blocking (members + same-size blocking); the others use the standard CostX net
+  // quantity. A Joist/Rafter group displaying as Count keeps its member count — blocking is lineal
+  // timber and never changes how many joists were drawn.
   const groupTotals = useMemo(() => {
     const totals: Record<number, Quantity | null> = {};
     for (const idText of Object.keys(groupProps)) {
@@ -419,11 +476,54 @@ export function DimensionGroupPane() {
         totals[id] = breakdown && breakdown.matchingTotalM > 0 ? { value: breakdown.matchingTotalM, uom: "m" } : null;
         continue;
       }
+      const arrayBreakdown = groupProps[id]?.default_display === "length" ? groupArrayBreakdowns[id] : undefined;
+      if (arrayBreakdown) {
+        totals[id] = Math.abs(arrayBreakdown.matchingTotalM) > 1e-9 ? { value: arrayBreakdown.matchingTotalM, uom: "m" } : null;
+        continue;
+      }
       const measurements = overlayMeasurements.filter((measurement) => measurement.dimension_group_id === id);
       totals[id] = groupNetQuantity(measurements, groupProps[id], scaleFor);
     }
     return totals;
-  }, [groupProps, groupFramingBreakdowns, overlayMeasurements, scaleFor]);
+  }, [groupProps, groupFramingBreakdowns, groupArrayBreakdowns, overlayMeasurements, scaleFor]);
+
+  // Itemised child rows for the tree: the framing build-up, or a Joist/Rafter group's members +
+  // blocking. Blocking of a different timber size lands in `overrides` (the accent-styled rows),
+  // exactly like a framing lintel whose size differs from its group.
+  const groupBreakdownRows = useMemo(() => {
+    const out: Record<number, GroupBreakdownRows> = {};
+    for (const idText of Object.keys(groupProps)) {
+      const id = Number(idText);
+      const framing = groupFramingBreakdowns[id];
+      if (framing) {
+        out[id] = {
+          components: framing.components
+            .filter((c) => !c.sizeOverride)
+            .map((c) => ({ key: c.kind, label: c.count > 1 ? `${c.label} (${c.count})` : c.label, total: c.totalM })),
+          overrides: framing.components
+            .filter((c) => !!c.sizeOverride)
+            .map((c) => ({ key: c.kind + c.sizeOverride, label: c.count > 1 ? `${c.label} (${c.count})` : c.label, total: c.totalM })),
+        };
+        continue;
+      }
+      const array = groupArrayBreakdowns[id];
+      if (!array?.blockingSize) continue;
+      // Same label shape as the framing build-up: "<kind>[ - <size>][ (<count>)]".
+      const blockingLabel = array.blockingMatchesSize
+        ? `Blocking${countSuffix(array.blockingCount)}`
+        : `Blocking - ${sizeLabel(array.blockingSize)}${countSuffix(array.blockingCount)}`;
+      out[id] = {
+        components: [
+          { key: "members", label: "Joists / Rafters", total: array.memberTotalM },
+          ...(array.blockingMatchesSize ? [{ key: "blocking", label: blockingLabel, total: array.blockingTotalM }] : []),
+        ],
+        overrides: array.blockingMatchesSize
+          ? []
+          : [{ key: `blocking-${array.blockingSize}`, label: blockingLabel, total: array.blockingTotalM }],
+      };
+    }
+    return out;
+  }, [groupProps, groupFramingBreakdowns, groupArrayBreakdowns]);
 
   useEffect(() => {
     let cancelled = false;
@@ -729,7 +829,7 @@ export function DimensionGroupPane() {
             activeNodeId={activeNodeId}
             selectedGroupIds={selectedGroupIds}
             groupTotals={groupTotals}
-            groupFramingBreakdowns={groupFramingBreakdowns}
+            groupBreakdownRows={groupBreakdownRows}
             groupProps={groupProps}
             onNodeClick={handleNodeClick}
             onContextMenu={handleContextMenu}

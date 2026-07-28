@@ -295,8 +295,10 @@ export function absArrayTrims(trims: ArrayTrim[], origin: PagePoint): ArrayTrim[
   });
 }
 
-/** Total post-trim length of all array members in PDF points. */
-function arrayTrimmedLengthPts(p1: PagePoint, p2: PagePoint, meta: ArrayMeta): number {
+/** Total post-trim length of all array members in PDF points. Exported so the Joist/Rafter group
+ *  aggregation (lib/framing.ts) derives the member run through exactly this code path rather than
+ *  re-deriving it — blocking is added on top of it, so the two must never drift. */
+export function arrayTrimmedLengthPts(p1: PagePoint, p2: PagePoint, meta: ArrayMeta): number {
   const dx = p2.x - p1.x;
   const dy = p2.y - p1.y;
   const len = Math.hypot(dx, dy);

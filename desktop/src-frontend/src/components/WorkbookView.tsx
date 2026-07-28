@@ -20,7 +20,7 @@ import { TextInputDialog } from "./TextInputDialog";
 import { NamedCellsManagerDialog, type NamedCellEntry } from "./NamedCellsManagerDialog";
 import { ImportDimensionDialog, type ImportDisplayOption } from "./ImportDimensionDialog";
 import { quantityValueText, type Quantity } from "../lib/quantity";
-import type { FramingGroupBreakdown } from "../lib/framing";
+import type { ArrayGroupBreakdown, FramingGroupBreakdown } from "../lib/framing";
 import {
   loadGroupImportContext,
   buildImportOptions,
@@ -230,6 +230,17 @@ interface CellLink {
    *  that specific lintel size's live total rather than the group's matchingTotalM, so
    *  refreshLinkedCells keeps it in step with the group (see reconcileFramingLintels). */
   lintelSize?: string;
+  /** The joist/rafter analogue of `lintelSize`: set only on the auto-inserted
+   *  "<size> Blocking" row for blocking whose timber size differs from its group's, and
+   *  tracks that blocking's live total rather than the group's own quantity
+   *  (see reconcileArrayBlocking). */
+  blockingSize?: string;
+}
+
+/** True for a link that tracks one differently-sized sub-quantity of its group (a framing lintel
+ *  size, a joist/rafter blocking size) rather than the group's own headline quantity. */
+function isSubQuantityLink(link: CellLink): boolean {
+  return link.lintelSize != null || link.blockingSize != null;
 }
 
 // ─── Named cells (Excel-style "New Named Cell") ───────────────────────────────
@@ -462,6 +473,27 @@ function liveLintelTotal(breakdown: FramingGroupBreakdown | null, size: string):
   if (!breakdown) return null;
   const c = breakdown.components.find(x => x.sizeOverride === size);
   return c ? c.totalM : null;
+}
+
+/** Canonical line-item description for a joist/rafter group's blocking of a timber size that
+ *  differs from the group's own — the array analogue of `lintelRowDesc`. Shared by the drop
+ *  (`populateArrayRollup`) and the live re-sync (`reconcileArrayBlocking`) so a blocking row is
+ *  always matched/backfilled by the exact text it was written with. */
+function blockingRowDesc(size: string): string {
+  return `${size} Blocking`;
+}
+
+/** Matches a blocking line-item description, capturing the timber size (group 1).
+ *  Mirrors `blockingRowDesc` — keep the two in sync. */
+const BLOCKING_DESC_RE = /^(.+?) Blocking$/;
+
+/** The current lineal-metre total for one blocking size within a joist/rafter breakdown, or `null`
+ *  if the group no longer carries blocking of that size (its row's quantity should then go to 0).
+ *  Only ever differing-size blocking gets a row — same-size blocking rolls into the group's own
+ *  `matchingTotalM` (see CLAUDE.md), so it must never resolve here. */
+function liveBlockingTotal(breakdown: ArrayGroupBreakdown | null, size: string): number | null {
+  if (!breakdown || breakdown.blockingMatchesSize || breakdown.blockingSize !== size) return null;
+  return breakdown.blockingTotalM;
 }
 
 /** Builds the Quantity Build-up sheet for a framing group's non-lintel component
@@ -1434,6 +1466,9 @@ export function WorkbookView() {
   // and the "Show dimension group" context menu for already-linked cells.
   const [importPrompt, setImportPrompt] = useState<{
     row: number; groupId: number; groupName: string; options: ImportDisplayOption[]; defaultKey: string;
+    /** Carried through the dialog so a Joist/Rafter group's differently-sized blocking row is only
+     *  inserted once the user actually confirms the import (cancelling must leave nothing behind). */
+    blocking?: ArrayGroupBreakdown | null;
   } | null>(null);
   const [gridContextMenu, setGridContextMenu] = useState<{
     x: number; y: number; items: ContextMenuEntry[];
@@ -1782,10 +1817,12 @@ export function WorkbookView() {
       const hot = hotRef.current?.hotInstance;
       if (!hot) continue;
 
-      // Lintel line-item row: track its own size's live total (0 if that size is gone
-      // from the group), never the group's matchingTotalM.
-      if (link.lintelSize != null) {
-        const total = liveLintelTotal(ctx.framingBreakdown, link.lintelSize);
+      // Differently-sized sub-quantity row (framing lintel / joist-rafter blocking): track its own
+      // size's live total (0 if that size is gone from the group), never the group's own quantity.
+      if (isSubQuantityLink(link)) {
+        const total = link.lintelSize != null
+          ? liveLintelTotal(ctx.framingBreakdown, link.lintelSize)
+          : liveBlockingTotal(ctx.arrayBreakdown, link.blockingSize!);
         const text = total != null ? total.toFixed(3) : "0";
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         if (String((hot as any).getSourceDataAtCell(row, COL_QTY) ?? "") !== text) {
@@ -1821,6 +1858,11 @@ export function WorkbookView() {
         }
         reconcileFramingLintels(hot, path, row, link.groupId, ctx.framingBreakdown);
       }
+
+      // Same, for a joist/rafter group's differently-sized blocking row.
+      if (ctx.props.measurement_type === "array" && ctx.arrayBreakdown) {
+        reconcileArrayBlocking(hot, path, row, link.groupId, ctx.arrayBreakdown);
+      }
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -1828,7 +1870,7 @@ export function WorkbookView() {
   /** Backfills lintel-row cell links onto legacy (pre-link) framing rows and refreshes
    *  each lintel row's quantity in place from the live breakdown. Scans the contiguous
    *  block of "<size> Lintel to last" rows immediately below the group's row — the shape
-   *  `insertLintelRowsBelow` creates — so each lintel row is attributed to THIS group even
+   *  `populateFramingRollup` creates — so each lintel row is attributed to THIS group even
    *  when several framing groups share a sheet. Only cell values / links change (never row
    *  structure), so it is safe to run on every display. A vanished size drives its row's
    *  quantity to 0; a NEW size with no existing row is not auto-inserted (that needs a
@@ -1873,6 +1915,53 @@ export function WorkbookView() {
     }
   }
 
+  /** The joist/rafter analogue of `reconcileFramingLintels`: backfills the blocking-row cell link
+   *  onto a legacy (pre-link) row and refreshes its quantity in place from the live breakdown.
+   *  Scans the contiguous block of "<size> Blocking" rows immediately below the group's row — the
+   *  shape `populateArrayRollup` creates — so the row is attributed to THIS group even when
+   *  several groups share a sheet. Only cell values / links change (never row structure), so it is
+   *  safe to run on every display. Blocking that has since been switched off, or changed to the
+   *  group's own timber size (and so folded into the group's quantity), drives the row to 0; a
+   *  newly-differing size with no existing row is not auto-inserted — that needs a re-drop, which
+   *  also lets the user price it. */
+  function reconcileArrayBlocking(
+    hot: Handsontable,
+    path: string,
+    groupRow: number,
+    groupId: number,
+    breakdown: ArrayGroupBreakdown,
+  ): void {
+    let attachedLink = false;
+    for (let r = groupRow + 1; r < NUM_ROWS; r++) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const desc = String((hot as any).getSourceDataAtCell(r, COL_DESC) ?? "");
+      const m = BLOCKING_DESC_RE.exec(desc);
+      if (!m) break; // end of the contiguous blocking block
+      const size = m[1];
+
+      const existingLink = getCellLink(path, r, COL_QTY);
+      // A row linked to a different group (or to a non-blocking meaning) ends this group's
+      // contiguous block — never touch someone else's row.
+      if (existingLink && (existingLink.groupId !== groupId || existingLink.blockingSize == null)) break;
+      if (!existingLink) {
+        setCellLink(path, r, COL_QTY, { groupId, display: "length", blockingSize: size });
+        setCellExcluded(path, r, COL_QTY, true);
+        attachedLink = true;
+      }
+
+      const total = liveBlockingTotal(breakdown, size);
+      const text = total != null ? total.toFixed(3) : "0";
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      if (String((hot as any).getSourceDataAtCell(r, COL_QTY) ?? "") !== text) {
+        hot.setDataAtCell(r, COL_QTY, text);
+      }
+    }
+    if (attachedLink) {
+      const revId = revIdRef.current;
+      if (revId != null) persistSheet(revId, path, sheetDataMap.current.get(path) ?? captureSourceData(hot));
+    }
+  }
+
   /** Ensures a freshly-displayed sheet's links are loaded and its linked cells reflect
    *  the latest dimension-group quantities. Call right after `loadLevelData`. */
   function syncSheetLinks(path: string) {
@@ -1906,7 +1995,7 @@ export function WorkbookView() {
 
   /** Shifts every (row,col)-keyed entry in a cell-link/cell-style map whose row lies in
    *  `[fromRow, toRowExclusive)` down by `by` rows — keeps links/styles attached to their
-   *  line items when `insertLintelRowsBelow` has to displace existing rows. Processes from
+   *  line items when `insertSubQuantityRowsBelow` has to displace existing rows. Processes from
    *  the bottom up so a row's incoming entry can never clobber one not yet moved. Entries
    *  that would land past the bottom of the fixed `NUM_ROWS` grid are dropped. */
   function shiftRowKeyedEntries<T>(
@@ -2059,19 +2148,19 @@ export function WorkbookView() {
     deriveLevelFormulas(hot, levelRef.current, isAutoUpdatingRef, "standard", cellExclusionMap.current.get(path));
   }
 
-  /** Inserts plain `Description`/`Quantity`/`Unit` line items directly below `afterRow` on
-   *  the current (Level 2) sheet — used for the framing group's "<size> Lintel to last" rows.
-   *  Lintels are always independent line items (never folded into the Quantity Build-up),
-   *  placed as plain takeoff-level values since there's nothing to drill into.
+  /** Inserts plain `Description`/`Quantity`/`Unit` line items directly below `afterRow` on the
+   *  current (Level 2) sheet — the framing group's "<size> Lintel to last" rows and a joist/rafter
+   *  group's "<size> Blocking" row. A differently-sized sub-quantity is always an independent line
+   *  item (never folded into the Quantity Build-up), placed as a plain takeoff-level value since
+   *  there's nothing to drill into.
    *
    *  If existing line items already occupy the rows directly below, shifts them down first
    *  (formula-safely — see `shiftStandardRowsDown`) rather than overwriting them. */
-  function insertLintelRowsBelow(
+  function insertSubQuantityRowsBelow(
     hot: Handsontable,
     path: string,
     afterRow: number,
-    groupId: number,
-    items: Array<{ desc: string; qty: string; size: string }>,
+    items: Array<{ desc: string; qty: string; link: CellLink }>,
   ): void {
     const count = items.length;
     if (count === 0) return;
@@ -2091,13 +2180,14 @@ export function WorkbookView() {
       hot.setDataAtCell(r, COL_DESC, items[i].desc);
       hot.setDataAtCell(r, COL_QTY, items[i].qty);
       hot.setDataAtCell(r, COL_UNIT, "m");
-      // Prevent accidental drill-down into C:Quantity for auto-generated lintel rows —
-      // the quantity is a flat total (nothing to build up), and drilling would create a
-      // sub-sheet whose rollup would overwrite the placed value on drill-up.
+      // Prevent accidental drill-down into C:Quantity for these auto-generated rows — the
+      // quantity is a flat total (nothing to build up), and drilling would create a sub-sheet
+      // whose rollup would overwrite the placed value on drill-up.
       setCellExcluded(path, r, COL_QTY, true);
-      // Link the row to its lintel size so refreshLinkedCells keeps its quantity live
-      // with the group (see reconcileFramingLintels) instead of freezing at drop time.
-      setCellLink(path, r, COL_QTY, { groupId, display: "length", lintelSize: items[i].size });
+      // Link the row to its own timber size so refreshLinkedCells keeps its quantity live with
+      // the group (see reconcileFramingLintels / reconcileArrayBlocking) instead of freezing at
+      // drop time.
+      setCellLink(path, r, COL_QTY, items[i].link);
     }
     hot.render();
     scheduleSaveRef.current();
@@ -2132,10 +2222,27 @@ export function WorkbookView() {
       const items = lintels.map(c => ({
         desc: `${lintelRowDesc(c.sizeOverride!)}`,
         qty: c.totalM.toFixed(3),
-        size: c.sizeOverride!,
+        link: { groupId, display: "length", lintelSize: c.sizeOverride! },
       }));
-      insertLintelRowsBelow(hot, path, row, groupId, items);
+      insertSubQuantityRowsBelow(hot, path, row, items);
     }
+  }
+
+  /** On dropping a Joist/Rafter group: inserts a plain "<size> Blocking" line item directly below
+   *  the group's row when the group's blocking is a *different* timber size from its joists —
+   *  the array analogue of the framing group's lintel rows, and for the same reason (CLAUDE.md's
+   *  one-quantity-per-timber-size model). Same-size blocking needs no row: it is already inside
+   *  the group's own imported quantity (`matchingTotalM`). */
+  function populateArrayRollup(row: number, groupId: number, breakdown: ArrayGroupBreakdown): void {
+    const hot = hotRef.current?.hotInstance;
+    if (!hot) return;
+    if (!breakdown.blockingSize || breakdown.blockingMatchesSize) return;
+    if (Math.abs(breakdown.blockingTotalM) <= 1e-9) return;
+    insertSubQuantityRowsBelow(hot, curSheetPath(), row, [{
+      desc: blockingRowDesc(breakdown.blockingSize),
+      qty: breakdown.blockingTotalM.toFixed(3),
+      link: { groupId, display: "length", blockingSize: breakdown.blockingSize },
+    }]);
   }
 
   /** Drop handler entry point: loads the dropped group's current quantity options and
@@ -2159,12 +2266,17 @@ export function WorkbookView() {
 
     const options = buildImportOptions(ctx);
     if (options.length === 0) return;
+    // A Joist/Rafter group's differently-sized blocking gets its own line item whichever display
+    // the group itself is imported as — it is a separate quantity of a separate timber, not a
+    // different reading of the same geometry.
+    const blocking = ctx.arrayBreakdown && !ctx.arrayBreakdown.blockingMatchesSize ? ctx.arrayBreakdown : null;
     if (options.length === 1) {
       applyImport(row, groupId, options[0].key, options[0].quantity);
+      if (blocking) populateArrayRollup(row, groupId, blocking);
       return;
     }
     const defaultKey = options.some(o => o.key === ctx.props.default_display) ? ctx.props.default_display : options[0].key;
-    setImportPrompt({ row, groupId, groupName, options, defaultKey });
+    setImportPrompt({ row, groupId, groupName, options, defaultKey, blocking });
   }
 
   function handleGridDragOver(event: React.DragEvent<HTMLDivElement>) {
@@ -5091,6 +5203,7 @@ export function WorkbookView() {
           onCancel={() => setImportPrompt(null)}
           onConfirm={(option) => {
             applyImport(importPrompt.row, importPrompt.groupId, option.key, option.quantity);
+            if (importPrompt.blocking) populateArrayRollup(importPrompt.row, importPrompt.groupId, importPrompt.blocking);
             setImportPrompt(null);
           }}
         />

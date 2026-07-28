@@ -6,7 +6,7 @@
 // the project convention) so it renders through `pageToScreen` like every other overlay.
 // See docs/framing/00-plan.md.
 
-import type { PagePoint } from "./quantity";
+import { absArrayTrims, applyArrayTrims, arrayTrimmedLengthPts, type ArrayMeta, type PagePoint } from "./quantity";
 
 /** Selectable framing sizes "D x T" (mm): D = stud depth (= plate/wall thickness in plan),
  *  T = stud thickness (face width along the wall). */
@@ -68,16 +68,42 @@ export function serializeFramingSettings(settings: FramingSettings): string {
  *  query (`json_extract(framing_props_json, '$.framingSize')`) works for both types uniformly. */
 export interface JoistRafterSettings {
   framingSize: FramingSize;
+  /** Blocking (dwanging) between adjacent joists/rafters — off by default. */
+  blockingOn: boolean;
+  /** Centre-to-centre spacing of blocking rows, measured ALONG the joist/rafter (i.e. down the
+   *  slope when the group carries a pitch). Same concept as Timber Framing's dwang centres. */
+  blockingCentresMm: number;
+  /** Blocking timber size. When it equals `framingSize` the blocking rolls into the group's own
+   *  quantity; when it differs it becomes a separate child quantity (the same rule Timber Framing
+   *  applies to lintels — see CLAUDE.md's framing multi-size model). */
+  blockingSize: FramingSize;
 }
 
-export const DEFAULT_JOIST_RAFTER_SETTINGS: JoistRafterSettings = { framingSize: "90x45" };
+export const DEFAULT_JOIST_RAFTER_SETTINGS: JoistRafterSettings = {
+  framingSize: "90x45",
+  blockingOn: false,
+  blockingCentresMm: 1200,
+  blockingSize: "90x45",
+};
+
+function asFramingSize(value: unknown, fallback: FramingSize): FramingSize {
+  return (FRAMING_SIZES as readonly string[]).includes(typeof value === "string" ? value : "") ? (value as FramingSize) : fallback;
+}
 
 export function parseJoistRafterSettings(json: string | null | undefined): JoistRafterSettings {
   if (!json) return { ...DEFAULT_JOIST_RAFTER_SETTINGS };
   try {
     const parsed = JSON.parse(json) as Partial<JoistRafterSettings>;
-    const size = parsed.framingSize;
-    return { framingSize: (FRAMING_SIZES as readonly string[]).includes(size ?? "") ? (size as FramingSize) : DEFAULT_JOIST_RAFTER_SETTINGS.framingSize };
+    const framingSize = asFramingSize(parsed.framingSize, DEFAULT_JOIST_RAFTER_SETTINGS.framingSize);
+    const centres = parsed.blockingCentresMm;
+    return {
+      framingSize,
+      blockingOn: parsed.blockingOn === true,
+      blockingCentresMm: typeof centres === "number" && Number.isFinite(centres) && centres > 0 ? centres : DEFAULT_JOIST_RAFTER_SETTINGS.blockingCentresMm,
+      // A group saved before blocking existed has no blockingSize — default it to the group's own
+      // timber size, the case that rolls into the parent quantity rather than splitting it out.
+      blockingSize: asFramingSize(parsed.blockingSize, framingSize),
+    };
   } catch {
     return { ...DEFAULT_JOIST_RAFTER_SETTINGS };
   }
@@ -1644,6 +1670,240 @@ export function aggregateFramingGroup(
     if (!acc.sizeOverride) matchingTotalM += acc.totalM;
   }
   return { perWall, components, matchingTotalM, totalM };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Joist/Rafter blocking (dwanging). Rows of solid blocking run across each bay between adjacent
+// joists/rafters — the array's equivalent of Timber Framing's dwangs, and set out the same way
+// (fixed centres, a row only where it fits). Geometry is produced in PDF points (Y-up) so it
+// renders through `pageToScreen` like every other overlay; lengths are true (level) metres.
+// ---------------------------------------------------------------------------------------------
+
+/** One piece of blocking spanning a single bay. `a`/`b` are the centreline endpoints in PDF
+ *  points (Y-up), running face-to-face across the bay. `runPts` is the plan arc-length of the
+ *  piece's centre along the joist run from the array baseline's first point — what the 3D builder
+ *  turns into a height rise under pitch. `lengthM` is the true lineal length (blocking runs level
+ *  across the slope, so pitch never stretches it). */
+export interface BlockingPiece {
+  a: PagePoint;
+  b: PagePoint;
+  runPts: number;
+  lengthM: number;
+}
+
+/**
+ * Blocking pieces for one Joist/Rafter measurement. Returns [] when blocking is off, there's no
+ * page scale, or the array is a single member (no bay to block).
+ *
+ * Pitch: blocking rows are set out at `blockingCentresMm` measured **along the rafter** (down the
+ * slope), matching how a builder sets them out and how the member lengths themselves are derived
+ * (plan length ÷ cos = true length). So under a pitch they land closer together in plan, by
+ * cos(pitch). Each piece itself runs level across the slope, so its length is pitch-independent.
+ *
+ * End rows: every bay is also blocked hard against each end of its joists, on top of the interior
+ * set-out grid. An end row's outer face is flush with the joist ends, so its centreline sits half a
+ * timber thickness in. An interior grid row landing within a thickness of an end row is dropped in
+ * favour of it (the two would be the same physical timber).
+ *
+ * All of that set-out is done **in the rafter's own frame** — distances measured down the slope —
+ * and then resolved into the plan arc-length this function returns, which takes two pitch terms:
+ *
+ *  - the blocking's own thickness foreshortens in plan by cos(pitch), since a piece is set square
+ *    to the rafters (rolled to the roof plane), not left plumb — so an end row's inset from the
+ *    joist end is half a thickness × cos(pitch), not half a thickness;
+ *  - hanging the blocking off the rafters' TOP face rather than centring it on them displaces its
+ *    centre along the run by the half-depth difference × sin(pitch), whenever the blocking timber
+ *    is a different depth from the joists.
+ *
+ * Both vanish at zero pitch and grow with it, which is exactly the drift a QA pass caught: end
+ * rows that no longer met the joist ends as the pitch went up.
+ *
+ * Trims are honoured: a row is only emitted where BOTH bounding members survive the group's trim
+ * shapes at that arc-length, so trimming a corner off an array removes the blocking with it — and
+ * because "the end of the joists" then means the cut, the end rows follow the trim in to it.
+ */
+export function arrayBlockingPieces(
+  points: PagePoint[],
+  meta: ArrayMeta,
+  settings: JoistRafterSettings,
+  mmPerPoint: number | null,
+  pitchAngleDeg: number,
+): BlockingPiece[] {
+  if (!settings.blockingOn) return [];
+  if (points.length < 2 || !mmPerPoint || !(mmPerPoint > 0)) return [];
+  if (meta.extraMembers < 1 || !(meta.spacingPts > 0) || !(settings.blockingCentresMm > 0)) return [];
+
+  const [p1, p2] = points;
+  const dx = p2.x - p1.x;
+  const dy = p2.y - p1.y;
+  const runLen = Math.hypot(dx, dy);
+  if (runLen < GEOM_EPS) return [];
+  const dir = { x: dx / runLen, y: dy / runLen };
+  const perp = { x: -dy / runLen, y: dx / runLen };
+
+  const pitchRad = Math.min(89.9, Math.max(0, pitchAngleDeg)) * (Math.PI / 180);
+  const cosP = Math.cos(pitchRad);
+  const planCentresPts = (settings.blockingCentresMm / mmPerPoint) * cosP;
+  if (!(planCentresPts > GEOM_EPS)) return [];
+
+  // Post-trim arc-length intervals per member, projected onto the run direction. A member's
+  // perpendicular offset drops out of that projection, so p1 serves as the origin for all of them.
+  const absTrimsList = absArrayTrims(meta.trims, p1);
+  const sOf = (p: PagePoint) => (p.x - p1.x) * dir.x + (p.y - p1.y) * dir.y;
+  const intervals: [number, number][][] = [];
+  for (let i = 0; i <= meta.extraMembers; i += 1) {
+    const off = i * meta.spacingPts * meta.direction;
+    const seg: [PagePoint, PagePoint] = [
+      { x: p1.x + perp.x * off, y: p1.y + perp.y * off },
+      { x: p2.x + perp.x * off, y: p2.y + perp.y * off },
+    ];
+    intervals.push(
+      applyArrayTrims(seg, absTrimsList).map((clipped) => {
+        const s0 = sOf(clipped[0]);
+        const s1 = sOf(clipped[1]);
+        return (s0 <= s1 ? [s0, s1] : [s1, s0]) as [number, number];
+      }),
+    );
+  }
+  // Blocking fits face-to-face between adjacent members, so it's one timber thickness shorter than
+  // the centre-to-centre spacing (thickness is a constant 45 across every FRAMING_SIZES option, so
+  // this holds whatever size the blocking itself is).
+  const thkPts = STUD_THICKNESS_MM / mmPerPoint;
+  const clearPts = meta.spacingPts - thkPts;
+  if (clearPts <= GEOM_EPS) return [];
+  const lengthM = (clearPts * mmPerPoint) / MM_PER_M;
+  const sign = meta.direction >= 0 ? 1 : -1;
+  // A blocking piece is set square to the rafters, so its 45 thickness lies down the slope and
+  // foreshortens into plan by cos(pitch) — this is the plan width one row actually occupies.
+  const thkPlanPts = thkPts * cosP;
+  const halfThkPlan = thkPlanPts / 2;
+  // Hanging the blocking off the rafters' top face displaces its centre along the run by the
+  // half-depth difference resolved into plan. Zero for same-size blocking, and at zero pitch.
+  const depthShiftPts =
+    ((framingDepthMm(settings.blockingSize) - framingDepthMm(settings.framingSize)) / 2 / mmPerPoint) * Math.sin(pitchRad);
+
+  // The interior set-out grid, one full centres in from the baseline and stopping short of the far
+  // end — the same "only where it fits" rule as `dwangRowsForStudHeight` (⌊run / centres⌋ rows).
+  // Shared by every bay so interior rows line up across the array.
+  const gridRows: number[] = [];
+  for (let s = planCentresPts; s < runLen - GEOM_EPS; s += planCentresPts) gridRows.push(s);
+
+  const pieces: BlockingPiece[] = [];
+  for (let i = 0; i < meta.extraMembers; i += 1) {
+    const off0 = i * meta.spacingPts * meta.direction + (sign * thkPts) / 2;
+    const off1 = (i + 1) * meta.spacingPts * meta.direction - (sign * thkPts) / 2;
+    // Where this bay actually exists: both of its bounding members surviving the trims.
+    for (const [s0, s1] of intersectIntervals(intervals[i], intervals[i + 1])) {
+      const span = s1 - s0;
+      if (span <= GEOM_EPS) continue;
+      // End rows first, so the de-dupe below always resolves a clash in their favour — the ends of
+      // the joists are blocked whatever the set-out grid happens to land on. A remnant too short
+      // for two rows gets a single one down the middle.
+      const rows =
+        span >= thkPlanPts
+          ? [s0 + halfThkPlan, s1 - halfThkPlan, ...gridRows.filter((s) => s > s0 + GEOM_EPS && s < s1 - GEOM_EPS)]
+          : [(s0 + s1) / 2];
+      const placed: number[] = [];
+      for (const s of rows) {
+        // Two rows within a thickness of each other are the same physical timber — keep the first.
+        if (placed.some((p) => Math.abs(p - s) < thkPlanPts)) continue;
+        placed.push(s);
+        // Set-out resolved to where the piece's centre physically lands in plan.
+        const runPts = s + depthShiftPts;
+        const base = { x: p1.x + dir.x * runPts, y: p1.y + dir.y * runPts };
+        pieces.push({
+          a: { x: base.x + perp.x * off0, y: base.y + perp.y * off0 },
+          b: { x: base.x + perp.x * off1, y: base.y + perp.y * off1 },
+          runPts,
+          lengthM,
+        });
+      }
+    }
+  }
+  return pieces;
+}
+
+/** Overlapping portions of two sorted-by-nature arc-length interval lists (a bay exists only where
+ *  both of its bounding members do). */
+function intersectIntervals(a: [number, number][], b: [number, number][]): [number, number][] {
+  const out: [number, number][] = [];
+  for (const [a0, a1] of a) {
+    for (const [b0, b1] of b) {
+      const s0 = Math.max(a0, b0);
+      const s1 = Math.min(a1, b1);
+      if (s1 - s0 > GEOM_EPS) out.push([s0, s1]);
+    }
+  }
+  return out.sort((p, q) => p[0] - q[0]);
+}
+
+/** One Joist/Rafter measurement's input for group aggregation. */
+export interface ArrayInput {
+  id: number;
+  points: PagePoint[];
+  mmPerPoint: number | null;
+  meta: ArrayMeta;
+  polarity: number;
+}
+
+/**
+ * Group-level makeup of a Joist/Rafter group with blocking. Mirrors `FramingGroupBreakdown`'s
+ * multi-size model: `matchingTotalM` is the canonical group quantity and covers only timber of the
+ * group's own `framingSize` — blocking of a *different* size is excluded and becomes its own child
+ * quantity, exactly as a framing group treats a lintel whose size differs (see CLAUDE.md).
+ */
+export interface ArrayGroupBreakdown {
+  /** Lineal metres of the joists/rafters themselves (pitch-corrected, polarity-netted). */
+  memberTotalM: number;
+  /** Lineal metres of blocking (level, so never pitch-stretched), polarity-netted. */
+  blockingTotalM: number;
+  /** Net number of blocking pieces. */
+  blockingCount: number;
+  /** The blocking timber size, or null when blocking is off / produced nothing. */
+  blockingSize: FramingSize | null;
+  /** True when the blocking is the group's own timber size, so it rolls into `matchingTotalM`. */
+  blockingMatchesSize: boolean;
+  /** Canonical group quantity: members + same-size blocking. */
+  matchingTotalM: number;
+  /** All-in total across both sizes, for reference. */
+  totalM: number;
+}
+
+/** Aggregate a Joist/Rafter group's arrays into member + blocking totals (lineal m). */
+export function aggregateArrayGroup(
+  arrays: ArrayInput[],
+  settings: JoistRafterSettings,
+  opts: { pitchAngleDeg: number; multiplier: number },
+): ArrayGroupBreakdown {
+  const pitchRad = ((opts.pitchAngleDeg ?? 0) * Math.PI) / 180;
+  const pitchScale = pitchRad !== 0 ? 1 / Math.cos(pitchRad) : 1;
+  const multiplier = opts.multiplier;
+  let memberTotalM = 0;
+  let blockingTotalM = 0;
+  let blockingCount = 0;
+
+  for (const array of arrays) {
+    if (array.points.length < 2 || !array.mmPerPoint || !(array.mmPerPoint > 0)) continue;
+    const sign = (array.polarity ?? 1) < 0 ? -1 : 1;
+    const mPerPt = array.mmPerPoint / MM_PER_M;
+    memberTotalM += sign * arrayTrimmedLengthPts(array.points[0], array.points[1], array.meta) * mPerPt * multiplier * pitchScale;
+    for (const piece of arrayBlockingPieces(array.points, array.meta, settings, array.mmPerPoint, opts.pitchAngleDeg)) {
+      blockingTotalM += sign * piece.lengthM * multiplier;
+      blockingCount += sign;
+    }
+  }
+
+  const blockingSize = settings.blockingOn && Math.abs(blockingTotalM) > 1e-9 ? settings.blockingSize : null;
+  const blockingMatchesSize = blockingSize !== null && blockingSize === settings.framingSize;
+  return {
+    memberTotalM,
+    blockingTotalM: blockingSize ? blockingTotalM : 0,
+    blockingCount: blockingSize ? blockingCount : 0,
+    blockingSize,
+    blockingMatchesSize,
+    matchingTotalM: memberTotalM + (blockingMatchesSize ? blockingTotalM : 0),
+    totalM: memberTotalM + (blockingSize ? blockingTotalM : 0),
+  };
 }
 
 /** Render geometry for a single opening (its daylight gap + jamb studs), for ghost previews. */

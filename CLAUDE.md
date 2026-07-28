@@ -134,6 +134,70 @@ The `sizeOverride` field on `FramingComponent` / `FramingComponentTotal` is **al
 lintel members** (to the lintel's own `FramingSize`) and absent on all other member kinds. This
 is the key that excludes lintels from `matchingTotalM` and marks them for separate worksheet rows.
 
+### Joist / Rafter blocking follows the same one-quantity-per-size rule
+
+A Joist/Rafter (`array`) group can carry **blocking** (dwanging between joists/rafters) — a
+checkbox, a centres value, and its own timber size in the group properties dialog
+(`JoistRafterSettings.blockingOn` / `blockingCentresMm` / `blockingSize`, persisted in the same
+`framing_props_json` blob as `framingSize`).
+
+Blocking obeys the framing multi-size rule above: when `blockingSize === framingSize` it rolls
+into the group's own quantity; when it differs it becomes a **separate child quantity** shown as
+an accent-styled sub-row under the group, exactly like a framing lintel of a different size.
+`aggregateArrayGroup` (lib/framing.ts) produces both, and `ArrayGroupBreakdown.matchingTotalM` is
+the canonical group quantity — never use `totalM`, which combines both sizes.
+
+Unlike the framing build-up, `deriveQuantity` (quantity.ts) deliberately does **not** know about
+blocking — it stays the pure member-run length. Blocking is added at the group level only
+(`aggregateArrayGroup`, consumed by `DimensionGroupPane`'s totals and `groupImport.ts`'s
+`deriveDisplayQuantity`), because `quantity.ts` must not import `lib/framing.ts`: framing.ts
+runtime-imports quantity.ts (for `applyArrayTrims`/`absArrayTrims`/`arrayTrimmedLengthPts`), and
+the reverse direction would make that a cycle.
+
+Geometry lives in `arrayBlockingPieces` (lib/framing.ts) and is the single source for the plan
+overlay (`drawArray`/`drawArrayDraft`), the 3D view (`computeArrayMembers3D`) and the quantity, so
+the three can't disagree. **Set-out is done in the rafter's own frame — distances down the slope —
+then resolved into the plan arc-length the function returns.** Interior rows sit at
+`blockingCentresMm`, so under a pitch they close up in plan by cos θ; each bay is additionally
+blocked hard against **both ends** of its joists, and a grid row landing within a thickness of an
+end row is dropped in favour of it. Each piece is one timber thickness (45) shorter than the member
+spacing. A row is only emitted where **both** bounding members survive the array's trims at that
+arc-length — and since a trim makes the cut the new end of the joists, the end rows follow it in.
+
+Resolving that set-out into plan takes **two pitch terms, and getting them wrong is what made end
+rows drift off the joist ends** (a QA finding — the error grew with pitch):
+- the blocking's own 45 thickness lies *down the slope* (it's rolled square to the rafters, not
+  plumb), so it foreshortens into plan by cos θ — an end row's inset is `22.5 × cos θ`, not 22.5.
+  Getting this wrong costs `22.5 × (sec θ − 1)` mm: ~3.5 at 30°, ~9 at 45°, ~22.5 at 60°.
+- hanging the blocking off the rafters' **top** face rather than centring it displaces its centre
+  along the run by `(blockingDepth − framingDepth)/2 × sin θ`, applied to every row. Zero for
+  same-size blocking; ~44 mm for 90×45 blocking in 240×45 rafters at 30°.
+
+The joists' end faces are **square cuts**, so at pitch they are not vertical planes — "flush" means
+the blocking's outer face lands on that same sloped plane, which is exactly what rafter-frame
+set-out gives. `blocking.test.ts` asserts it to 1e-12 across 0–60° and mismatched depths.
+
+In 3D each piece is **rolled to the pitch** and hung so its **top face is coplanar and flush with
+the rafters'** (shallower blocking hangs from the top rather than sitting on the bottom). It reuses
+the members' own `yaw`/`pitch` — `Framing3DView`'s `quaternionFor` composes `Ry(yaw)·Rz(pitch)`, so
+an identical pair yields an identical local-Y axis — which requires the box's length on local Z and
+the 45 mm thickness on local X, the mirror of the members' `[length, depth, width]` layout.
+
+**Worksheet:** dragging a Joist/Rafter group in imports the joists + same-size blocking as the
+row's quantity and, when the blocking is a *different* size, inserts a plain `"<size> Blocking"`
+line item directly below — the exact analogue of the framing group's `"<size> Lintel to last"`
+rows. `populateArrayRollup` writes it, `reconcileArrayBlocking` keeps it live on every display
+(both in `WorkbookView.tsx`), and the row's `CellLink` carries `blockingSize` the way a lintel
+row's carries `lintelSize`. `insertSubQuantityRowsBelow` is the shared inserter for both. The row
+appears whichever display the group itself is imported as — it is a separate quantity of a
+separate timber, not another reading of the same geometry. Blocking that is later switched off or
+changed to the group's own size drives its row to 0; a newly-differing size needs a re-drop (same
+rule as lintels, so the estimator gets to price it).
+
+Unlike a framing group, an array group's row gets **no Quantity Build-up sub-sheet** — its
+quantity is a flat member-run + blocking total with nothing to itemise into Description/Length
+rows.
+
 ### Workbook → Excel export is built in Rust, not JS
 
 `WorkbookView.tsx`'s `exportExcel` flattens the workbook (unchanged, in the frontend) and hands
@@ -371,7 +435,9 @@ files working without a versioned migration system. Follow this pattern for any 
 
 ## Conventions
 
-- No build/CI yet; no automated tests. Pure geometry logic (intersection, distance-to-segment,
-  rect detection) is good candidate for unit tests if/when added.
+- No build/CI yet. Vitest covers the pure geometry/quantity logic — `npm test` (`vitest run`) in
+  `desktop/src-frontend`; see `src/lib/framing.test.ts` (wall framing) and `src/lib/blocking.test.ts`
+  (joist/rafter blocking + its 3D placement). Add to these rather than hand-rolling a throwaway
+  script when changing that math.
 - SQL is always parameterized. Node mutations verify `expected_node_type` before acting — keep this.
 - British spelling is used in identifiers in places (`colour`). Match surrounding code.

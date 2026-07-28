@@ -6,7 +6,16 @@
 // across-axis.
 
 import { absArrayTrims, applyArrayTrims, type ArrayMeta, type PagePoint } from "./quantity";
-import { framingDepthMm, wallMembers, STUD_THICKNESS_MM, type FramingComponentKind, type FramingSettings, type FramingSize, type WallFraming } from "./framing";
+import {
+  arrayBlockingPieces,
+  framingDepthMm,
+  wallMembers,
+  STUD_THICKNESS_MM,
+  type FramingComponentKind,
+  type FramingSettings,
+  type JoistRafterSettings,
+  type WallFraming,
+} from "./framing";
 
 export interface Member3D {
   kind: FramingComponentKind | "generic";
@@ -172,12 +181,17 @@ export function computeLengthMembers3D(
  *  45mm thickness (T) as its plan-view width, matching the 2D dimensional rendering. A non-zero
  *  pitch tilts each member about its own width axis and stretches it to the true sloped length,
  *  rising from `points[0]` (drawn first) to `points[1]` — the same low-to-high convention as
- *  drawing a rafter directly along the slope. */
+ *  drawing a rafter directly along the slope.
+ *
+ *  When the group has blocking switched on, a box is added across each bay for every blocking piece
+ *  `arrayBlockingPieces` produces (the same pieces the 2D overlay draws and the quantity counts),
+ *  rolled to the same pitch as the members and hung so its top face is flush and coplanar with
+ *  theirs. */
 export function computeArrayMembers3D(
   points: PagePoint[],
   mmPerPoint: number | null,
   meta: ArrayMeta,
-  framingSize: FramingSize,
+  settings: JoistRafterSettings,
   opts: { offsetM: number; color: string; pitchAngleDeg: number },
 ): Member3D[] {
   if (!mmPerPoint || !(mmPerPoint > 0) || points.length < 2) return [];
@@ -190,7 +204,7 @@ export function computeArrayMembers3D(
   const perpX = -dy / baseLen;
   const perpY = dx / baseLen;
   const absTrimsList = absArrayTrims(meta.trims, p1);
-  const depthM = framingDepthMm(framingSize) / 1000;
+  const depthM = framingDepthMm(settings.framingSize) / 1000;
   const widthM = STUD_THICKNESS_MM / 1000;
   const pitchRad = Math.min(89.9, Math.max(0, opts.pitchAngleDeg)) * (Math.PI / 180);
   const tan = pitchRad !== 0 ? Math.tan(pitchRad) : 0;
@@ -226,6 +240,49 @@ export function computeArrayMembers3D(
       });
     }
   }
+
+  // Blocking. Two things have to hold against the rafters it sits between:
+  //
+  //  1. It is rolled to the roof pitch, not left plumb — its top face is coplanar with the
+  //     rafters' top faces. It gets the SAME yaw and pitch as the members above, which is what
+  //     guarantees that: `quaternionFor` composes Ry(yaw)·Rz(pitch), so an identical (yaw, pitch)
+  //     gives an identical local-Y axis — the tilted "up" normal the rafters already have. To use
+  //     that shared rotation the box's length has to sit on local Z (the axis Rz leaves alone, and
+  //     which that yaw points across the slope), with the 45 mm thickness on local X — the mirror
+  //     of the members' own [length, depth, width] layout.
+  //  2. Its TOP is flush with the rafters' top, whatever depth the blocking timber is — shallower
+  //     blocking hangs from the top rather than sitting on the bottom.
+  //
+  // Working vertically in the (run, up) cross-section: a rafter's centreline runs from
+  // `offsetM + depthM/2` at the start of the run up at tan(pitch), and its top face is a further
+  // (depthM/2)·sec(pitch) above that measured vertically (the perpendicular offset read off
+  // vertically). The blocking's own top face is likewise (blockingDepthM/2)·sec(pitch) above its
+  // centre, so matching the two planes leaves the half-depth *difference*, scaled by sec(pitch).
+  const blockingDepthM = framingDepthMm(settings.blockingSize) / 1000;
+  const sec = pitchRad !== 0 ? 1 / cos : 1;
+  const [rx1, rz1] = pageToWorld(p1, S);
+  const [rx2, rz2] = pageToWorld(p2, S);
+  const runYaw = Math.atan2(-(rz2 - rz1), rx2 - rx1);
+  for (const piece of arrayBlockingPieces(points, meta, settings, mmPerPoint, opts.pitchAngleDeg)) {
+    const [bx1, bz1] = pageToWorld(piece.a, S);
+    const [bx2, bz2] = pageToWorld(piece.b, S);
+    const spanLen = Math.hypot(bx2 - bx1, bz2 - bz1);
+    if (spanLen <= 0) continue;
+    const riseM = tan !== 0 ? piece.runPts * S * tan : 0;
+    members.push({
+      kind: "generic",
+      position: [
+        (bx1 + bx2) / 2,
+        opts.offsetM + depthM / 2 + ((depthM - blockingDepthM) / 2) * sec + riseM,
+        (bz1 + bz2) / 2,
+      ],
+      size: [widthM, blockingDepthM, spanLen],
+      yaw: runYaw,
+      pitch: pitchRad,
+      color: opts.color,
+    });
+  }
+
   return members;
 }
 

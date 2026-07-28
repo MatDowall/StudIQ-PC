@@ -4,6 +4,7 @@ import { theme } from "../theme";
 import { DialogShell } from "./DialogShell";
 import type { DimensionGroupPropsDto } from "../store/appStore";
 import {
+  DEFAULT_JOIST_RAFTER_SETTINGS,
   FRAMING_SIZES,
   type FramingSettings,
   type FramingSize,
@@ -134,9 +135,12 @@ export function DimensionGroupPropertiesDialog({
   const [dwangCentres, setDwangCentres] = useState(String(initialFraming.dwangCentresMm));
   const [dwangsOn, setDwangsOn] = useState(initialFraming.dwangsOn);
 
-  // Joist/Rafter (Array) timber size — shown only when measurement type = Joist / Rafter.
+  // Joist/Rafter (Array) timber size + blocking — shown only when measurement type = Joist / Rafter.
   const initialJoistRafter = parseJoistRafterSettings(initial.framing_props_json);
   const [joistRafterSize, setJoistRafterSize] = useState<FramingSize>(initialJoistRafter.framingSize);
+  const [blockingOn, setBlockingOn] = useState(initialJoistRafter.blockingOn);
+  const [blockingCentres, setBlockingCentres] = useState(String(initialJoistRafter.blockingCentresMm));
+  const [blockingSize, setBlockingSize] = useState<FramingSize>(initialJoistRafter.blockingSize);
 
   const isFraming = measurementType === "timber_framing";
   const isArray = measurementType === "array";
@@ -214,7 +218,12 @@ export function DimensionGroupPropertiesDialog({
       framing_props_json: isFraming
         ? serializeFramingSettings(framingSettings)
         : isArray
-          ? serializeJoistRafterSettings({ framingSize: joistRafterSize })
+          ? serializeJoistRafterSettings({
+              framingSize: joistRafterSize,
+              blockingOn,
+              blockingCentresMm: Math.max(1, parseNumber(blockingCentres, DEFAULT_JOIST_RAFTER_SETTINGS.blockingCentresMm)),
+              blockingSize,
+            })
           : initial.framing_props_json,
       count_type: isCount ? countType : initial.count_type,
     };
@@ -287,15 +296,53 @@ export function DimensionGroupPropertiesDialog({
                 <span style={{ color: theme.text.secondary, fontSize: 12 }}>m</span>
               </Field>
               {isArray ? (
-                <Field label="Timber Size">
-                  <select value={joistRafterSize} onChange={(e) => setJoistRafterSize(e.target.value as FramingSize)} style={{ ...inputStyle, flex: 1 }}>
-                    {FRAMING_SIZES.map((size) => (
-                      <option key={size} value={size}>
-                        {size.replace("x", " × ")}
-                      </option>
-                    ))}
-                  </select>
-                </Field>
+                <>
+                  <Field label="Timber Size">
+                    <select value={joistRafterSize} onChange={(e) => setJoistRafterSize(e.target.value as FramingSize)} style={{ ...inputStyle, flex: 1 }}>
+                      {FRAMING_SIZES.map((size) => (
+                        <option key={size} value={size}>
+                          {size.replace("x", " × ")}
+                        </option>
+                      ))}
+                    </select>
+                  </Field>
+                  <Field label="Blocking">
+                    <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: theme.text.secondary }}>
+                      <input type="checkbox" checked={blockingOn} onChange={(e) => setBlockingOn(e.target.checked)} /> On
+                    </label>
+                  </Field>
+                  <Field label="Blocking Centres">
+                    <input
+                      type="number"
+                      value={blockingCentres}
+                      disabled={!blockingOn}
+                      onChange={(e) => setBlockingCentres(e.target.value)}
+                      style={{ ...inputStyle, flex: 1, opacity: blockingOn ? 1 : 0.5 }}
+                      title="Centre-to-centre spacing of blocking rows, measured along the joist/rafter"
+                    />
+                    <span style={{ color: theme.text.secondary, fontSize: 12 }}>mm</span>
+                  </Field>
+                  <Field label="Blocking Size">
+                    <select
+                      value={blockingSize}
+                      disabled={!blockingOn}
+                      onChange={(e) => setBlockingSize(e.target.value as FramingSize)}
+                      style={{ ...inputStyle, flex: 1, opacity: blockingOn ? 1 : 0.5 }}
+                      title="Blocking of the same size as the joist/rafter rolls into this group's quantity; a different size becomes its own child quantity"
+                    >
+                      {FRAMING_SIZES.map((size) => (
+                        <option key={size} value={size}>
+                          {size.replace("x", " × ")}
+                        </option>
+                      ))}
+                    </select>
+                  </Field>
+                  {blockingOn && blockingSize !== joistRafterSize ? (
+                    <div style={{ fontSize: 11, color: theme.text.secondary, textAlign: "right" }}>
+                      {blockingSize.replace("x", " × ")} blocking will be a separate child quantity.
+                    </div>
+                  ) : null}
+                </>
               ) : (
                 <Field label="Default Height">
                   <input type="number" value={height} onChange={(e) => setHeight(e.target.value)} style={{ ...inputStyle, flex: 1 }} />

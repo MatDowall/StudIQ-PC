@@ -21,6 +21,7 @@ import {
   type GroupProps,
 } from "../lib/quantity";
 import {
+  arrayBlockingPieces,
   computeFramingGeometry,
   computeFramingQuantities,
   extraStudRect,
@@ -36,6 +37,7 @@ import {
   wallMembers,
   wallStudPositions,
   STUD_THICKNESS_MM,
+  type JoistRafterSettings,
   type Opening,
   type OpeningTemplate,
   type WallFraming,
@@ -508,11 +510,12 @@ function drawOverlays(
       continue;
     }
 
-    // Array measurements render as N parallel line segments.
+    // Array measurements render as N parallel line segments (+ blocking across the bays).
     if (measurement.measurement_type === "array") {
       if (points.length >= 2) {
         const meta = parseArrayMeta(measurement.framing_json ?? null);
-        drawArray(ctx, [points[0], points[1]], meta, colour, style, pan, zoom, page, selected, false, mmPerPoint);
+        const jrSettings = parseJoistRafterSettings(props?.framing_props_json ?? null);
+        drawArray(ctx, [points[0], points[1]], meta, colour, style, pan, zoom, page, selected, false, mmPerPoint, jrSettings, props?.pitch_angle_deg ?? 0);
       }
       continue;
     }
@@ -964,7 +967,9 @@ function fillArrayMemberRect(ctx: CanvasRenderingContext2D, screenRect: { x: num
 /** Render a committed or draft array onto the canvas. Each (trimmed) member is drawn as a
  *  dimensional rectangle at the timber's real-world 45mm plan-view width when a page scale is
  *  available, falling back to a plain centreline (like Timber Framing's own no-scale fallback)
- *  otherwise. */
+ *  otherwise. When the group has blocking switched on, each blocking piece is drawn across its bay
+ *  as the same kind of dimensional rectangle (there is no separate plan symbol for blocking — like
+ *  a joist, it's just its real-world footprint). */
 function drawArray(
   ctx: CanvasRenderingContext2D,
   baseline: [PagePoint, PagePoint],
@@ -977,6 +982,8 @@ function drawArray(
   selected: boolean,
   showVertices: boolean,
   mmPerPoint: number | null,
+  jrSettings?: JoistRafterSettings | null,
+  pitchAngleDeg = 0,
 ) {
   const members = getArrayMembers(baseline[0], baseline[1], meta);
   const absTrimsList = absTrims(meta.trims, baseline[0]);
@@ -991,6 +998,12 @@ function drawArray(
     for (const member of members) {
       for (const clipped of applyTrimsToSegment(member, absTrimsList)) {
         const rect = arrayMemberRect(clipped[0], clipped[1], halfWidthPts).map((p) => pageToScreen(p.x, p.y, page.height_pts, pan, zoom));
+        fillArrayMemberRect(ctx, rect, colour, lineWidth);
+      }
+    }
+    if (jrSettings) {
+      for (const piece of arrayBlockingPieces([baseline[0], baseline[1]], meta, jrSettings, mmPerPoint, pitchAngleDeg)) {
+        const rect = arrayMemberRect(piece.a, piece.b, halfWidthPts).map((p) => pageToScreen(p.x, p.y, page.height_pts, pan, zoom));
         fillArrayMemberRect(ctx, rect, colour, lineWidth);
       }
     }
@@ -1031,6 +1044,8 @@ function drawArrayDraft(
   zoom: number,
   page: PageMeta,
   mmPerPoint: number | null,
+  jrSettings?: JoistRafterSettings | null,
+  pitchAngleDeg = 0,
 ) {
   const meta: ArrayMeta = { extraMembers, spacingPts, direction, trims: [] };
   const members = getArrayMembers(baseline[0], baseline[1], meta);
@@ -1056,6 +1071,14 @@ function drawArrayDraft(
       ctx.moveTo(a.x, a.y);
       ctx.lineTo(b.x, b.y);
       ctx.stroke();
+    }
+  }
+  // Blocking preview, at the same reduced opacity as the extra members it spans between.
+  if (jrSettings && halfWidthPts > 0) {
+    ctx.globalAlpha = 0.7;
+    for (const piece of arrayBlockingPieces([baseline[0], baseline[1]], meta, jrSettings, mmPerPoint, pitchAngleDeg)) {
+      const rect = arrayMemberRect(piece.a, piece.b, halfWidthPts).map((p) => pageToScreen(p.x, p.y, page.height_pts, pan, zoom));
+      fillArrayMemberRect(ctx, rect, colour, 1.3);
     }
   }
   ctx.globalAlpha = 1;
@@ -2221,7 +2244,20 @@ export function ViewerCanvas({
         if (draftPoints.length >= 2) {
           // Extruding phase: show ghost array based on cursor's perpendicular offset.
           const baseline: [PagePoint, PagePoint] = [draftPoints[0], draftPoints[1]];
-          drawArrayDraft(ctx, baseline, arrayExtraMembers, arrayDirection, arraySpacingPts, draftColour, pan, zoom, page, pageScale?.mm_per_point ?? null);
+          drawArrayDraft(
+            ctx,
+            baseline,
+            arrayExtraMembers,
+            arrayDirection,
+            arraySpacingPts,
+            draftColour,
+            pan,
+            zoom,
+            page,
+            pageScale?.mm_per_point ?? null,
+            parseJoistRafterSettings(activeProps?.framing_props_json ?? null),
+            activeProps?.pitch_angle_deg ?? 0,
+          );
         } else {
           // Baseline phase: rubber-band the first segment.
           drawDraft(ctx, draftPoints, livePoint, draftColour, pan, zoom, page, draftStyle, false);
@@ -3692,6 +3728,19 @@ export function ViewerCanvas({
           const arrayPitchRad = ((props?.pitch_angle_deg ?? 0) * Math.PI) / 180;
           const arrayPitchScale = arrayPitchRad !== 0 ? 1 / Math.cos(arrayPitchRad) : 1;
           const segLenM = mPerPt != null ? Math.hypot(hitSeg[1].x - hitSeg[0].x, hitSeg[1].y - hitSeg[0].y) * mPerPt * m * arrayPitchScale : null;
+          // Blocking is not part of `deriveQuantity` (it's a group-level makeup, like the framing
+          // build-up), so it gets its own row — labelled with its size when that differs from the
+          // joists', since a differing size is a separate sub-quantity that never rolls in here.
+          const jrSettings = parseJoistRafterSettings(props?.framing_props_json ?? null);
+          const blockingPieces = arrayBlockingPieces(points, meta, jrSettings, pageScale?.mm_per_point ?? null, props?.pitch_angle_deg ?? 0);
+          const blockingRows: HoverCardRow[] = blockingPieces.length
+            ? [{
+                label: jrSettings.blockingSize === jrSettings.framingSize
+                  ? "Blocking"
+                  : `Blocking (${jrSettings.blockingSize.replace("x", " × ")})`,
+                value: formatQuantity({ value: blockingPieces.reduce((sum, piece) => sum + piece.lengthM, 0) * m, uom: "m" }),
+              }]
+            : [];
           setHoverInfo({
             x: clientX,
             y: clientY,
@@ -3704,6 +3753,7 @@ export function ViewerCanvas({
               { label: "Length (Current Segment)", value: segLenM != null ? formatQuantity({ value: segLenM, uom: "m" }) : "—" },
               { label: "Total Length", value: lengthQty ? formatQuantity(lengthQty) : formatLength(pathLengthPts(points), pageScale) },
               { label: "Count", value: countQty ? formatQuantity(countQty) : "—" },
+              ...blockingRows,
             ],
           });
           return;
@@ -4512,7 +4562,7 @@ export function ViewerCanvas({
               } else if (m.measurement_type === "array" && pts.length >= 2) {
                 const meta = parseArrayMeta(m.framing_json ?? null);
                 const joistRafter = parseJoistRafterSettings(props?.framing_props_json ?? null);
-                members = computeArrayMembers3D(pts, mmpp, meta, joistRafter.framingSize, {
+                members = computeArrayMembers3D(pts, mmpp, meta, joistRafter, {
                   offsetM,
                   color,
                   pitchAngleDeg: props?.pitch_angle_deg ?? 0,

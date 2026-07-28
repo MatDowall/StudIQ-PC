@@ -6,11 +6,15 @@
 // the derivation matrix (see CLAUDE.md and lib/quantity.ts / lib/framing.ts).
 
 import { invoke } from "@tauri-apps/api/core";
-import { groupNetQuantity, type GroupProps, type PagePoint, type Quantity } from "./quantity";
+import { groupNetQuantity, parseArrayMeta, type GroupProps, type PagePoint, type Quantity } from "./quantity";
 import {
+  aggregateArrayGroup,
   aggregateFramingGroup,
   parseFramingSettings,
+  parseJoistRafterSettings,
   parseWallFraming,
+  type ArrayGroupBreakdown,
+  type ArrayInput,
   type FramingGroupBreakdown,
   type FramingWallInput,
 } from "./framing";
@@ -67,6 +71,9 @@ export interface GroupImportContext {
   measurements: MeasurementDto[];
   scaleFor: (drawingId: number, pageIndex: number) => number | null;
   framingBreakdown: FramingGroupBreakdown | null;
+  /** Only set for a Joist/Rafter group with blocking switched on — `deriveQuantity` covers the
+   *  members alone, so the blocking has to come from here (mirrors `framingBreakdown`). */
+  arrayBreakdown: ArrayGroupBreakdown | null;
 }
 
 /** Loads everything needed to derive a dimension group's quantity outside of the
@@ -106,7 +113,32 @@ export async function loadGroupImportContext(groupId: number): Promise<GroupImpo
     framingBreakdown = aggregateFramingGroup(walls, parseFramingSettings(props.framing_props_json));
   }
 
-  return { props, measurements, scaleFor, framingBreakdown };
+  let arrayBreakdown: ArrayGroupBreakdown | null = null;
+  if (props.measurement_type === "array") {
+    const settings = parseJoistRafterSettings(props.framing_props_json);
+    if (settings.blockingOn) {
+      const arrays: ArrayInput[] = measurements.map((m) => {
+        let points: PagePoint[] = [];
+        try {
+          const parsed = JSON.parse(m.geometry_json);
+          if (Array.isArray(parsed)) points = parsed;
+        } catch { /* ignore malformed geometry */ }
+        return {
+          id: m.id,
+          points,
+          mmPerPoint: scaleFor(m.drawing_id, m.page_index),
+          meta: parseArrayMeta(m.framing_json ?? null),
+          polarity: m.polarity ?? 1,
+        };
+      });
+      arrayBreakdown = aggregateArrayGroup(arrays, settings, {
+        pitchAngleDeg: props.pitch_angle_deg ?? 0,
+        multiplier: props.default_multiplier ?? 1,
+      });
+    }
+  }
+
+  return { props, measurements, scaleFor, framingBreakdown, arrayBreakdown };
 }
 
 /** Builds the option list — one entry per possible derived display that actually
@@ -114,11 +146,23 @@ export async function loadGroupImportContext(groupId: number): Promise<GroupImpo
 export function buildImportOptions(ctx: GroupImportContext): ImportDisplayOption[] {
   const out: ImportDisplayOption[] = [];
   for (const display of possibleImportDisplays(ctx.props)) {
-    const quantity = groupNetQuantity(ctx.measurements, { ...ctx.props, default_display: display }, ctx.scaleFor);
+    const quantity = deriveDisplayQuantity(ctx, display);
     if (!quantity) continue;
     out.push({ key: display, label: IMPORT_DISPLAY_LABELS[display] ?? display, quantity });
   }
   return out;
+}
+
+/** One derived display's quantity for the whole group. A Joist/Rafter group with same-size
+ *  blocking rolls that blocking into its Length (the group's canonical `matchingTotalM`), matching
+ *  what the Dimensions sidebar shows; blocking of a different size stays out of it and is a
+ *  separate sub-quantity. Count is untouched — blocking doesn't change how many joists were drawn. */
+function deriveDisplayQuantity(ctx: GroupImportContext, display: string): Quantity | null {
+  if (ctx.arrayBreakdown && display === "length") {
+    const value = ctx.arrayBreakdown.matchingTotalM;
+    return Math.abs(value) > 1e-9 ? { value, uom: "m" } : null;
+  }
+  return groupNetQuantity(ctx.measurements, { ...ctx.props, default_display: display }, ctx.scaleFor);
 }
 
 /** Re-derives a linked cell's current quantity, for the chosen display. */
@@ -127,5 +171,5 @@ export function deriveLinkedQuantity(ctx: GroupImportContext, display: string): 
     const value = ctx.framingBreakdown?.matchingTotalM ?? 0;
     return value > 0 ? { value, uom: "m" } : null;
   }
-  return groupNetQuantity(ctx.measurements, { ...ctx.props, default_display: display }, ctx.scaleFor);
+  return deriveDisplayQuantity(ctx, display);
 }
