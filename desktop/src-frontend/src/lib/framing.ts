@@ -1680,14 +1680,17 @@ export function aggregateFramingGroup(
 // ---------------------------------------------------------------------------------------------
 
 /** One piece of blocking spanning a single bay. `a`/`b` are the centreline endpoints in PDF
- *  points (Y-up), running face-to-face across the bay. `runPts` is the plan arc-length of the
- *  piece's centre along the joist run from the array baseline's first point — what the 3D builder
- *  turns into a height rise under pitch. `lengthM` is the true lineal length (blocking runs level
- *  across the slope, so pitch never stretches it). */
+ *  points (Y-up), running face-to-face across the bay. `runPtsA`/`runPtsB` are the plan arc-lengths
+ *  of those endpoints along the joist run from the array baseline's first point — what the 3D
+ *  builder turns into a height on the roof plane. They are equal for an ordinary square row; an end
+ *  row following an off-axis trim has different ones, which is what makes it skewed in plan and, if
+ *  the group is pitched, sloped (its ends sit at different heights). `lengthM` is the piece's true
+ *  lineal length, measured in the roof plane, so a skewed row is longer than the clear bay width. */
 export interface BlockingPiece {
   a: PagePoint;
   b: PagePoint;
-  runPts: number;
+  runPtsA: number;
+  runPtsB: number;
   lengthM: number;
 }
 
@@ -1721,6 +1724,13 @@ export interface BlockingPiece {
  * Trims are honoured: a row is only emitted where BOTH bounding members survive the group's trim
  * shapes at that arc-length, so trimming a corner off an array removes the blocking with it — and
  * because "the end of the joists" then means the cut, the end rows follow the trim in to it.
+ *
+ * An **off-axis** trim ends each joist in a bay at a different arc-length. An end row then runs
+ * corner to corner between those two ends rather than square across the shorter of them, so
+ * successive bays' end rows line up into one continuous run of blocking along the cut instead of a
+ * staircase of square stubs pulled back to the short side. Interior grid rows stay square — they
+ * aren't at a cut. A grid row overlapping a skewed end row's arc-length range is dropped in its
+ * favour, same rule as for a square one.
  */
 export function arrayBlockingPieces(
   points: PagePoint[],
@@ -1771,7 +1781,6 @@ export function arrayBlockingPieces(
   const thkPts = STUD_THICKNESS_MM / mmPerPoint;
   const clearPts = meta.spacingPts - thkPts;
   if (clearPts <= GEOM_EPS) return [];
-  const lengthM = (clearPts * mmPerPoint) / MM_PER_M;
   const sign = meta.direction >= 0 ? 1 : -1;
   // A blocking piece is set square to the rafters, so its 45 thickness lies down the slope and
   // foreshortens into plan by cos(pitch) — this is the plan width one row actually occupies.
@@ -1788,33 +1797,50 @@ export function arrayBlockingPieces(
   const gridRows: number[] = [];
   for (let s = planCentresPts; s < runLen - GEOM_EPS; s += planCentresPts) gridRows.push(s);
 
+  const clearM = (clearPts * mmPerPoint) / MM_PER_M;
   const pieces: BlockingPiece[] = [];
   for (let i = 0; i < meta.extraMembers; i += 1) {
     const off0 = i * meta.spacingPts * meta.direction + (sign * thkPts) / 2;
     const off1 = (i + 1) * meta.spacingPts * meta.direction - (sign * thkPts) / 2;
     // Where this bay actually exists: both of its bounding members surviving the trims.
-    for (const [s0, s1] of intersectIntervals(intervals[i], intervals[i + 1])) {
-      const span = s1 - s0;
+    for (const bay of bayIntervals(intervals[i], intervals[i + 1])) {
+      const span = bay.s1 - bay.s0;
       if (span <= GEOM_EPS) continue;
       // End rows first, so the de-dupe below always resolves a clash in their favour — the ends of
-      // the joists are blocked whatever the set-out grid happens to land on. A remnant too short
-      // for two rows gets a single one down the middle.
-      const rows =
+      // the joists are blocked whatever the set-out grid happens to land on. Each end row takes
+      // each member's OWN end, so an off-axis cut gives a skewed row along the cut. A remnant too
+      // short for two rows gets a single square one down the middle.
+      const rows: { sA: number; sB: number }[] =
         span >= thkPlanPts
-          ? [s0 + halfThkPlan, s1 - halfThkPlan, ...gridRows.filter((s) => s > s0 + GEOM_EPS && s < s1 - GEOM_EPS)]
-          : [(s0 + s1) / 2];
-      const placed: number[] = [];
-      for (const s of rows) {
-        // Two rows within a thickness of each other are the same physical timber — keep the first.
-        if (placed.some((p) => Math.abs(p - s) < thkPlanPts)) continue;
-        placed.push(s);
-        // Set-out resolved to where the piece's centre physically lands in plan.
-        const runPts = s + depthShiftPts;
-        const base = { x: p1.x + dir.x * runPts, y: p1.y + dir.y * runPts };
+          ? [
+              { sA: bay.aStart + halfThkPlan, sB: bay.bStart + halfThkPlan },
+              { sA: bay.aEnd - halfThkPlan, sB: bay.bEnd - halfThkPlan },
+              ...gridRows.filter((s) => s > bay.s0 + GEOM_EPS && s < bay.s1 - GEOM_EPS).map((s) => ({ sA: s, sB: s })),
+            ]
+          : [{ sA: (bay.s0 + bay.s1) / 2, sB: (bay.s0 + bay.s1) / 2 }];
+
+      const placed: { lo: number; hi: number }[] = [];
+      for (const row of rows) {
+        const lo = Math.min(row.sA, row.sB);
+        const hi = Math.max(row.sA, row.sB);
+        // Two rows whose arc-length ranges come within a thickness of each other are the same
+        // physical timber (or would cross) — keep the first, which is always an end row.
+        if (placed.some((p) => lo - p.hi < thkPlanPts && p.lo - hi < thkPlanPts)) continue;
+        placed.push({ lo, hi });
+        // Set-out resolved to where the piece's ends physically land in plan.
+        const runPtsA = row.sA + depthShiftPts;
+        const runPtsB = row.sB + depthShiftPts;
+        const baseA = { x: p1.x + dir.x * runPtsA, y: p1.y + dir.y * runPtsA };
+        const baseB = { x: p1.x + dir.x * runPtsB, y: p1.y + dir.y * runPtsB };
+        // True length in the roof plane: the across-bay run is level, so it is its own length, while
+        // the along-run component is down the slope and stretches by 1/cos(pitch).
+        const alongSlopePts = cosP > GEOM_EPS ? (runPtsB - runPtsA) / cosP : 0;
+        const lengthM = alongSlopePts === 0 ? clearM : Math.hypot(clearM, (alongSlopePts * mmPerPoint) / MM_PER_M);
         pieces.push({
-          a: { x: base.x + perp.x * off0, y: base.y + perp.y * off0 },
-          b: { x: base.x + perp.x * off1, y: base.y + perp.y * off1 },
-          runPts,
+          a: { x: baseA.x + perp.x * off0, y: baseA.y + perp.y * off0 },
+          b: { x: baseB.x + perp.x * off1, y: baseB.y + perp.y * off1 },
+          runPtsA,
+          runPtsB,
           lengthM,
         });
       }
@@ -1823,18 +1849,29 @@ export function arrayBlockingPieces(
   return pieces;
 }
 
-/** Overlapping portions of two sorted-by-nature arc-length interval lists (a bay exists only where
- *  both of its bounding members do). */
-function intersectIntervals(a: [number, number][], b: [number, number][]): [number, number][] {
-  const out: [number, number][] = [];
+/** One stretch of a bay: `s0`/`s1` are the overlap of its two bounding members' surviving runs —
+ *  where the bay exists at all — while `aStart`/`aEnd` and `bStart`/`bEnd` keep each member's own
+ *  ends, which differ when a trim cuts the array off-axis. End rows span between those; interior
+ *  rows are bounded by the overlap. */
+interface BayInterval {
+  s0: number;
+  s1: number;
+  aStart: number;
+  aEnd: number;
+  bStart: number;
+  bEnd: number;
+}
+
+function bayIntervals(a: [number, number][], b: [number, number][]): BayInterval[] {
+  const out: BayInterval[] = [];
   for (const [a0, a1] of a) {
     for (const [b0, b1] of b) {
       const s0 = Math.max(a0, b0);
       const s1 = Math.min(a1, b1);
-      if (s1 - s0 > GEOM_EPS) out.push([s0, s1]);
+      if (s1 - s0 > GEOM_EPS) out.push({ s0, s1, aStart: a0, aEnd: a1, bStart: b0, bEnd: b1 });
     }
   }
-  return out.sort((p, q) => p[0] - q[0]);
+  return out.sort((p, q) => p.s0 - q.s0);
 }
 
 /** One Joist/Rafter measurement's input for group aggregation. */

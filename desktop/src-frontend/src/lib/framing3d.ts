@@ -23,6 +23,10 @@ export interface Member3D {
   size: [number, number, number];
   yaw: number;
   pitch: number;
+  /** Optional swing within the member's own pitched plane, about its (already tilted) local up-axis
+   *  — see `quaternionFor` in Framing3DView. Only Joist/Rafter end blocks following an off-axis trim
+   *  use it; absent/0 everywhere else. */
+  roll?: number;
   wedge?: { quad: [number, number][]; depthM: number };
   /** Explicit colour override — used by generic (non-framing) members, which are coloured by
    *  their owning dimension group rather than by member kind. */
@@ -266,9 +270,21 @@ export function computeArrayMembers3D(
   for (const piece of arrayBlockingPieces(points, meta, settings, mmPerPoint, opts.pitchAngleDeg)) {
     const [bx1, bz1] = pageToWorld(piece.a, S);
     const [bx2, bz2] = pageToWorld(piece.b, S);
-    const spanLen = Math.hypot(bx2 - bx1, bz2 - bz1);
-    if (spanLen <= 0) continue;
-    const riseM = tan !== 0 ? piece.runPts * S * tan : 0;
+    if (Math.hypot(bx2 - bx1, bz2 - bz1) <= 0) continue;
+    // Resolve the piece into the roof plane's own two axes: across the slope (level, so plan
+    // distance is true distance) and down the slope (stretched by 1/cos). An ordinary square row is
+    // purely across; an end row following an off-axis trim also runs down the slope, and `roll`
+    // swings it by that much within the plane — leaving the plane's normal, and so the flush top
+    // face, untouched.
+    const alongPlanM = (piece.runPtsB - piece.runPtsA) * S;
+    const alongSlopeM = alongPlanM * sec;
+    const acrossM = dotAcross(bx2 - bx1, bz2 - bz1, rx2 - rx1, rz2 - rz1);
+    const lengthM = Math.hypot(acrossM, alongSlopeM);
+    if (lengthM <= 0) continue;
+    const roll = Math.atan2(alongSlopeM, acrossM);
+    // Height reference is the piece's midpoint; the roll keeps both ends on the same plane.
+    const midRunM = ((piece.runPtsA + piece.runPtsB) / 2) * S;
+    const riseM = tan !== 0 ? midRunM * tan : 0;
     members.push({
       kind: "generic",
       position: [
@@ -276,14 +292,25 @@ export function computeArrayMembers3D(
         opts.offsetM + depthM / 2 + ((depthM - blockingDepthM) / 2) * sec + riseM,
         (bz1 + bz2) / 2,
       ],
-      size: [widthM, blockingDepthM, spanLen],
+      size: [widthM, blockingDepthM, lengthM],
       yaw: runYaw,
       pitch: pitchRad,
+      roll,
       color: opts.color,
     });
   }
 
   return members;
+}
+
+/** Component of the world vector (vx, vz) along the array's across-slope axis — the horizontal
+ *  direction perpendicular to the run (rx, rz). Signed, so a mirrored extrusion direction simply
+ *  rolls the (symmetric) box the other way round. */
+function dotAcross(vx: number, vz: number, runX: number, runZ: number): number {
+  const len = Math.hypot(runX, runZ);
+  if (len <= 0) return Math.hypot(vx, vz);
+  // The across axis used by `quaternionFor`'s yaw is (-runZ, runX) normalised.
+  return (vx * -runZ + vz * runX) / len;
 }
 
 /** An "area" measurement's 3D extrusion: the polygon footprint extruded up from `offsetM` by the

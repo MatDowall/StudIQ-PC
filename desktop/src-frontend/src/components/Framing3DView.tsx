@@ -4,10 +4,15 @@ import { OrbitControls } from "@react-three/drei";
 import * as THREE from "three";
 import { MEMBER_COLOURS, type AreaMesh3D, type Member3D } from "../lib/framing3d";
 
-/** Compose the member's yaw (about world-up) and pitch (about its local across-axis) into a quaternion. */
-function quaternionFor(yaw: number, pitch: number): [number, number, number, number] {
+/** Compose the member's yaw (about world-up), pitch (about its local across-axis) and optional roll
+ *  into a quaternion. Roll is applied *innermost*, about the member's local up-axis — which pitch
+ *  has already tilted — so it swings the member within its own pitched plane while leaving that
+ *  plane's normal alone. That is what lets a Joist/Rafter end block skew to follow an off-axis trim
+ *  and still sit flush in the roof plane (see `computeArrayMembers3D`). */
+function quaternionFor(yaw: number, pitch: number, roll = 0): [number, number, number, number] {
   const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), yaw);
   if (pitch) q.multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), pitch));
+  if (roll) q.multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), roll));
   return [q.x, q.y, q.z, q.w];
 }
 
@@ -107,7 +112,7 @@ function InstancedMembers({
     const matrix = new THREE.Matrix4();
     const scale = new THREE.Vector3(1, 1, 1);
     members.forEach((mem, i) => {
-      const [qx, qy, qz, qw] = quaternionFor(mem.yaw, mem.pitch);
+      const [qx, qy, qz, qw] = quaternionFor(mem.yaw, mem.pitch, mem.roll);
       matrix.compose(new THREE.Vector3(...mem.position), new THREE.Quaternion(qx, qy, qz, qw), scale);
       mesh.setMatrixAt(i, matrix);
     });

@@ -164,6 +164,21 @@ end row is dropped in favour of it. Each piece is one timber thickness (45) shor
 spacing. A row is only emitted where **both** bounding members survive the array's trims at that
 arc-length — and since a trim makes the cut the new end of the joists, the end rows follow it in.
 
+**Off-axis trims skew the end rows.** A diagonal cut ends each joist in a bay at a different
+arc-length, so an end row runs corner to corner between those two ends rather than square across the
+shorter of them. Consecutive bays' end rows then meet at their shared joist and line up into one
+continuous run of blocking along the cut, instead of a staircase of square stubs pulled back to the
+short side. Hence `BlockingPiece` carries `runPtsA`/`runPtsB` (per-end arc-lengths, equal only for a
+square row) and `lengthM` is measured in the roof plane, so a skewed row is genuinely longer and the
+quantity reflects it. Interior grid rows stay square; one overlapping a skewed row's arc-length range
+is dropped in its favour.
+
+A skewed row under pitch has its two ends at **different heights**, which the `yaw` + `pitch` box
+model cannot express — so `Member3D` has an optional **`roll`**, applied innermost about the member's
+already-tilted local up-axis (`quaternionFor` in `Framing3DView` composes `Ry(yaw)·Rz(pitch)·Ry(roll)`).
+That swings the member *within* its pitched plane and leaves the plane's normal alone, so a skewed
+block stays flush in the roof plane at both ends. Only blocking uses it; everything else omits it.
+
 Resolving that set-out into plan takes **two pitch terms, and getting them wrong is what made end
 rows drift off the joist ends** (a QA finding — the error grew with pitch):
 - the blocking's own 45 thickness lies *down the slope* (it's rolled square to the rafters, not
