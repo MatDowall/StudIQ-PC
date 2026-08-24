@@ -201,6 +201,18 @@ function isDrillColumn(level: Level, col: number): boolean {
       || (level === 2 && (col === COL_RATE || col === COL_QTY));
 }
 
+// Pale-yellow highlight applied to the "result" columns of a sheet — the figures
+// the estimator reads off rather than types in. Which columns those are depends on
+// both the sheet's depth and its kind:
+//   L1 / L2 / L3 Rate Build-up  C:Quantity, F:Sub-Total, H:Total
+//   L3 Quantity Build-up        H:Quantity only — C–F are Count/Length/Width/Height
+//                               inputs there, so F carries no result to highlight.
+const HIGHLIGHT_BG = "#fef9c6";
+function isHighlightColumn(_level: Level, kind: SheetKind, col: number): boolean {
+  if (kind === "qty") return col === COL_TOTAL;
+  return col === COL_QTY || col === COL_SUBTOTAL || col === COL_TOTAL;
+}
+
 // ─── Per-cell text formatting (Format toolbar) ────────────────────────────
 
 interface CellStyle {
@@ -1119,7 +1131,7 @@ function BreadcrumbChip({
         textOverflow: "ellipsis",
         border: header ? undefined : "1px solid #b9c2cc",
         borderRadius: header ? undefined : 0,
-        background: header ? undefined : yellow ? "#fffff0" : "#fff",
+        background: header ? undefined : yellow ? HIGHLIGHT_BG : "#fff",
       }}
     >
       {children}
@@ -4603,7 +4615,7 @@ export function WorkbookView() {
 
     cells(_row: number, col: number) {
       const props: Record<string, unknown> = { renderer: workbookCellRenderer };
-      if (col === COL_SUBTOTAL || col === COL_TOTAL) {
+      if (isHighlightColumn(levelRef.current, sheetKindForPath(curSheetPath()), col)) {
         props.className = "ht-yellow-cell";
       }
       return props;
@@ -4674,8 +4686,8 @@ export function WorkbookView() {
     },
 
     afterGetColHeader(col: number, TH: HTMLTableCellElement) {
-      if (col === COL_SUBTOTAL || col === COL_TOTAL) {
-        (TH as HTMLTableCellElement).style.background = "#fffff0";
+      if (isHighlightColumn(levelRef.current, sheetKindForPath(curSheetPath()), col)) {
+        (TH as HTMLTableCellElement).style.background = HIGHLIGHT_BG;
       } else {
         (TH as HTMLTableCellElement).style.background = "";
       }
@@ -4981,8 +4993,8 @@ export function WorkbookView() {
 
       {/* ── Global Handsontable overrides ── */}
       <style>{`
-        .ht-yellow-cell { background: #fffff0 !important; }
-        .handsontable .ht-yellow-cell { background: #fffff0 !important; }
+        .ht-yellow-cell { background: ${HIGHLIGHT_BG} !important; }
+        .handsontable .ht-yellow-cell { background: ${HIGHLIGHT_BG} !important; }
         .handsontable .ht-project-total-cell { background: #ffe27a !important; }
         .handsontable th { white-space: nowrap; overflow: hidden; }
         .handsontable td { font-size: 12px; }
