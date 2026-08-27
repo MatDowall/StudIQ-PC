@@ -1,0 +1,18 @@
+# Paths the `tauri dev` file watcher must NOT rebuild on.
+#
+# The watcher watches this whole crate directory, and the frontend lives inside it at
+# src-frontend/. Without this, every .tsx edit — and every `npm test` run, because vitest writes
+# node_modules/.vite/vitest/results.json — killed the running app and relaunched it, losing
+# whatever project was open. In dev the frontend is served by Vite on devUrl and hot-reloads on
+# its own, so the Rust side has no reason to rebuild for it.
+#
+# IMPORTANT: list the noisy SUBDIRECTORIES, never `src-frontend/` itself. These ignore rules also
+# apply to the scan the Tauri CLI uses to locate the frontend directory, so hiding src-frontend/
+# wholesale hides src-frontend/package.json too — the CLI then falls back to the repo root and
+# `beforeDevCommand` dies with "Could not read package.json".
+#
+# `tauri build` is unaffected: it bundles frontendDist via beforeBuildCommand, not via this watcher.
+src-frontend/src/
+src-frontend/node_modules/
+src-frontend/dist/
+src-frontend/scripts/

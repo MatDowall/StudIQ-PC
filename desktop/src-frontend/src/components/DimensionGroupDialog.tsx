@@ -10,6 +10,8 @@ const MEASUREMENT_TYPES = [
   { value: "count", label: "Count" },
   { value: "timber_framing", label: "Timber Framing" },
   { value: "array", label: "Joist / Rafter" },
+  { value: "wall_surface", label: "Wall Surface from Framing" },
+  { value: "wall_insulation", label: "Wall Insulation from Framing" },
 ] as const;
 
 interface DimensionGroupDialogProps {

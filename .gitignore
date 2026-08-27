@@ -56,3 +56,7 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+
+# pdf_renderer staged for bundling by desktop/src-frontend/scripts/copy-renderer.mjs — a build
+# artifact copied out of cargo's (now out-of-tree) target dir, not source.
+desktop/bin/

@@ -18,6 +18,7 @@ import {
   serializeJoistRafterSettings,
   studHeightMm,
 } from "../lib/framing";
+import { isWallInsulationType, isWallSurfaceType, parseWallSurfaceSettings, serializeWallSurfaceSettings } from "../lib/quantity";
 
 const MEASUREMENT_TYPES = [
   { value: "count", label: "Count" },
@@ -25,6 +26,8 @@ const MEASUREMENT_TYPES = [
   { value: "area", label: "Area" },
   { value: "timber_framing", label: "Timber Framing" },
   { value: "array", label: "Joist / Rafter" },
+  { value: "wall_surface", label: "Wall Surface from Framing" },
+  { value: "wall_insulation", label: "Wall Insulation from Framing" },
 ] as const;
 const COUNT_TYPES = [
   { value: "marker", label: "Marker" },
@@ -60,6 +63,10 @@ const DISPLAYS_BY_TYPE: Record<string, { value: string; label: string }[]> = {
     { value: "length", label: "Length" },
     { value: "count", label: "Count" },
   ],
+  // A wall surface only ever measures the area of the wall face it was taken off; insulation the
+  // area of the frame's voids.
+  wall_surface: [{ value: "area", label: "Wall surface area" }],
+  wall_insulation: [{ value: "area", label: "Insulation area" }],
 };
 
 function Field({ label, children }: { label: string; children: ReactNode }) {
@@ -142,8 +149,14 @@ export function DimensionGroupPropertiesDialog({
   const [blockingCentres, setBlockingCentres] = useState(String(initialJoistRafter.blockingCentresMm));
   const [blockingSize, setBlockingSize] = useState<FramingSize>(initialJoistRafter.blockingSize);
 
+  // Wall Surface: the group-wide Deduct Openings default. Individual surfaces can override it
+  // from the canvas context menu; those overrides are stored per measurement and are untouched here.
+  const [deductOpenings, setDeductOpenings] = useState(parseWallSurfaceSettings(initial.framing_props_json).deductOpenings);
+
   const isFraming = measurementType === "timber_framing";
   const isArray = measurementType === "array";
+  const isWallSurface = isWallSurfaceType(measurementType);
+  const isInsulation = isWallInsulationType(measurementType);
   const isCount = measurementType === "count";
   const isCustomCount = isCount && countType === "custom";
   // Pitch Angle applies to Area (whole-shape slope correction), Length (a rake/rafter run, or a
@@ -194,7 +207,7 @@ export function DimensionGroupPropertiesDialog({
       node_id: initial.node_id,
       measurement_type: measurementType,
       // Framing always displays as length. Array displays as length or count.
-      default_display: isFraming ? "length" : defaultDisplay,
+      default_display: isFraming ? "length" : isWallSurface ? "area" : defaultDisplay,
       default_multiplier: parseNumber(multiplier, 1),
       // Custom count shapes are edited in mm above; everything else edits default_width/height
       // in metres directly. Marker-mode count groups don't use these — keep them unchanged.
@@ -215,7 +228,9 @@ export function DimensionGroupPropertiesDialog({
       pitch_direction_deg: showsPitchDirection && pitchDirection === "y" ? 90 : 0,
       // Persist framing settings when this is a framing group, the joist/rafter timber size when
       // this is a Joist/Rafter (array) group; otherwise keep any existing blob.
-      framing_props_json: isFraming
+      framing_props_json: isWallSurface
+        ? serializeWallSurfaceSettings({ deductOpenings })
+        : isFraming
         ? serializeFramingSettings(framingSettings)
         : isArray
           ? serializeJoistRafterSettings({
@@ -276,6 +291,31 @@ export function DimensionGroupPropertiesDialog({
               <Field label="Default Multiplier">
                 <input type="number" value={multiplier} onChange={(e) => setMultiplier(e.target.value)} style={{ ...inputStyle, flex: 1 }} />
               </Field>
+            </>
+          ) : isWallSurface ? (
+            <>
+              <Field label="Default Display">
+                <span style={{ flex: 1, fontSize: 12, color: theme.text.primary }}>
+                  {isInsulation ? "Insulation area" : "Wall surface area"}
+                </span>
+              </Field>
+              <Field label="Default Multiplier">
+                <input type="number" value={multiplier} onChange={(e) => setMultiplier(e.target.value)} style={{ ...inputStyle, flex: 1 }} />
+              </Field>
+              <div style={{ fontSize: 11, color: theme.text.secondary, textAlign: "right" }}>
+                {isInsulation
+                  ? "Measured dimensions will factor in framing volume and allow for insulation pockets only."
+                  : "Measured dimensions cover the whole wall face, as a lining is applied to the surface."}
+              </div>
+              <Field label="Deduct Openings">
+                <label style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: theme.text.secondary }}>
+                  <input type="checkbox" checked={deductOpenings} onChange={(e) => setDeductOpenings(e.target.checked)} />
+                  Deduct door and window openings
+                </label>
+              </Field>
+              <div style={{ fontSize: 11, color: theme.text.secondary, textAlign: "right" }}>
+                The group default. A surface can override it from its right-click menu.
+              </div>
             </>
           ) : !isFraming ? (
             <>

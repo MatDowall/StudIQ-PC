@@ -1,7 +1,16 @@
 import { invoke } from "@tauri-apps/api/core";
 import { create } from "zustand";
 import type { GroupProps } from "../lib/quantity";
-import { parseFramingSettings, parseWallFraming, wallMembers, type OpeningTemplate } from "../lib/framing";
+import {
+  buildWallSurfaceMeta,
+  parseFramingSettings,
+  parseWallFraming,
+  wallMembers,
+  wallPathLengthMm,
+  wallSurfaceMetaMatches,
+  type OpeningTemplate,
+} from "../lib/framing";
+import { isWallSurfaceType, parseWallSurfaceMeta, serializeWallSurfaceMeta, wallSurfaceSpanOf } from "../lib/quantity";
 import { computeWallElevations } from "../lib/elevation2d";
 import { exportElevationPdf, type WallElevationExport } from "../lib/elevationPdf";
 
@@ -41,6 +50,15 @@ export interface MeasurementDto {
   // Per-wall timber-framing extras (door/window openings, raking, manual studs) as JSON; null
   // for non-framing measurements. Parsed via lib/framing.ts.
   framing_json: string | null;
+}
+
+/** A timber-framing wall from *another* dimension group, loaded read-only so a "Wall Surface from
+ *  Framing" group can show the existing framing markup and convert its faces into surfaces. */
+export interface FramingSourceWallDto {
+  measurement: MeasurementDto;
+  framing_props_json: string | null;
+  group_name: string;
+  group_colour: string;
 }
 
 export interface PageScaleDto {
@@ -308,6 +326,11 @@ interface AppStore {
   activeBreadcrumb: string;
   overlayMeasurements: MeasurementDto[];
   overlayColour: string;
+  // Timber-framing walls on the active page belonging to OTHER dimension groups — populated only
+  // while a "Wall Surface from Framing" group is active, and shown read-only so their faces can be
+  // converted into lining/insulation surfaces. Empty for every other measurement type.
+  framingSourceWalls: FramingSourceWallDto[];
+  loadFramingSourceWalls: () => Promise<void>;
   // "add" = click to place new dimensions; "select" = pick/edit/delete existing ones.
   viewerMode: ViewerMode;
   selectedMeasurementIds: number[];
@@ -815,6 +838,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
   activeBreadcrumb: "",
   overlayMeasurements: [],
   overlayColour: "#4A9EFF",
+  framingSourceWalls: [],
   viewerMode: "add",
   selectedMeasurementIds: [],
   viewerStatus: "",
@@ -1086,6 +1110,66 @@ export const useAppStore = create<AppStore>((set, get) => ({
         measurement.id === updated.id ? updated : measurement,
       ),
     }));
+  },
+
+  // Loads the read-only framing markup a Wall Surface group works off, then re-snapshots any of
+  // this group's surfaces whose source wall has since changed (a moved wall, a new opening, an
+  // edited rake) so the linings stay in step with the framing they were extrapolated from —
+  // that live follow-through is the whole point of the measurement type. The snapshot itself
+  // stays the persisted source of truth, so quantities derive everywhere else with nothing loaded.
+  loadFramingSourceWalls: async () => {
+    const state = get();
+    const props = state.activeDimensionGroupId !== null ? state.groupProps[state.activeDimensionGroupId] : undefined;
+    if (!isWallSurfaceType(props?.measurement_type ?? "") || state.activeDrawingId === null) {
+      if (get().framingSourceWalls.length > 0) set({ framingSourceWalls: [] });
+      return;
+    }
+    const walls = await invoke<FramingSourceWallDto[]>("get_framing_walls_for_page", {
+      drawingId: state.activeDrawingId,
+      pageIndex: state.activePageIndex,
+    });
+    set({ framingSourceWalls: walls });
+
+    const mmPerPoint = get().pageScale?.mm_per_point ?? null;
+    if (!mmPerPoint) return;
+    const byId = new Map(walls.map((w) => [w.measurement.id, w]));
+    for (const surface of get().overlayMeasurements) {
+      if (!isWallSurfaceType(surface.measurement_type)) continue;
+      if (surface.dimension_group_id !== get().activeDimensionGroupId) continue;
+      const meta = parseWallSurfaceMeta(surface.framing_json);
+      const source = byId.get(meta.sourceMeasurementId);
+      if (!source) continue;
+      let wallPoints: { x: number; y: number }[];
+      try {
+        wallPoints = JSON.parse(source.measurement.geometry_json);
+      } catch {
+        continue;
+      }
+      if (!Array.isArray(wallPoints)) continue;
+      const fresh = buildWallSurfaceMeta(
+        source.measurement.id,
+        source.measurement.dimension_group_id,
+        wallPoints,
+        parseFramingSettings(source.framing_props_json),
+        mmPerPoint,
+        parseWallFraming(source.measurement.framing_json),
+        meta.side,
+        meta.deductOpenings,
+        // Re-cut to the SAME run the estimator drew. Rebuilding without this would silently
+        // widen every partial surface back out to its whole wall on the next visit.
+        wallSurfaceSpanOf(meta, wallPathLengthMm(wallPoints, mmPerPoint)),
+      );
+      if (!fresh || wallSurfaceMetaMatches(fresh, meta)) continue;
+      // The source wall moved — re-cut the surface to it, and follow its centre line too.
+      try {
+        await get().updateMeasurementFraming(surface.id, serializeWallSurfaceMeta(fresh));
+        if (source.measurement.geometry_json !== surface.geometry_json) {
+          await get().updateMeasurementGeometry(surface.id, source.measurement.geometry_json);
+        }
+      } catch {
+        /* a surface that can't be refreshed keeps its last good snapshot */
+      }
+    }
   },
 
   createProject: async (name, client, contractNumber, filePath) => {

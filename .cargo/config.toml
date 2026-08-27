@@ -1,0 +1,14 @@
+# This repo lives on a network share (\\CMNET-Data\CCM-Shared mapped to Z:). Building into the
+# default ./target on that share makes every rebuild pay SMB round-trips for thousands of small
+# artifacts — a cold `cargo tauri dev` took ~8 minutes, and even incremental relinks of the 43 MB
+# debug binary crawl. Redirecting the build output to a local disk is what makes dev-mode
+# iteration usable.
+#
+# The path is deliberately literal: cargo does NOT expand environment variables or ~ in config
+# values, so %USERPROFILE%-style paths silently become a directory called "%USERPROFILE%".
+# Cargo creates the directory if it doesn't exist. This is Windows-only, which matches the app.
+#
+# Nothing here changes what is built — only where it lands. `target/` on the share can be deleted
+# once the local dir is warm (18.6 GB reclaimed); it is gitignored either way.
+[build]
+target-dir = "C:/cargo-target/take-it-off"

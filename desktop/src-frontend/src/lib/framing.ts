@@ -6,7 +6,18 @@
 // the project convention) so it renders through `pageToScreen` like every other overlay.
 // See docs/framing/00-plan.md.
 
-import { absArrayTrims, applyArrayTrims, arrayTrimmedLengthPts, type ArrayMeta, type PagePoint } from "./quantity";
+import {
+  absArrayTrims,
+  applyArrayTrims,
+  arrayTrimmedLengthPts,
+  serializeWallSurfaceMeta,
+  type ArrayMeta,
+  type PagePoint,
+  type WallSurfaceMeta,
+  type WallSurfacePocket,
+  type WallSurfaceOpening,
+  type WallSurfaceSegment,
+} from "./quantity";
 
 /** Selectable framing sizes "D x T" (mm): D = stud depth (= plate/wall thickness in plan),
  *  T = stud thickness (face width along the wall). */
@@ -1995,4 +2006,474 @@ export function projectOntoPath(
     }
   }
   return best;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Wall Surface from Framing — building the face snapshot off a live timber-framing wall.
+//
+// The pure-number side of this model (the persisted snapshot, its parsing and the area maths)
+// lives in lib/quantity.ts so quantities derive with nothing else loaded. Everything here needs
+// the wall's real geometry/settings, so it lives with the rest of the framing math.
+// ---------------------------------------------------------------------------------------------
+
+/** Which face of a wall a surface is taken off: "left" is the +normal side of each segment
+ *  (the segment direction rotated +90°) — the same side `computeFramingGeometry` calls
+ *  `plateLeft`. Inside vs outside depends on which way the estimator drew the wall, so the two
+ *  are only ever distinguished visually, by hovering. */
+export type WallFace = "left" | "right";
+
+/** The plate line on one face of a wall — the centre path offset by half the wall's plan depth,
+ *  with the same mitred corners the plate outlines use. Takes the depth in mm rather than a
+ *  `FramingSize` because a committed surface knows only the depth it snapshotted, not the source
+ *  group's framing size. */
+export function wallFacePath(path: PagePoint[], depthMm: number, mmPerPoint: number | null, face: WallFace): PagePoint[] {
+  if (path.length < 2 || !mmPerPoint || !(mmPerPoint > 0)) return [];
+  const halfDepth = depthMm / mmPerPoint / 2;
+  return offsetPolyline(path, face === "left" ? halfDepth : -halfDepth);
+}
+
+/** The strip of wall on one face, as one closed quad per segment (centre line → face line). This
+ *  is what the canvas highlights on hover and fills for a committed surface, and what the hover
+ *  hit-test runs against — so the pickable area and the drawn area are the same polygons. */
+export function wallFaceQuads(path: PagePoint[], depthMm: number, mmPerPoint: number | null, face: WallFace): PagePoint[][] {
+  const facePath = wallFacePath(path, depthMm, mmPerPoint, face);
+  if (facePath.length < 2) return [];
+  const quads: PagePoint[][] = [];
+  for (let i = 0; i < facePath.length - 1; i += 1) {
+    if (Math.hypot(path[i + 1].x - path[i].x, path[i + 1].y - path[i].y) < GEOM_EPS) continue;
+    quads.push([path[i], path[i + 1], facePath[i + 1], facePath[i]]);
+  }
+  return quads;
+}
+
+/** The whole wall body in plan — both face strips together, one quad per segment per side. What
+ *  an INSULATION measure targets: the batt sits inside the wall, not on either face, so the wall
+ *  is picked and highlighted as a single object rather than as two selectable faces. */
+export function wallBodyQuads(path: PagePoint[], depthMm: number, mmPerPoint: number | null): PagePoint[][] {
+  return [
+    ...wallFaceQuads(path, depthMm, mmPerPoint, "left"),
+    ...wallFaceQuads(path, depthMm, mmPerPoint, "right"),
+  ];
+}
+
+/** The plan footprint of a committed surface: one quad per segment, clipped to the measured run.
+ *  A whole-wall surface reproduces `wallFaceQuads` / `wallBodyQuads` exactly; a partial one covers
+ *  only the drawn stretch. This is both what gets filled and what gets hit-tested, so what is
+ *  clickable is always what is drawn.
+ *
+ *  Insulation spans the wall body (it fills the cavity), a lining only its own face strip. Both are
+ *  measured off the CENTRE line's arc-length, which is what the snapshot's `frameStartMm` holds. */
+export function wallSurfaceSpanQuads(
+  path: PagePoint[],
+  meta: WallSurfaceMeta,
+  mmPerPoint: number | null,
+  insulation: boolean,
+): PagePoint[][] {
+  if (path.length < 2 || !mmPerPoint || !(mmPerPoint > 0)) return [];
+  const half = meta.framingDepthMm / mmPerPoint / 2;
+  const sides: number[] = insulation ? [half, -half] : [meta.side === "left" ? half : -half];
+  const quads: PagePoint[][] = [];
+
+  for (let i = 0; i < path.length - 1 && i < meta.segments.length; i += 1) {
+    const seg = meta.segments[i];
+    if (!(seg.frameLengthMm > 1e-6)) continue;
+    const a = path[i];
+    const b = path[i + 1];
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const len = Math.hypot(dx, dy);
+    if (len < GEOM_EPS) continue;
+    const dir = { x: dx / len, y: dy / len };
+    const nrm = { x: -dir.y, y: dir.x };
+    const s0 = seg.frameStartMm / mmPerPoint;
+    const s1 = (seg.frameStartMm + seg.frameLengthMm) / mmPerPoint;
+    const at = (sPts: number, off: number): PagePoint => ({
+      x: a.x + dir.x * sPts + nrm.x * off,
+      y: a.y + dir.y * sPts + nrm.y * off,
+    });
+    for (const off of sides) {
+      quads.push([at(s0, 0), at(s1, 0), at(s1, off), at(s0, off)]);
+    }
+  }
+  return quads;
+}
+
+/** True when `p` falls inside any of the face's segment quads. */
+export function pointInWallFace(p: PagePoint, quads: PagePoint[][]): boolean {
+  for (const quad of quads) {
+    let inside = false;
+    for (let i = 0, j = quad.length - 1; i < quad.length; j = i++) {
+      const xi = quad[i].x, yi = quad[i].y;
+      const xj = quad[j].x, yj = quad[j].y;
+      if (yi > p.y !== yj > p.y && p.x < ((xj - xi) * (p.y - yi)) / (yj - yi) + xi) inside = !inside;
+    }
+    if (inside) return true;
+  }
+  return false;
+}
+
+/**
+ * Snapshots one face of a framing wall into the self-contained blob a Wall Surface measurement
+ * stores. Face lengths come from the offset (mitred) plate line, not the centre line, so the
+ * inside and outside of a corner correctly differ. Heights follow the segment's rake — a plain
+ * rake is a linear start→end run, a gable rises to its apex and falls again — so raking frames
+ * are respected without the surface needing its own height. Openings are carried as their
+ * daylight hole (width × head−sill) positioned along the face, ready to deduct.
+ */
+/** Cumulative centre-line arc-length (mm) at each vertex of the wall. The coordinate a partial
+ *  span is expressed in. */
+export function wallPathArcLengths(path: PagePoint[], mmPerPoint: number): number[] {
+  const out = [0];
+  for (let i = 0; i < path.length - 1; i += 1) {
+    out.push(out[i] + Math.hypot(path[i + 1].x - path[i].x, path[i + 1].y - path[i].y) * mmPerPoint);
+  }
+  return out;
+}
+
+/** Total centre-line length of a wall (mm). */
+export function wallPathLengthMm(path: PagePoint[], mmPerPoint: number): number {
+  const cumulative = wallPathArcLengths(path, mmPerPoint);
+  return cumulative[cumulative.length - 1] ?? 0;
+}
+
+export function buildWallSurfaceMeta(
+  sourceMeasurementId: number,
+  sourceGroupId: number,
+  path: PagePoint[],
+  settings: FramingSettings,
+  mmPerPoint: number | null,
+  framing: WallFraming | undefined,
+  face: WallFace,
+  deductOpenings: boolean | null,
+  /** Measured run as cumulative centre-line arc-length (mm); omit for the whole wall. Everything
+   *  downstream reads the clipped snapshot, so a partial surface needs no special handling in the
+   *  area maths, the 3D builders or the plan fill. */
+  span?: { startMm: number; endMm: number } | null,
+): WallSurfaceMeta | null {
+  const facePath = wallFacePath(path, framingDepthMm(settings.framingSize), mmPerPoint, face);
+  if (facePath.length < 2 || !mmPerPoint) return null;
+
+  const rakes = framing?.rakes ?? [];
+  const segments: WallSurfaceSegment[] = [];
+  // Centre-line and face lengths differ at mitred corners; opening positions are set out along the
+  // centre line, so each segment carries the ratio needed to move them onto the face.
+  const faceRatios: number[] = [];
+  const cumulative = wallPathArcLengths(path, mmPerPoint);
+  const totalMm = cumulative[cumulative.length - 1] ?? 0;
+  const spanStart = span ? Math.max(0, Math.min(span.startMm, span.endMm)) : 0;
+  const spanEnd = span ? Math.min(totalMm, Math.max(span.startMm, span.endMm)) : totalMm;
+  if (spanEnd - spanStart < 1e-6) return null;
+  const partial = !!span && (spanStart > 1e-6 || spanEnd < totalMm - 1e-6);
+
+  for (let i = 0; i < path.length - 1; i += 1) {
+    const centreLenMm = Math.hypot(path[i + 1].x - path[i].x, path[i + 1].y - path[i].y) * mmPerPoint;
+    if (centreLenMm < GEOM_EPS) {
+      faceRatios.push(1);
+      continue;
+    }
+    const fullFaceLengthMm = Math.hypot(facePath[i + 1].x - facePath[i].x, facePath[i + 1].y - facePath[i].y) * mmPerPoint;
+    const ratio = centreLenMm > 0 ? fullFaceLengthMm / centreLenMm : 1;
+    faceRatios.push(ratio);
+
+    // Clip this segment to the measured run, in its own local centre-line coordinates.
+    const frameStartMm = Math.max(0, spanStart - cumulative[i]);
+    const frameEndMm = Math.min(centreLenMm, spanEnd - cumulative[i]);
+    const frameLengthMm = Math.max(0, frameEndMm - frameStartMm);
+    const faceStartMm = frameStartMm * ratio;
+    const faceLengthMm = frameLengthMm * ratio;
+
+    // Heights are sampled at the clipped ends, so a partial run across a rake picks up the
+    // roofline where it actually starts and stops rather than the whole segment's end heights.
+    const rake = rakes.find((r) => r.segmentIndex === i);
+    const heightAtLocal = (sMm: number): number => {
+      if (!rake) return settings.wallHeightMm;
+      const f = centreLenMm > 0 ? Math.max(0, Math.min(1, sMm / centreLenMm)) : 0;
+      if (rake.gable && rake.middleMm !== undefined) {
+        const apexF = centreLenMm > 0 ? Math.max(0, Math.min(1, rakeApexMm(rake, centreLenMm) / centreLenMm)) : 0.5;
+        return f <= apexF
+          ? rake.startMm + (rake.middleMm - rake.startMm) * (apexF > 0 ? f / apexF : 0)
+          : rake.middleMm + (rake.endMm - rake.middleMm) * (apexF < 1 ? (f - apexF) / (1 - apexF) : 0);
+      }
+      return rake.startMm + (rake.endMm - rake.startMm) * f;
+    };
+
+    const base = {
+      faceLengthMm,
+      faceStartMm,
+      frameStartMm,
+      frameLengthMm,
+      startHeightMm: heightAtLocal(frameStartMm),
+      endHeightMm: heightAtLocal(frameEndMm),
+    };
+    const apexMm = rake?.gable && rake.middleMm !== undefined ? rakeApexMm(rake, centreLenMm) : null;
+    if (apexMm !== null && frameLengthMm > 0 && apexMm > frameStartMm + 1e-6 && apexMm < frameEndMm - 1e-6) {
+      // The apex only survives when the measured run actually crosses it; otherwise the run sits
+      // wholly on one slope and is a plain linear rake.
+      segments.push({ ...base, apexHeightMm: rake?.middleMm, apexFrac: (apexMm - frameStartMm) / frameLengthMm });
+    } else {
+      segments.push(base);
+    }
+  }
+  if (segments.length === 0 || segments.every((seg) => seg.faceLengthMm <= 1e-6)) return null;
+
+  const openings: WallSurfaceOpening[] = [];
+  for (const opening of framing?.openings ?? []) {
+    if (opening.segmentIndex < 0 || opening.segmentIndex >= segments.length) continue;
+    const seg = segments[opening.segmentIndex];
+    const sill = opening.kind === "window" ? opening.sillHeightMm ?? 0 : 0;
+    // An opening the run only partly covers is clipped to the part actually being measured.
+    const half = opening.daylightWidthMm / 2;
+    const x0 = Math.max(opening.centreMm - half, seg.frameStartMm);
+    const x1 = Math.min(opening.centreMm + half, seg.frameStartMm + seg.frameLengthMm);
+    const widthMm = x1 - x0;
+    if (widthMm <= 1e-6) continue;
+    const frameCentreMm = (x0 + x1) / 2;
+    openings.push({
+      segmentIndex: opening.segmentIndex,
+      centreMm: frameCentreMm * (faceRatios[opening.segmentIndex] ?? 1),
+      // The frame (and so the pockets) is set out on the centre line, so an insulation measure
+      // needs the unscaled position; only a lining face-line set-out wants the mitred one.
+      frameCentreMm,
+      widthMm,
+      headMm: headHeightMm(opening),
+      sillMm: sill,
+    });
+  }
+
+  // Pockets are snapshotted unconditionally, not just for insulation groups: switching a group
+  // between Lining and Insulation is then a pure display change with no re-snapshot to go stale.
+  const pockets = clipPocketsToSegments(wallInsulationPockets(path, settings, mmPerPoint, framing), segments);
+
+  return {
+    type: "wall_surface",
+    sourceMeasurementId,
+    sourceGroupId,
+    side: face,
+    deductOpenings,
+    framingDepthMm: framingDepthMm(settings.framingSize),
+    segments,
+    openings,
+    pockets,
+    spanStartMm: partial ? spanStart : null,
+    spanEndMm: partial ? spanEnd : null,
+  };
+}
+
+/** Trims pockets to each segment measured run, interpolating the sloped edges at the cut so a run
+ *  ending mid-bay under a rake keeps the right trapezoid rather than a square end. */
+function clipPocketsToSegments(pockets: WallPocket[], segments: WallSurfaceSegment[]): WallPocket[] {
+  const out: WallPocket[] = [];
+  for (const pocket of pockets) {
+    const seg = segments[pocket.segmentIndex];
+    if (!seg || seg.frameLengthMm <= 1e-6) continue;
+    const lo = seg.frameStartMm;
+    const hi = seg.frameStartMm + seg.frameLengthMm;
+    const x0 = Math.max(pocket.x0, lo);
+    const x1 = Math.min(pocket.x1, hi);
+    if (x1 - x0 <= 1e-6) continue;
+    if (x0 === pocket.x0 && x1 === pocket.x1) {
+      out.push(pocket);
+      continue;
+    }
+    const width = pocket.x1 - pocket.x0;
+    const at = (x: number, v0: number, v1: number) => (width > 1e-9 ? v0 + ((v1 - v0) * (x - pocket.x0)) / width : v0);
+    out.push({
+      segmentIndex: pocket.segmentIndex,
+      x0,
+      x1,
+      yb0: at(x0, pocket.yb0, pocket.yb1),
+      yb1: at(x1, pocket.yb0, pocket.yb1),
+      yt0: at(x0, pocket.yt0, pocket.yt1),
+      yt1: at(x1, pocket.yt0, pocket.yt1),
+    });
+  }
+  return out;
+}
+
+/** True when two snapshots describe the same face — used to tell whether a surface has drifted
+ *  from the framing it was taken off and needs re-snapshotting. Ignores `deductOpenings`, which
+ *  is the estimator's own choice and never follows the wall. */
+export function wallSurfaceMetaMatches(a: WallSurfaceMeta, b: WallSurfaceMeta): boolean {
+  return serializeWallSurfaceMeta({ ...a, deductOpenings: null }) === serializeWallSurfaceMeta({ ...b, deductOpenings: null });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Insulation pockets — the voids in the frame a batt actually fills.
+//
+// A lining covers the whole wall face; insulation only occupies what is left between the framing.
+// So rather than subtracting a framing area from the face, this derives the voids themselves, in
+// each segment's own along-wall / height plane, straight from `wallMembers` — the one member list
+// the 2D takeoff, the 3D view and the framing quantities already share. The pockets it returns
+// drive BOTH the insulation quantity and the batts drawn in 3D, so those can never disagree.
+//
+// Note the set-out is measured along the wall's CENTRE line, not the face line a lining uses: a
+// batt is cut to the frame it drops into, and the frame is set out on the centre line. The two
+// differ only at a mitred corner, and the corner cavity itself is occupied by the adjacent wall's
+// corner makeup, which belongs to that wall's own segments — so pockets there are approximate.
+// ---------------------------------------------------------------------------------------------
+
+/** One void in the frame, in a segment's along-wall (`x`, mm from the segment start) / height
+ *  (`y`, mm above FFL) plane. Edges are linear between `x0` and `x1`, so a pocket clipped by a
+ *  rake is a trapezoid rather than a rectangle. */
+export interface WallPocket {
+  segmentIndex: number;
+  x0: number;
+  x1: number;
+  yb0: number;
+  yb1: number;
+  yt0: number;
+  yt1: number;
+}
+
+/** A member (or opening) projected into a segment's along/height plane, with linear top and
+ *  bottom edges — the general form that covers plain rectangles and rake-cut wedges alike. */
+interface PocketBlocker {
+  x0: number;
+  x1: number;
+  yb0: number;
+  yb1: number;
+  yt0: number;
+  yt1: number;
+}
+
+function blockerAt(b: PocketBlocker, x: number): { yb: number; yt: number } {
+  const span = b.x1 - b.x0;
+  const t = span > GEOM_EPS ? Math.max(0, Math.min(1, (x - b.x0) / span)) : 0;
+  return { yb: b.yb0 + (b.yb1 - b.yb0) * t, yt: b.yt0 + (b.yt1 - b.yt0) * t };
+}
+
+export function wallInsulationPockets(
+  path: PagePoint[],
+  settings: FramingSettings,
+  mmPerPoint: number | null,
+  framing?: WallFraming,
+): WallPocket[] {
+  if (path.length < 2 || !mmPerPoint || !(mmPerPoint > 0)) return [];
+  const S = mmPerPoint / 1000;
+  const members = wallMembers(path, settings, mmPerPoint, framing);
+  const rakes = framing?.rakes ?? [];
+  const openings = framing?.openings ?? [];
+  const pockets: WallPocket[] = [];
+
+  for (let i = 0; i < path.length - 1; i += 1) {
+    const a = path[i];
+    const b = path[i + 1];
+    const dxp = b.x - a.x;
+    const dyp = b.y - a.y;
+    const lenPts = Math.hypot(dxp, dyp);
+    if (lenPts < GEOM_EPS) continue;
+    const dir = { x: dxp / lenPts, y: dyp / lenPts };
+    const segLenMm = lenPts * mmPerPoint;
+
+    // World position -> arc-length along this segment (mm). Inverts the fx/fz mapping
+    // `wallMembers` uses: world X = pageX * S, world Z = -pageY * S.
+    const alongMm = (pos: [number, number, number]): number => {
+      const px = pos[0] / S;
+      const py = -pos[2] / S;
+      return ((px - a.x) * dir.x + (py - a.y) * dir.y) * mmPerPoint;
+    };
+
+    const blockers: PocketBlocker[] = [];
+    for (const m of members) {
+      if (m.segmentIndex !== i) continue;
+      const s = alongMm(m.position);
+      const wedge = m.wedge;
+      if (wedge) {
+        // A wedge is vertical-sided: exactly two distinct local x values, each with a low and a
+        // high corner. That is already the linear-edged form a blocker wants.
+        const xs = wedge.quad.map((q) => q[0] * 1000);
+        const xMin = Math.min(...xs);
+        const xMax = Math.max(...xs);
+        const cornersAt = (xv: number) => {
+          const ys = wedge.quad
+            .filter((q) => Math.abs(q[0] * 1000 - xv) < 1e-6)
+            .map((q) => (m.position[1] + q[1]) * 1000);
+          return ys.length ? { lo: Math.min(...ys), hi: Math.max(...ys) } : null;
+        };
+        const lo = cornersAt(xMin);
+        const hi = cornersAt(xMax);
+        if (!lo || !hi) continue;
+        blockers.push({ x0: s + xMin, x1: s + xMax, yb0: lo.lo, yb1: hi.lo, yt0: lo.hi, yt1: hi.hi });
+      } else {
+        // Box members are centred on `position` in both the along and the vertical axis.
+        const halfAlong = (m.size[0] * 1000) / 2;
+        const yb = (m.position[1] - m.size[1] / 2) * 1000;
+        const yt = (m.position[1] + m.size[1] / 2) * 1000;
+        blockers.push({ x0: s - halfAlong, x1: s + halfAlong, yb0: yb, yb1: yb, yt0: yt, yt1: yt });
+      }
+    }
+
+    // A daylight opening is a hole, not a pocket — there is nothing to insulate in a doorway.
+    for (const opening of openings) {
+      if (opening.segmentIndex !== i) continue;
+      const sill = opening.kind === "window" ? opening.sillHeightMm ?? 0 : 0;
+      const head = headHeightMm(opening);
+      const half = opening.daylightWidthMm / 2;
+      blockers.push({
+        x0: opening.centreMm - half,
+        x1: opening.centreMm + half,
+        yb0: sill,
+        yb1: sill,
+        yt0: head,
+        yt1: head,
+      });
+    }
+
+    const rake = rakes.find((r) => r.segmentIndex === i);
+    const apexMm = rake?.gable && rake.middleMm !== undefined ? rakeApexMm(rake, segLenMm) : null;
+    const roofAt = (x: number): number => {
+      if (!rake) return settings.wallHeightMm;
+      const f = Math.max(0, Math.min(1, x / segLenMm));
+      if (rake.gable && rake.middleMm !== undefined) {
+        const apexF = segLenMm > 0 ? Math.max(0, Math.min(1, (apexMm ?? segLenMm / 2) / segLenMm)) : 0.5;
+        return f <= apexF
+          ? rake.startMm + (rake.middleMm - rake.startMm) * (apexF > 0 ? f / apexF : 0)
+          : rake.middleMm + (rake.endMm - rake.middleMm) * (apexF < 1 ? (f - apexF) / (1 - apexF) : 0);
+      }
+      return rake.startMm + (rake.endMm - rake.startMm) * f;
+    };
+
+    // Split the segment wherever any member starts or ends, so that within a slab the SET of
+    // covering members never changes and their y-intervals stay disjoint and consistently ordered.
+    const edges = new Set<number>([0, segLenMm]);
+    if (apexMm !== null) edges.add(Math.max(0, Math.min(segLenMm, apexMm)));
+    for (const blocker of blockers) {
+      for (const x of [blocker.x0, blocker.x1]) {
+        if (x > GEOM_EPS && x < segLenMm - GEOM_EPS) edges.add(x);
+      }
+    }
+    const xs = Array.from(edges).sort((p, q) => p - q);
+
+    for (let k = 0; k < xs.length - 1; k += 1) {
+      const xa = xs[k];
+      const xb = xs[k + 1];
+      if (xb - xa < 1e-6) continue;
+      const mid = (xa + xb) / 2;
+      const covering = blockers
+        .filter((blocker) => blocker.x0 < mid && blocker.x1 > mid)
+        .map((blocker) => ({ a: blockerAt(blocker, xa), b: blockerAt(blocker, xb), mid: blockerAt(blocker, mid) }))
+        .sort((p, q) => p.mid.yb - q.mid.yb);
+
+      // Sweep up the slab: every gap between one blocker's top and the next one's bottom is a
+      // pocket, capped by the roofline. Taking a running max of the tops tolerates overlapping
+      // members rather than emitting a negative-height pocket.
+      let cursorA = 0;
+      let cursorB = 0;
+      const emit = (topA: number, topB: number) => {
+        const yt0 = Math.min(topA, roofAt(xa));
+        const yt1 = Math.min(topB, roofAt(xb));
+        if (yt0 - cursorA > 1e-6 || yt1 - cursorB > 1e-6) {
+          pockets.push({ segmentIndex: i, x0: xa, x1: xb, yb0: cursorA, yb1: cursorB, yt0, yt1 });
+        }
+      };
+      for (const c of covering) {
+        emit(c.a.yb, c.b.yb);
+        cursorA = Math.max(cursorA, c.a.yt);
+        cursorB = Math.max(cursorB, c.b.yt);
+      }
+      emit(roofAt(xa), roofAt(xb));
+    }
+  }
+
+  return pockets;
 }

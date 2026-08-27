@@ -1,10 +1,10 @@
 {
   "name": "pdf-cad-frontend",
-  "version": "0.1.41",
+  "version": "0.1.42",
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build && cargo build --manifest-path ../../Cargo.toml --package core --bin pdf_renderer --release",
+    "build": "tsc && vite build && cargo build --manifest-path ../../Cargo.toml --package core --bin pdf_renderer --release && node scripts/copy-renderer.mjs",
     "preview": "vite preview",
     "test": "vitest run"
   },

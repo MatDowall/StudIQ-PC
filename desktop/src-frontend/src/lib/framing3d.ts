@@ -5,10 +5,18 @@
 // "PDF Y → world -Z" convention. Each box member is rotated `yaw` about Y and `pitch` about its
 // across-axis.
 
-import { absArrayTrims, applyArrayTrims, type ArrayMeta, type PagePoint } from "./quantity";
+import {
+  absArrayTrims,
+  applyArrayTrims,
+  wallInsulationPocketsFor,
+  type ArrayMeta,
+  type PagePoint,
+  type WallSurfaceMeta,
+} from "./quantity";
 import {
   arrayBlockingPieces,
   framingDepthMm,
+  wallFacePath,
   wallMembers,
   STUD_THICKNESS_MM,
   type FramingComponentKind,
@@ -329,4 +337,220 @@ export function computeAreaMesh3D(
     heightM: Math.max(opts.heightM, MIN_AREA_HEIGHT_M),
     color: opts.color,
   };
+}
+
+/** Lining panel thickness (m) used to give a Wall Surface a visible body in 3D. It is purely
+ *  representational — the quantity is an area and carries no thickness. */
+const WALL_SURFACE_THICKNESS_M = 0.02;
+
+/** Splits a face segment's full-height profile into the vertical strips left once its openings
+ *  are punched out: solid full-height pieces either side, plus the spandrel above each head and
+ *  the apron below each sill. Ranges are along-face metres; heights come from `heightAt`. */
+function wallSurfaceStrips(
+  lengthM: number,
+  openings: { x0: number; x1: number; sillM: number; headM: number }[],
+  heightAt: (x: number) => number,
+): { x0: number; x1: number; y0: (x: number) => number; y1: (x: number) => number }[] {
+  const out: { x0: number; x1: number; y0: (x: number) => number; y1: (x: number) => number }[] = [];
+  const sorted = [...openings].sort((a, b) => a.x0 - b.x0);
+  let cursor = 0;
+  for (const op of sorted) {
+    const x0 = Math.max(0, Math.min(lengthM, op.x0));
+    const x1 = Math.max(0, Math.min(lengthM, op.x1));
+    if (x0 > cursor + 1e-9) out.push({ x0: cursor, x1: x0, y0: () => 0, y1: heightAt });
+    if (x1 > x0) {
+      if (op.sillM > 1e-9) out.push({ x0, x1, y0: () => 0, y1: () => op.sillM });
+      out.push({ x0, x1, y0: () => op.headM, y1: heightAt });
+    }
+    cursor = Math.max(cursor, x1);
+  }
+  if (cursor < lengthM - 1e-9) out.push({ x0: cursor, x1: lengthM, y0: () => 0, y1: heightAt });
+  return out;
+}
+
+/**
+ * A "wall surface" measurement's 3D geometry: one thin upright panel per face segment, standing on
+ * the wall's face line and following the segment's rake (a gable segment is split at its apex, so
+ * both slopes are true). When the surface deducts openings the panel is split around each hole, so
+ * what's drawn is exactly the area that was measured.
+ *
+ * `points` is the source wall's centre line (as stored in `geometry_json`); the face offset comes
+ * from the snapshot's own `framingDepthMm`, so the panel lands on the same face the 2D canvas fills.
+ */
+/**
+ * An insulation measure's 3D geometry: one batt per pocket, sitting in the frame's voids rather
+ * than covering the wall face. Pockets are set out along the wall's CENTRE line (that is where the
+ * frame is set out), so each batt is placed off the centre-line segment and pushed out onto the
+ * face — not off the mitred face path a lining panel uses.
+ *
+ * Batts are drawn the full depth of the framing, since that is what a batt fills. `meta.side` is
+ * deliberately unused here: both faces of a wall look into the same cavity, so measuring the
+ * insulation off either face gives the same batts in the same place.
+ */
+function computeWallBatts3D(
+  points: PagePoint[],
+  mmPerPoint: number | null,
+  meta: WallSurfaceMeta,
+  opts: { offsetM: number; color: string; deductOpenings: boolean },
+): Member3D[] {
+  if (!mmPerPoint || !(mmPerPoint > 0) || points.length < 2) return [];
+  const S = mmPerPoint / 1000;
+  const depthM = meta.framingDepthMm / 1000;
+  const members: Member3D[] = [];
+  // Same list the quantity sums, so a surface that isn't deducting openings shows a batt filling
+  // the daylight too rather than drawing less than it charges for.
+  const pocketList = wallInsulationPocketsFor(meta, opts.deductOpenings);
+
+  for (const pocket of pocketList) {
+    const a = points[pocket.segmentIndex];
+    const b = points[pocket.segmentIndex + 1];
+    if (!a || !b) continue;
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const len = Math.hypot(dx, dy);
+    if (len < 1e-9) continue;
+    const dir = { x: dx / len, y: dy / len };
+    const yaw = Math.atan2(dir.y, dir.x);
+
+    const width = (pocket.x1 - pocket.x0) / 1000;
+    const yb0 = pocket.yb0 / 1000;
+    const yb1 = pocket.yb1 / 1000;
+    const yt0 = Math.max(pocket.yt0 / 1000, yb0);
+    const yt1 = Math.max(pocket.yt1 / 1000, yb1);
+    if (width < 1e-9 || (yt0 - yb0 < 1e-9 && yt1 - yb1 < 1e-9)) continue;
+
+    // Start of the pocket on the centre line, then out to the middle of the wall's own depth —
+    // the batt sits inside the frame, so it straddles the centre line rather than standing off it.
+    const startPage = { x: a.x + dir.x * (pocket.x0 / mmPerPoint), y: a.y + dir.y * (pocket.x0 / mmPerPoint) };
+    const [originX, originZ] = pageToWorld(startPage, S);
+    members.push({
+      kind: "generic",
+      position: [originX, opts.offsetM, originZ],
+      size: [width, Math.max(yt0, yt1), depthM],
+      yaw,
+      pitch: 0,
+      color: opts.color,
+      wedge: {
+        quad: [
+          [0, yb0],
+          [width, yb1],
+          [width, yt1],
+          [0, yt0],
+        ],
+        depthM,
+      },
+    });
+  }
+
+  return members;
+}
+
+export function computeWallSurface3D(
+  points: PagePoint[],
+  mmPerPoint: number | null,
+  meta: WallSurfaceMeta,
+  opts: { offsetM: number; color: string; deductOpenings: boolean; insulation?: boolean },
+): Member3D[] {
+  // Insulation shows the batts filling the frame's pockets instead of a sheet over the face.
+  if (opts.insulation) {
+    return computeWallBatts3D(points, mmPerPoint, meta, {
+      offsetM: opts.offsetM,
+      color: opts.color,
+      deductOpenings: opts.deductOpenings,
+    });
+  }
+  if (!mmPerPoint || !(mmPerPoint > 0) || points.length < 2 || meta.segments.length === 0) return [];
+  const S = mmPerPoint / 1000;
+  const members: Member3D[] = [];
+
+  // The panel's own centre plane, mitred. Offsetting the centre line by (depth + thickness)/2 is
+  // exactly `wallFacePath` at that widened depth, so the mitre at every corner is computed the
+  // same way the plate lines are and consecutive panels meet on a shared vertex. Pushing each
+  // panel out along its OWN segment normal instead would leave a gap of the panel thickness at
+  // every corner — the two segments' normals differ there.
+  const panelPath = wallFacePath(points, meta.framingDepthMm + WALL_SURFACE_THICKNESS_M * 1000, mmPerPoint, meta.side);
+  if (panelPath.length < 2) return [];
+  // Whether this surface covers only part of the wall — the snapshot is the authority.
+  const partialRun = meta.spanStartMm !== null || meta.spanEndMm !== null;
+
+  for (let i = 0; i < meta.segments.length && i < panelPath.length - 1; i += 1) {
+    const seg = meta.segments[i];
+    const a = panelPath[i];
+    const b = panelPath[i + 1];
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const len = Math.hypot(dx, dy);
+    if (len < 1e-9 || !(seg.faceLengthMm > 0)) continue;
+    const dir = { x: dx / len, y: dy / len };
+    const yaw = Math.atan2(dir.y, dir.x);
+
+    // A partial surface starts partway along the segment, so advance along the panel path by the
+    // snapshot's own face offset before laying the panel down.
+    const faceOffsetM = seg.faceStartMm / 1000;
+    const [segOriginX, segOriginZ] = pageToWorld(a, S);
+    const originX = segOriginX + Math.cos(yaw) * faceOffsetM;
+    const originZ = segOriginZ - Math.sin(yaw) * faceOffsetM;
+
+    // A whole-wall panel spans its own mitred length rather than the snapshot plate-line face
+    // length, so corners close exactly; the two differ by at most half the panel thickness at a
+    // mitred end. A partial run has real ends of its own, so it uses the measured length directly.
+    // Note this must key off the snapshot's own span, NOT off comparing those two lengths — at a
+    // mitred corner they differ by design, which would mistake a whole wall for a partial run and
+    // reopen the corner gap.
+    const lengthM = partialRun ? seg.faceLengthMm / 1000 : len * S;
+    const startM = seg.startHeightMm / 1000;
+    const endM = seg.endHeightMm / 1000;
+    const apexM = seg.apexHeightMm !== undefined ? seg.apexHeightMm / 1000 : null;
+    const apexX = apexM !== null ? Math.max(0, Math.min(1, seg.apexFrac ?? 0.5)) * lengthM : null;
+    const heightAt = (x: number): number => {
+      if (apexM === null || apexX === null) return startM + ((endM - startM) * x) / lengthM;
+      return x <= apexX
+        ? startM + (apexX > 0 ? ((apexM - startM) * x) / apexX : 0)
+        : apexM + (apexX < lengthM ? ((endM - apexM) * (x - apexX)) / (lengthM - apexX) : 0);
+    };
+
+    const holes = opts.deductOpenings
+      ? meta.openings
+          .filter((o) => o.segmentIndex === i && o.widthMm > 0 && o.headMm > o.sillMm)
+          .map((o) => ({
+            x0: (o.centreMm - o.widthMm / 2) / 1000,
+            x1: (o.centreMm + o.widthMm / 2) / 1000,
+            sillM: o.sillMm / 1000,
+            headM: o.headMm / 1000,
+          }))
+      : [];
+
+    for (const strip of wallSurfaceStrips(lengthM, holes, heightAt)) {
+      // The apex splits a gable strip in two so each half stays a straight-topped quad.
+      const cuts = apexX !== null && apexX > strip.x0 + 1e-9 && apexX < strip.x1 - 1e-9
+        ? [[strip.x0, apexX], [apexX, strip.x1]]
+        : [[strip.x0, strip.x1]];
+      for (const [x0, x1] of cuts) {
+        const yb0 = strip.y0(x0);
+        const yb1 = strip.y0(x1);
+        const yt0 = Math.max(strip.y1(x0), yb0);
+        const yt1 = Math.max(strip.y1(x1), yb1);
+        if (x1 - x0 < 1e-9 || (yt0 - yb0 < 1e-9 && yt1 - yb1 < 1e-9)) continue;
+        members.push({
+          kind: "generic",
+          position: [originX + Math.cos(yaw) * x0, opts.offsetM, originZ - Math.sin(yaw) * x0],
+          size: [x1 - x0, Math.max(yt0, yt1), WALL_SURFACE_THICKNESS_M],
+          yaw,
+          pitch: 0,
+          color: opts.color,
+          wedge: {
+            quad: [
+              [0, yb0],
+              [x1 - x0, yb1],
+              [x1 - x0, yt1],
+              [0, yt0],
+            ],
+            depthM: WALL_SURFACE_THICKNESS_M,
+          },
+        });
+      }
+    }
+  }
+
+  return members;
 }

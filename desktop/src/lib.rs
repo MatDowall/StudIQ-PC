@@ -377,6 +377,17 @@ pub struct MeasurementDto {
     pub framing_json: Option<String>,
 }
 
+/// A timber-framing wall as seen from *outside* its own dimension group — the measurement plus
+/// the owning group's framing settings, name and colour. Read-only source data for the
+/// "Wall Surface from Framing" measurement type.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct FramingSourceWallDto {
+    pub measurement: MeasurementDto,
+    pub framing_props_json: Option<String>,
+    pub group_name: String,
+    pub group_colour: String,
+}
+
 /// Per-drawing-page scale. `mm_per_point` converts PDF points to real-world millimetres
 /// (the canonical internal unit); `unit` is the user's preferred display unit (e.g. "m").
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
@@ -1669,6 +1680,9 @@ async fn create_dimension_group(
     // like timber_framing — matches DISPLAYS_BY_TYPE.array[0] in the properties dialog.
     let default_display = match mtype.as_str() {
         "timber_framing" | "array" => "length",
+        // Both framing-derived surface types are always an area — of one wall face for a lining,
+        // of the frame's voids for insulation. See DISPLAYS_BY_TYPE in the properties dialog.
+        "wall_surface" | "wall_insulation" => "area",
         _ => mtype.as_str(),
     };
 
@@ -1999,6 +2013,64 @@ async fn get_measurements_for_group(
     rows.iter().map(measurement_from_row).collect()
 }
 
+/// Every timber-framing wall drawn on one drawing page, with the framing settings and colour of
+/// the dimension group that owns it.
+///
+/// This is what a "Wall Surface from Framing" group reads to show the existing framing markup in
+/// read-only mode: the walls it lets the estimator convert into lining/insulation surfaces belong
+/// to *other* dimension groups, which are not loaded by `get_measurements_for_group`.
+#[tauri::command]
+async fn get_framing_walls_for_page(
+    drawing_id: i64,
+    page_index: i64,
+    state: State<'_, AppState>,
+) -> Result<Vec<FramingSourceWallDto>, String> {
+    let db = active_project_db(&state)?;
+
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            m.id,
+            m.dimension_group_id,
+            m.drawing_id,
+            m.page_index,
+            m.measurement_type,
+            m.geometry_json,
+            m.polarity,
+            m.quantity,
+            m.uom,
+            m.framing_json,
+            p.framing_props_json AS framing_props_json,
+            n.name AS group_name,
+            n.colour AS group_colour
+        FROM measurements m
+        JOIN tree_nodes n ON n.id = m.dimension_group_id
+        LEFT JOIN dimension_group_props p ON p.node_id = m.dimension_group_id
+        WHERE m.drawing_id = ? AND m.page_index = ? AND m.measurement_type = 'timber_framing'
+        ORDER BY m.id
+    "#,
+    )
+    .bind(drawing_id)
+    .bind(page_index)
+    .fetch_all(&db)
+    .await
+    .map_err(|e| format!("Failed to load framing walls: {e}"))?;
+
+    rows.iter()
+        .map(|row| {
+            Ok(FramingSourceWallDto {
+                measurement: measurement_from_row(row)?,
+                framing_props_json: row.try_get("framing_props_json").map_err(|e: sqlx::Error| e.to_string())?,
+                group_name: row.try_get("group_name").map_err(|e: sqlx::Error| e.to_string())?,
+                group_colour: row
+                    .try_get::<Option<String>, _>("group_colour")
+                    .map_err(|e: sqlx::Error| e.to_string())?
+                    .unwrap_or_else(|| "#4A9EFF".to_string()),
+            })
+        })
+        .collect()
+}
+
 /// Maps a `measurements` row (selected with the canonical column list) to a `MeasurementDto`.
 fn measurement_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<MeasurementDto, String> {
     Ok(MeasurementDto {
@@ -2066,7 +2138,9 @@ async fn create_measurement(
     verify_node_type(&db, dimension_group_id, "dimension_group").await?;
     verify_node_type(&db, drawing_id, "drawing").await?;
 
-    if !matches!(measurement_type.as_str(), "count" | "length" | "area" | "timber_framing" | "array") {
+    // Shares MEASUREMENT_TYPES with create_dimension_group/set_dimension_group_props rather than
+    // repeating the list — a second hardcoded copy here silently rejected a valid new type.
+    if !MEASUREMENT_TYPES.contains(&measurement_type.as_str()) {
         return Err(format!(
             "Unsupported measurement_type: {measurement_type}"
         ));
@@ -2255,7 +2329,9 @@ async fn get_page_scale(
     .transpose()
 }
 
-const MEASUREMENT_TYPES: [&str; 5] = ["count", "length", "area", "timber_framing", "array"];
+const MEASUREMENT_TYPES: [&str; 7] = [
+    "count", "length", "area", "timber_framing", "array", "wall_surface", "wall_insulation",
+];
 const DISPLAY_TYPES: [&str; 7] = ["count", "length", "area", "perimeter", "wall_area", "volume", "weight"];
 const COUNT_TYPES: [&str; 2] = ["marker", "custom"];
 const LINE_STYLES: [&str; 4] = ["solid", "dashed", "dotted", "dash_dot"];
@@ -4330,6 +4406,35 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), String> {
         }
     }
 
+    // Insulation began as a radio button inside the "wall_surface" type and is now its own
+    // measurement type. Promote any group still carrying the old flag, and its measurements with
+    // it — the frontend dispatches on measurement_type, so a group left behind would silently
+    // revert to measuring whole wall faces as linings.
+    sqlx::query(
+        r#"
+        UPDATE measurements SET measurement_type = 'wall_insulation'
+        WHERE measurement_type = 'wall_surface'
+          AND dimension_group_id IN (
+            SELECT node_id FROM dimension_group_props
+            WHERE measurement_type = 'wall_surface'
+              AND json_extract(framing_props_json, '$.measureType') = 'insulation'
+          )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| format!("Failed to migrate wall insulation measurements: {e}"))?;
+    sqlx::query(
+        r#"
+        UPDATE dimension_group_props SET measurement_type = 'wall_insulation'
+        WHERE measurement_type = 'wall_surface'
+          AND json_extract(framing_props_json, '$.measureType') = 'insulation'
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| format!("Failed to migrate wall insulation groups: {e}"))?;
+
     // Per-drawing-page scale calibration (M3). One row per (drawing, page).
     sqlx::query(
         r#"
@@ -5872,6 +5977,7 @@ pub fn run() {
             rename_node,
             update_dimension_group_colour,
             get_measurements_for_group,
+            get_framing_walls_for_page,
             create_measurement,
             update_measurement_geometry,
             update_measurement_framing,

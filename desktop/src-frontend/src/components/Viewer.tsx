@@ -5,13 +5,14 @@ import { theme } from "../theme";
 import { DocumentMeta, ViewerCanvas } from "./ViewerCanvas";
 import { Framing3DView, type Framing3DPage } from "./Framing3DView";
 import { parseFramingSettings, parseJoistRafterSettings, parseWallFraming } from "../lib/framing";
-import { parseArrayMeta } from "../lib/quantity";
+import { isWallInsulationType, isWallSurfaceType, parseArrayMeta, parseWallSurfaceMeta, wallSurfaceDeducts } from "../lib/quantity";
 import {
   computeAreaMesh3D,
   computeArrayMembers3D,
   computeCountMarker3D,
   computeLengthMembers3D,
   computeWall3D,
+  computeWallSurface3D,
   offsetMembers,
   type AreaMesh3D,
   type Member3D,
@@ -101,6 +102,16 @@ export function Viewer() {
             pitchAngleDeg: props?.pitch_angle_deg ?? 0,
           }),
         );
+      } else if (isWallSurfaceType(mz.measurement_type)) {
+        const meta = parseWallSurfaceMeta(mz.framing_json);
+        members.push(
+          ...computeWallSurface3D(pts, mmpp, meta, {
+            offsetM,
+            color,
+            deductOpenings: wallSurfaceDeducts(meta, { framing_props_json: props?.framing_props_json ?? null }),
+            insulation: isWallInsulationType(mz.measurement_type),
+          }),
+        );
       } else if (mz.measurement_type === "length") {
         members.push(
           ...computeLengthMembers3D(pts, mmpp, {
@@ -163,6 +174,16 @@ export function Viewer() {
                   offsetM: g.defaultOffsetM,
                   color,
                   pitchAngleDeg: g.pitchAngleDeg,
+                }),
+              );
+            } else if (isWallSurfaceType(g.measurementType)) {
+              const meta = parseWallSurfaceMeta(mz.framing_json);
+              members.push(
+                ...computeWallSurface3D(pts, p.mmPerPoint, meta, {
+                  offsetM: g.defaultOffsetM,
+                  color,
+                  deductOpenings: wallSurfaceDeducts(meta, { framing_props_json: g.framingPropsJson }),
+                  insulation: isWallInsulationType(g.measurementType),
                 }),
               );
             } else if (g.measurementType === "length") {

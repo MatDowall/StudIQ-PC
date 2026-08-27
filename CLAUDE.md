@@ -213,6 +213,133 @@ Unlike a framing group, an array group's row gets **no Quantity Build-up sub-she
 quantity is a flat member-run + blocking total with nothing to itemise into Description/Length
 rows.
 
+### Wall Surface from Framing reads other groups' framing, read-only
+
+The `wall_surface` measurement type turns walls that have **already** been measured as Timber
+Framing into lining / insulation surfaces, so linings never have to be re-measured. It owns no
+geometry of its own: while a wall_surface group is active, every timber-framing wall on the page —
+including walls belonging to **other** dimension groups, which `get_measurements_for_group` never
+loads — is fetched by the `get_framing_walls_for_page` command into `framingSourceWalls` and drawn
+**read-only**, in a neutral grey (`READONLY_FRAMING_COLOUR`, dashed, 45% alpha) that belongs to no
+dimension group. That styling is the cue that the estimator is *not* in the framing group that owns
+these walls: they can't be moved, resized, or given openings/rakes here, and right-clicking one
+offers nothing (they aren't in `overlayMeasurements`, so `hitTestMeasurementId` never sees them).
+Hovering the left or right face highlights that face's strip; a click commits it.
+
+**The measurement is geometry + a self-contained snapshot.** `geometry_json` holds the source
+wall's centre line (so the surface lives on the page and hit-tests like anything else — though it
+is picked and drawn by its *face* strip, `wallFaceQuads`, never by that centre line), and
+`framing_json` holds a `WallSurfaceMeta`: which wall/group/side it came off, the wall's plan depth,
+and per segment the **face** length plus its top-plate height profile, plus each opening's daylight
+hole. Face lengths come from the mitred offset line (`wallFacePath`), so the inside and outside of a
+corner correctly differ by half the wall depth per mitred end. The snapshot is deliberately pure
+numbers, which is why `wallSurfaceAreaM2` lives in `quantity.ts` alongside `deriveQuantity`:
+quantities derive with no page scale and nothing else loaded (sidebar, workbook, Excel bridge all
+agree), and `quantity.ts` still doesn't import `lib/framing.ts` — the cycle rule the Joist/Rafter
+blocking note above explains. The *builders* (`buildWallSurfaceMeta`, `wallFacePath`,
+`wallFaceQuads`, `pointInWallFace`) need real wall geometry, so they live in `framing.ts`.
+
+**Raking frames are respected**: a plain rake contributes its mean height over the segment, a gable
+is two runs meeting at the apex (`apexFrac`), which is why a segment carries a height profile rather
+than a single wall height.
+
+**Openings are deducted by default.** The group-wide default lives in the group's
+`framing_props_json` (`WallSurfaceSettings.deductOpenings`, edited in the properties dialog); each
+surface may override it from its right-click menu (`WallSurfaceMeta.deductOpenings`, `null` =
+follow the group). `wallSurfaceDeducts` is the single place that resolves the two.
+
+**The snapshot stays live.** `loadFramingSourceWalls` re-derives every surface's snapshot from the
+wall it came off each time the group is opened on that page, and rewrites it (and the centre line)
+when the framing has moved, gained an opening, or been re-raked — that follow-through is the point
+of the type. `wallSurfaceMetaMatches` is the drift test, and it ignores `deductOpenings`, which is
+the estimator's choice and never follows the wall. The persisted snapshot remains the source of
+truth everywhere else.
+
+**Lining and insulation are two distinct measurement types**, `wall_surface` and `wall_insulation`,
+sharing this entire model — the same snapshot, the same read-only framing interaction, the same
+`buildWallSurfaceMeta`. `isWallSurfaceType` matches either; `isWallInsulationType` only the second,
+and it is what every fork keys off. (Insulation began as a radio inside `wall_surface`; a startup
+migration promotes any group still carrying `framing_props_json.measureType === "insulation"`, and
+its measurements with it, since the frontend dispatches on `measurement_type`.)
+
+A lining is applied *to* the surface, so it covers the
+whole face. Insulation goes *into* the frame, so it only occupies the voids between studs, dwangs,
+plates, lintels, sills and jacks. Rather than subtracting a framing area from the face,
+`wallInsulationPockets` derives **the voids themselves** off `wallMembers` — the same member list
+the framing takeoff and 3D already share — and those pockets drive both the quantity
+(`wallInsulationAreaM2`) and the batts drawn in 3D (`computeWallBatts3D`), so the two can't
+disagree. `wallSurfaceMeasureM2` is the single place the types diverge.
+
+The pocket sweep works per wall segment in its along/height plane: every member is projected to a
+blocker with *linear* top and bottom edges (which covers plain rectangles and rake-cut wedges
+alike), the segment is split at every blocker edge so the covering set is constant within a slab,
+and each gap up the slab becomes a pocket capped by the roofline.
+
+Daylight openings are injected into the sweep as blockers, so `meta.pockets` is always the
+openings-deducted set. **Deduct Openings stays the estimator's choice in insulation mode too**: with
+it off, `wallInsulationPocketsFor` adds each opening back as a pocket of its own
+(`wallOpeningAsPocket`). That add-back is exact rather than approximate, because the daylight is
+clear of framing by construction — trimmers each side, lintel over, sill under — so it is precisely
+the piece the sweep held back. The same list feeds the quantity and the 3D batts, so a surface that
+isn't deducting draws a batt in the daylight rather than showing less than it charges for.
+
+An opening therefore carries **two** positions: `centreMm` along the mitred face line (a lining's
+set-out) and `frameCentreMm` along the centre line (the frame's, and so the pockets'). They differ
+only on a segment mitred at a corner.
+
+**Click takes the whole face; click-and-hold draws a partial run.** Holding the pointer on a
+hovered wall and dragging along it sets a run, which commits on release; a plain click (movement
+under `WALL_RUN_DRAG_THRESHOLD_MM`, measured in wall mm so it is zoom-independent) still takes the
+whole face. The run is stored as `spanStartMm`/`spanEndMm` — cumulative CENTRE-line arc-length from
+the wall's first vertex, `null`/`null` meaning the whole wall — and `buildWallSurfaceMeta` **clips
+the snapshot at build time**: segment lengths and rake heights are resampled at the cut, openings
+the run only partly covers are clipped to the measured part, and pockets are trimmed with their
+sloped edges interpolated. Because the clipping happens in the snapshot, the area maths, the 3D
+builders and the plan fill need no notion of partial runs at all.
+
+Each segment therefore carries where the run starts as well as how long it is, on both set-outs:
+`faceStartMm`/`faceLengthMm` (mitred face line, for a lining) and `frameStartMm`/`frameLengthMm`
+(centre line, for pockets and the plan footprint). `wallSurfaceSpanQuads` is the one footprint used
+for both the plan fill and hit-testing.
+
+Anything that **re-derives** a snapshot must round-trip the run through `wallSurfaceSpanOf` — the
+drift re-sync in `loadFramingSourceWalls` rebuilds every surface from its source wall on each visit,
+and rebuilding without the run silently widens a partial surface back out to its whole wall.
+
+Two surfaces in a group may not **overlap** on the same wall face (lining) or the same wall
+(insulation) — `wallSpansOverlap` is the interval test, treating a `null` span as the whole wall.
+Non-overlapping runs on one face are fine and expected; that is the point of the gesture. The
+preview turns red while a run would clash. In `computeWallSurface3D`, whether a surface is partial
+must be read from `meta.spanStartMm`/`spanEndMm` and **never** by comparing `faceLengthMm` against
+the mitred panel length — those differ by design at a corner, and confusing the two reopens the
+corner gap the mitred panel path exists to close.
+
+**Insulation is picked by the wall, not by a face.** A lining is taken off one side, so its two
+faces are separately hoverable and each can carry its own measure. Insulation sits in the cavity, so
+the whole wall body (`wallBodyQuads` — both face strips together) is one hover target, one click,
+and `existingSurfaceFor` ignores the side when checking for an existing measure: a second take-off
+from the other face would be the same batts counted twice, not a separate quantity. `meta.side` is
+still stored (fixed to `"left"`) so the snapshot has a definite value, but nothing reads it in
+insulation mode. A group switched from Lining to Insulation *can* still be holding two surfaces for
+one wall from before the switch; that double-counts, so `ViewerCanvas` warns in the footer rather
+than silently dropping one — which of the pair to keep is the estimator's call.
+
+Two deliberate asymmetries with the lining measure: insulation is set out along the wall's **centre
+line** (a batt is cut to the frame, and the frame is set out on the centre line) where a lining uses
+the mitred **face** line; and pockets at a corner are approximate, because the corner cavity is
+filled by the adjoining wall's corner makeup, which belongs to that wall's own segments. Pockets are
+snapshotted **unconditionally**, whichever type the group is, so the two types share one snapshot
+and nothing needs re-cutting if a surface is rebuilt under the other.
+
+**3D** (`computeWallSurface3D`) stands a thin upright panel on the face line per segment, following
+the rake and split around each opening when the surface deducts them — so what's drawn is exactly
+the area that was measured. A `wall_insulation` group instead draws one full-depth batt per pocket, in the
+cavity rather than on the face; `meta.side` is ignored there, since both faces of a wall look into
+the same cavity. The lining panel is placed on `wallFacePath(depth + panel thickness)` rather than
+being pushed out along each segment's own normal — offsetting per-segment leaves a gap of the panel
+thickness at every corner, because the two segments' normals differ there. A gable segment is split at its apex so each half stays a straight-topped
+`wedge` quad.
+
 ### Workbook → Excel export is built in Rust, not JS
 
 `WorkbookView.tsx`'s `exportExcel` flattens the workbook (unchanged, in the frontend) and hands
@@ -378,6 +505,8 @@ Material Symbols Outlined.
 | Count group | `tag` |
 | Length group | `diagonal_line` |
 | Joist / Rafter group | `texture` |
+| Wall Surface from Framing group | `add_column_left` |
+| Wall Insulation from Framing group | `heat` |
 | Recalculate workbook | `calculate` |
 | Rotate Left (Page / Takeoff Item) | `rotate_90_degrees_ccw` |
 | Rotate Right (Page / Takeoff Item) | `rotate_90_degrees_cw` |
@@ -451,8 +580,9 @@ files working without a versioned migration system. Follow this pattern for any 
 ## Conventions
 
 - No build/CI yet. Vitest covers the pure geometry/quantity logic — `npm test` (`vitest run`) in
-  `desktop/src-frontend`; see `src/lib/framing.test.ts` (wall framing) and `src/lib/blocking.test.ts`
-  (joist/rafter blocking + its 3D placement). Add to these rather than hand-rolling a throwaway
+  `desktop/src-frontend`; see `src/lib/framing.test.ts` (wall framing), `src/lib/blocking.test.ts`
+  (joist/rafter blocking + its 3D placement) and `src/lib/wallSurface.test.ts` (wall-face geometry,
+  rakes, opening deductions, snapshot drift). Add to these rather than hand-rolling a throwaway
   script when changing that math.
 - SQL is always parameterized. Node mutations verify `expected_node_type` before acting — keep this.
 - British spelling is used in identifiers in places (`colour`). Match surrounding code.

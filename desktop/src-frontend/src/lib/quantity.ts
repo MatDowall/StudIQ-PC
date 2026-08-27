@@ -45,6 +45,8 @@ export const MEASUREMENT_TYPE_ICONS: Record<string, string> = {
   count: "tag",
   length: "diagonal_line",
   array: "texture",
+  wall_surface: "add_column_left",
+  wall_insulation: "heat",
 };
 
 export const MEASUREMENT_TYPE_LABELS: Record<string, string> = {
@@ -53,6 +55,8 @@ export const MEASUREMENT_TYPE_LABELS: Record<string, string> = {
   count: "Count",
   length: "Length",
   array: "Joist / Rafter",
+  wall_surface: "Wall Surface from Framing",
+  wall_insulation: "Wall Insulation from Framing",
 };
 
 export interface Quantity {
@@ -327,6 +331,15 @@ export function arrayTrimmedLengthPts(p1: PagePoint, p2: PagePoint, meta: ArrayM
  */
 export function deriveQuantity(points: PagePoint[], mmPerPoint: number | null, props: GroupProps, framingJson?: string | null): Quantity | null {
   if (points.length < 1) return null;
+  // Wall Surface: the face is fully described by its own snapshot blob (face lengths, rake
+  // heights, opening holes — all in mm), so it needs neither the page scale nor the centre-line
+  // geometry, and it always displays as an area.
+  if (isWallSurfaceType(props.measurement_type)) {
+    const meta = parseWallSurfaceMeta(framingJson ?? null);
+    if (meta.segments.length === 0) return null;
+    const value = wallSurfaceMeasureM2(meta, props) * props.default_multiplier;
+    return { value, uom: "m²" };
+  }
   // Array + Count: total number of members in the array (including extras), times the multiplier.
   if (props.measurement_type === "array" && props.default_display === "count") {
     const meta = parseArrayMeta(framingJson ?? null);
@@ -438,4 +451,287 @@ export function groupNetQuantity(
     computed = true;
   }
   return computed ? { value: total, uom } : null;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Wall Surface from Framing — a lining/insulation measure taken off an existing timber-framing
+// wall's face rather than re-measured. See CLAUDE.md.
+//
+// The measurement stores the source wall's centre-line in `geometry_json` (so it lives on the same
+// page, hit-tests and renders through the usual path) and a fully self-contained snapshot of the
+// *face* in `framing_json`. The snapshot is deliberately pure numbers — face lengths, heights,
+// opening sizes — so the area derives here without importing lib/framing.ts (which would be a
+// cycle: framing.ts already imports this module) and without a page scale, and so every consumer
+// (sidebar totals, workbook, Excel bridge) gets the same number with nothing extra loaded.
+// It is refreshed from the live framing whenever the group is opened on the source page.
+// ---------------------------------------------------------------------------------------------
+
+/** One opening's hole in the lining, positioned along its face segment. Heights are above FFL. */
+/** The two measurement types that take a measure off existing timber framing. They share the
+ *  whole snapshot model and the read-only framing interaction; they differ in what they count —
+ *  a lining covers the wall face, insulation fills the voids between the framing — and in how the
+ *  wall is picked (a lining per face, insulation per wall). */
+export const WALL_SURFACE_TYPE = "wall_surface";
+export const WALL_INSULATION_TYPE = "wall_insulation";
+
+/** True for either of the framing-derived surface types. */
+export function isWallSurfaceType(measurementType: string): boolean {
+  return measurementType === WALL_SURFACE_TYPE || measurementType === WALL_INSULATION_TYPE;
+}
+
+/** True only for the insulation type — the pockets measure. */
+export function isWallInsulationType(measurementType: string): boolean {
+  return measurementType === WALL_INSULATION_TYPE;
+}
+
+export interface WallSurfaceOpening {
+  segmentIndex: number;
+  /** Centre along the FACE line — what a lining panel is set out on. */
+  centreMm: number;
+  /** Centre along the wall's CENTRE line — what the frame, and so the pockets, are set out on.
+   *  Differs from `centreMm` only on a segment whose face is mitred at a corner. */
+  frameCentreMm: number;
+  widthMm: number;
+  headMm: number;
+  sillMm: number;
+}
+
+/** One wall segment's measured span: its length and the top-plate height profile over it.
+ *  `apexHeightMm` + `apexFrac` are only set for a gable rake (height rises to the apex, then
+ *  falls), and `apexFrac` is relative to the span, not the whole segment.
+ *
+ *  A surface covering the whole wall has `faceStartMm`/`frameStartMm` of 0 and spans the full
+ *  segment; a partial surface (drag-drawn along the wall) starts partway in. The face and frame
+ *  figures are both carried because a lining is set out on the mitred face line while insulation
+ *  pockets are set out on the centre line — see the measure-type notes in CLAUDE.md. */
+export interface WallSurfaceSegment {
+  faceLengthMm: number;
+  startHeightMm: number;
+  endHeightMm: number;
+  apexHeightMm?: number;
+  apexFrac?: number;
+  /** Where the span starts along this segment's FACE line (mm from the segment start). */
+  faceStartMm: number;
+  /** Where the span starts, and how long it runs, along this segment's CENTRE line (mm). */
+  frameStartMm: number;
+  frameLengthMm: number;
+}
+
+/** One insulation pocket, snapshotted from the frame. `x` runs along the wall segment from its
+ *  start, `y` is height above FFL, both mm; the top and bottom edges are linear between `x0` and
+ *  `x1`, so a pocket cut by a rake is a trapezoid. Built by `wallInsulationPockets`. */
+export interface WallSurfacePocket {
+  segmentIndex: number;
+  x0: number;
+  x1: number;
+  yb0: number;
+  yb1: number;
+  yt0: number;
+  yt1: number;
+}
+
+export interface WallSurfaceMeta {
+  type: "wall_surface";
+  /** The framing measurement this face was taken off, and its dimension group. */
+  sourceMeasurementId: number;
+  sourceGroupId: number;
+  /** Which face: "left" is the +normal side of each segment (direction rotated +90°). */
+  side: "left" | "right";
+  /** Per-measurement override of the group's Deduct Openings default; null = follow the group. */
+  deductOpenings: boolean | null;
+  /** Wall thickness in plan (the framing size's depth) — how far the face sits off the centre line. */
+  framingDepthMm: number;
+  segments: WallSurfaceSegment[];
+  openings: WallSurfaceOpening[];
+  /** The voids between the framing — what an insulation measure counts instead of the whole face.
+   *  Always snapshotted, whichever mode the group is in, so switching between Lining and
+   *  Insulation is instant and needs no re-snapshot. */
+  pockets: WallSurfacePocket[];
+  /** The measured run along the wall, as cumulative CENTRE-line arc-length (mm) from the wall's
+   *  first vertex. `null` on both means the whole wall — the default when a face is taken off
+   *  with a plain click. A drag along the wall sets a partial span. Kept at meta level (as well
+   *  as broken down per segment) so overlap between two surfaces on the same wall is a single
+   *  interval test. */
+  spanStartMm: number | null;
+  spanEndMm: number | null;
+}
+
+export const EMPTY_WALL_SURFACE_META: WallSurfaceMeta = {
+  type: "wall_surface",
+  sourceMeasurementId: 0,
+  sourceGroupId: 0,
+  side: "left",
+  deductOpenings: null,
+  framingDepthMm: 90,
+  segments: [],
+  openings: [],
+  pockets: [],
+  spanStartMm: null,
+  spanEndMm: null,
+};
+
+export function parseWallSurfaceMeta(json: string | null | undefined): WallSurfaceMeta {
+  if (!json) return { ...EMPTY_WALL_SURFACE_META };
+  try {
+    const parsed = JSON.parse(json) as Partial<WallSurfaceMeta>;
+    if (parsed?.type !== "wall_surface") return { ...EMPTY_WALL_SURFACE_META };
+    return {
+      type: "wall_surface",
+      sourceMeasurementId: typeof parsed.sourceMeasurementId === "number" ? parsed.sourceMeasurementId : 0,
+      sourceGroupId: typeof parsed.sourceGroupId === "number" ? parsed.sourceGroupId : 0,
+      side: parsed.side === "right" ? "right" : "left",
+      deductOpenings: typeof parsed.deductOpenings === "boolean" ? parsed.deductOpenings : null,
+      framingDepthMm: typeof parsed.framingDepthMm === "number" && parsed.framingDepthMm > 0 ? parsed.framingDepthMm : 90,
+      // Snapshots written before partial spans existed carry neither the span nor the per-segment
+      // offsets; both default to "the whole segment", which is exactly what those surfaces are.
+      segments: Array.isArray(parsed.segments)
+        ? parsed.segments.map((seg) => ({
+            ...seg,
+            faceStartMm: seg.faceStartMm ?? 0,
+            frameStartMm: seg.frameStartMm ?? 0,
+            frameLengthMm: seg.frameLengthMm ?? seg.faceLengthMm,
+          }))
+        : [],
+      openings: Array.isArray(parsed.openings) ? parsed.openings : [],
+      pockets: Array.isArray(parsed.pockets) ? parsed.pockets : [],
+      spanStartMm: typeof parsed.spanStartMm === "number" ? parsed.spanStartMm : null,
+      spanEndMm: typeof parsed.spanEndMm === "number" ? parsed.spanEndMm : null,
+    };
+  } catch {
+    return { ...EMPTY_WALL_SURFACE_META };
+  }
+}
+
+export function serializeWallSurfaceMeta(meta: WallSurfaceMeta): string {
+  return JSON.stringify(meta);
+}
+
+/** Group-level settings for a Wall Surface group (persisted in `framing_props_json`, the same
+ *  column Timber Framing / Joist-Rafter use — the three measurement types never coexist). */
+export interface WallSurfaceSettings {
+  /** Deduct door/window openings from every surface in the group unless a surface overrides it.
+   *  Applies to both surface types. */
+  deductOpenings: boolean;
+}
+
+export const DEFAULT_WALL_SURFACE_SETTINGS: WallSurfaceSettings = { deductOpenings: true };
+
+export function parseWallSurfaceSettings(json: string | null | undefined): WallSurfaceSettings {
+  if (!json) return { ...DEFAULT_WALL_SURFACE_SETTINGS };
+  try {
+    // Blobs written while lining/insulation was a radio inside one type may still carry a
+    // "measureType" key; the group's own measurement_type is the authority now, so it is ignored.
+    const parsed = JSON.parse(json) as Partial<WallSurfaceSettings>;
+    return { deductOpenings: parsed.deductOpenings !== false };
+  } catch {
+    return { ...DEFAULT_WALL_SURFACE_SETTINGS };
+  }
+}
+
+export function serializeWallSurfaceSettings(settings: WallSurfaceSettings): string {
+  return JSON.stringify(settings);
+}
+
+/** Whether this surface deducts openings — its own override if set, else the group's default.
+ *  Applies to both measure types: an insulation take-off that deliberately ignores openings is a
+ *  legitimate gross figure, so the choice stays with the estimator rather than being forced. */
+export function wallSurfaceDeducts(meta: WallSurfaceMeta, props: Pick<GroupProps, "framing_props_json">): boolean {
+  return meta.deductOpenings ?? parseWallSurfaceSettings(props.framing_props_json).deductOpenings;
+}
+
+/** Gross face area (mm²) of one segment: length × the mean top-plate height over it. A gable rake
+ *  is two linear runs meeting at the apex, so it's the length-weighted mean of both halves. */
+export function wallSurfaceSegmentAreaMm2(seg: WallSurfaceSegment): number {
+  const L = seg.faceLengthMm;
+  if (!(L > 0)) return 0;
+  if (seg.apexHeightMm !== undefined) {
+    const f = Math.max(0, Math.min(1, seg.apexFrac ?? 0.5));
+    return L * (f * ((seg.startHeightMm + seg.apexHeightMm) / 2) + (1 - f) * ((seg.apexHeightMm + seg.endHeightMm) / 2));
+  }
+  return L * ((seg.startHeightMm + seg.endHeightMm) / 2);
+}
+
+/** A snapshot's measured run in the form `buildWallSurfaceMeta` takes back, or `null` for a
+ *  whole-wall surface. Anything that RE-derives a snapshot must round-trip the run through this —
+ *  rebuilding without it silently widens a partial surface back out to its whole wall. */
+export function wallSurfaceSpanOf(meta: WallSurfaceMeta, wallLengthMm: number): { startMm: number; endMm: number } | null {
+  if (meta.spanStartMm === null && meta.spanEndMm === null) return null;
+  return { startMm: meta.spanStartMm ?? 0, endMm: meta.spanEndMm ?? wallLengthMm };
+}
+
+/** Two surfaces on the same wall clash when their measured runs overlap — the same lining or batt
+ *  counted twice. A `null` span means the whole wall, so it clashes with everything on it. */
+export function wallSpansOverlap(a: WallSurfaceMeta, b: WallSurfaceMeta, wallLengthMm: number): boolean {
+  const a0 = a.spanStartMm ?? 0;
+  const a1 = a.spanEndMm ?? wallLengthMm;
+  const b0 = b.spanStartMm ?? 0;
+  const b1 = b.spanEndMm ?? wallLengthMm;
+  return Math.min(a1, b1) - Math.max(a0, b0) > 1e-6;
+}
+
+/** One pocket's area (mm²). A rake can leave the roofline below the pocket's top at one end, so a
+ *  trapezoid with one negative height degenerates to a triangle rather than clipping to zero. */
+export function wallSurfacePocketAreaMm2(pocket: WallSurfacePocket): number {
+  const width = pocket.x1 - pocket.x0;
+  if (!(width > 0)) return 0;
+  const h0 = pocket.yt0 - pocket.yb0;
+  const h1 = pocket.yt1 - pocket.yb1;
+  if (h0 <= 0 && h1 <= 0) return 0;
+  if (h0 >= 0 && h1 >= 0) return (width * (h0 + h1)) / 2;
+  const positive = Math.max(h0, h1);
+  const negative = -Math.min(h0, h1);
+  return 0.5 * positive * width * (positive / (positive + negative));
+}
+
+/** A daylight opening expressed as the pocket it would be if openings were not deducted. The
+ *  pocket sweep treats openings as blockers, so this is exactly the piece it held back — the
+ *  daylight is clear of framing by construction (trimmers each side, lintel over, sill under),
+ *  which is what makes adding it back exact rather than an approximation. */
+export function wallOpeningAsPocket(opening: WallSurfaceOpening): WallSurfacePocket {
+  const half = opening.widthMm / 2;
+  return {
+    segmentIndex: opening.segmentIndex,
+    x0: opening.frameCentreMm - half,
+    x1: opening.frameCentreMm + half,
+    yb0: opening.sillMm,
+    yb1: opening.sillMm,
+    yt0: opening.headMm,
+    yt1: opening.headMm,
+  };
+}
+
+/** Every void an insulation measure counts: the frame's pockets, plus each opening's daylight
+ *  when openings are not being deducted. The single list both the quantity and the 3D batts use. */
+export function wallInsulationPocketsFor(meta: WallSurfaceMeta, deductOpenings: boolean): WallSurfacePocket[] {
+  return deductOpenings ? meta.pockets : [...meta.pockets, ...meta.openings.map(wallOpeningAsPocket)];
+}
+
+/** Total insulation area in m²: the sum of the frame's voids, plus the openings when they are not
+ *  being deducted. */
+export function wallInsulationAreaM2(meta: WallSurfaceMeta, deductOpenings = true): number {
+  let mm2 = 0;
+  for (const pocket of wallInsulationPocketsFor(meta, deductOpenings)) mm2 += wallSurfacePocketAreaMm2(pocket);
+  return mm2 / 1e6;
+}
+
+/** The measure this surface reports, in m² — the whole face for a lining, only the frame's voids
+ *  for insulation. The single place the two types diverge. */
+export function wallSurfaceMeasureM2(
+  meta: WallSurfaceMeta,
+  props: Pick<GroupProps, "measurement_type" | "framing_props_json">,
+): number {
+  const deducts = wallSurfaceDeducts(meta, props);
+  return isWallInsulationType(props.measurement_type)
+    ? wallInsulationAreaM2(meta, deducts)
+    : wallSurfaceAreaM2(meta, deducts);
+}
+
+/** Net face area in m²: Σ segment areas, less each opening's daylight hole when deducting. */
+export function wallSurfaceAreaM2(meta: WallSurfaceMeta, deductOpenings: boolean): number {
+  let mm2 = 0;
+  for (const seg of meta.segments) mm2 += wallSurfaceSegmentAreaMm2(seg);
+  if (deductOpenings) {
+    for (const op of meta.openings) mm2 -= Math.max(0, op.widthMm) * Math.max(0, op.headMm - op.sillMm);
+  }
+  return Math.max(0, mm2) / 1e6;
 }

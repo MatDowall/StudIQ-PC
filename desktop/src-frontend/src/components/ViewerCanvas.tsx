@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { useAppStore, type SnapPoint, type SnapType, type TreeNodeDto } from "../store/appStore";
+import { useAppStore, type FramingSourceWallDto, type SnapPoint, type SnapType, type TreeNodeDto } from "../store/appStore";
 import {
   deriveQuantity,
   formatQuantity,
@@ -12,13 +12,26 @@ import {
   polygonAreaPts,
   polygonPerimeterPts,
   quantityValueText,
+  isWallInsulationType,
+  isWallSurfaceType,
+  WALL_SURFACE_TYPE,
+  parseWallSurfaceMeta,
+  parseWallSurfaceSettings,
+  EMPTY_WALL_SURFACE_META,
+  wallInsulationAreaM2,
+  wallInsulationPocketsFor,
+  wallSpansOverlap,
   serializeArrayMeta,
+  serializeWallSurfaceMeta,
+  wallSurfaceAreaM2,
+  wallSurfaceDeducts,
   MEASUREMENT_TYPE_ICONS,
   MEASUREMENT_TYPE_LABELS,
   type ArrayMeta,
   type ArrayTrim,
   type BoxTrim,
   type GroupProps,
+  type WallSurfaceMeta,
 } from "../lib/quantity";
 import {
   arrayBlockingPieces,
@@ -33,13 +46,23 @@ import {
   projectOntoPath,
   reindexFramingForVertexDeletion,
   reindexFramingForVertexInsertion,
+  buildWallSurfaceMeta,
+  framingDepthMm,
+  pointInWallFace,
   serializeWallFraming,
+  wallBodyQuads,
+  wallFacePath,
+  wallFaceQuads,
+  wallPathLengthMm,
+  wallSurfaceSpanQuads,
   wallMembers,
   wallStudPositions,
   STUD_THICKNESS_MM,
+  type FramingSettings,
   type JoistRafterSettings,
   type Opening,
   type OpeningTemplate,
+  type WallFace,
   type WallFraming,
 } from "../lib/framing";
 import {
@@ -48,6 +71,7 @@ import {
   computeCountMarker3D,
   computeLengthMembers3D,
   computeWall3D,
+  computeWallSurface3D,
   offsetMembers,
   type AreaMesh3D,
   type Member3D,
@@ -240,7 +264,15 @@ function findGroupNode(nodes: TreeNodeDto[], childCache: Record<number, TreeNode
 // Length, timber-framing, and array dimensions are open polylines; area-type displays close
 // into a polygon; count is a point set. Centralised so every hit-test/render agrees.
 function isAreaType(measurementType: string) {
-  return measurementType !== "length" && measurementType !== "count" && measurementType !== "timber_framing" && measurementType !== "array";
+  // A wall surface's geometry is the source wall's open centre line, not a closed shape — the
+  // face it actually measures is derived from it (see `wallFaceQuads`), never drawn from it.
+  return (
+    measurementType !== "length" &&
+    measurementType !== "count" &&
+    measurementType !== "timber_framing" &&
+    measurementType !== "array" &&
+    !isWallSurfaceType(measurementType)
+  );
 }
 
 // Dash/dot/dash-dot segment lengths below are tuned at this reference stroke width;
@@ -437,6 +469,92 @@ function drawFraming(
   ctx.restore();
 }
 
+/** Neutral grey the read-only framing markup is drawn in while a Wall Surface group is active —
+ *  deliberately not any dimension group's colour, so it reads at a glance as "you are not in the
+ *  framing group that owns this wall". */
+/** How far along a wall the cursor must travel before a click-and-hold counts as drawing a run
+ *  rather than taking off the whole face. In wall millimetres, so it is independent of zoom. */
+const WALL_RUN_DRAG_THRESHOLD_MM = 50;
+
+const READONLY_FRAMING_COLOUR = "#8C8C8C";
+const READONLY_FRAMING_ALPHA = 0.45;
+
+/** Fills the strip of wall on one face (centre line → plate line), one quad per segment. This is
+ *  both the hover target and the body of a committed surface, so what's pickable is what's drawn. */
+function fillWallFace(
+  ctx: CanvasRenderingContext2D,
+  quads: PagePoint[][],
+  colour: string,
+  fillAlphaHex: string,
+  lineWidth: number,
+  pan: { x: number; y: number },
+  zoom: number,
+  page: PageMeta,
+) {
+  ctx.save();
+  ctx.lineJoin = "round";
+  ctx.fillStyle = `${colour}${fillAlphaHex}`;
+  ctx.strokeStyle = colour;
+  ctx.lineWidth = lineWidth;
+  for (const quad of quads) {
+    const sp = quad.map((p) => pageToScreen(p.x, p.y, page.height_pts, pan, zoom));
+    ctx.beginPath();
+    ctx.moveTo(sp[0].x, sp[0].y);
+    for (const s of sp.slice(1)) ctx.lineTo(s.x, s.y);
+    ctx.closePath();
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+/** A committed Wall Surface: the measured face filled along the wall, with the plate line it was
+ *  taken off stroked bold so which side of the wall was measured is unambiguous. */
+function drawWallSurface(
+  ctx: CanvasRenderingContext2D,
+  points: PagePoint[],
+  meta: WallSurfaceMeta,
+  mmPerPoint: number | null,
+  colour: string,
+  style: string | undefined,
+  pan: { x: number; y: number },
+  zoom: number,
+  page: PageMeta,
+  selected: boolean,
+  insulation: boolean,
+) {
+  // Insulation fills the whole wall body (it lives in the cavity); a lining fills only the face
+  // strip it was taken off, so which side was measured stays readable at a glance.
+  const quads = wallSurfaceSpanQuads(points, meta, mmPerPoint, insulation);
+  if (quads.length === 0) return;
+  fillWallFace(ctx, quads, colour, selected ? "66" : "44", 1, pan, zoom, page);
+
+  // Outline: both plate lines for insulation (the wall it fills), the measured face for a lining.
+  // A partial run has no continuous plate line of its own, so its quads carry the outline instead.
+  const wholeWall = meta.spanStartMm === null && meta.spanEndMm === null;
+  const outlines = !wholeWall
+    ? quads.map((quad) => [quad[3], quad[2]])
+    : insulation
+      ? [wallFacePath(points, meta.framingDepthMm, mmPerPoint, "left"), wallFacePath(points, meta.framingDepthMm, mmPerPoint, "right")]
+      : [wallFacePath(points, meta.framingDepthMm, mmPerPoint, meta.side)];
+  ctx.save();
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round";
+  const width = selected ? FRAMING_LINE_WIDTH + 2 : FRAMING_LINE_WIDTH + 1;
+  ctx.strokeStyle = colour;
+  ctx.lineWidth = width;
+  ctx.setLineDash(lineDash(style, width));
+  for (const outline of outlines) {
+    if (outline.length < 2) continue;
+    const sp = outline.map((p) => pageToScreen(p.x, p.y, page.height_pts, pan, zoom));
+    ctx.beginPath();
+    ctx.moveTo(sp[0].x, sp[0].y);
+    for (const s of sp.slice(1)) ctx.lineTo(s.x, s.y);
+    ctx.stroke();
+  }
+  ctx.setLineDash([]);
+  ctx.restore();
+}
+
 // Measurement geometry is stored in `geometry_json` as PDF points with a
 // Y-up, bottom-left origin — the same convention the snap engine produces
 // (see resolveSnap / scheduleSnapResolution). Render it through pageToScreen
@@ -507,6 +625,16 @@ function drawOverlays(
       const settings = parseFramingSettings(props?.framing_props_json ?? null);
       const wallFraming = parseWallFraming(measurement.framing_json);
       drawFraming(ctx, points, settings, mmPerPoint, colour, style, pan, zoom, page, selected, false, wallFraming);
+      continue;
+    }
+
+    // Wall surfaces render as a filled face strip along the wall they were taken off — never
+    // as the wall's own plates/studs, which belong to the framing group, not to this measure.
+    if (isWallSurfaceType(measurement.measurement_type)) {
+      if (points.length >= 2) {
+        const insulation = isWallInsulationType(measurement.measurement_type);
+        drawWallSurface(ctx, points, parseWallSurfaceMeta(measurement.framing_json), mmPerPoint, colour, style, pan, zoom, page, selected, insulation);
+      }
       continue;
     }
 
@@ -1421,6 +1549,31 @@ export function ViewerCanvas({
   } | null>(null);
   // Right-click → View wall in 3D: the wall shown in the isolated 3D modal.
   const [wall3dId, setWall3dId] = useState<number | null>(null);
+  // The framing-wall face under the cursor while a Wall Surface group is active. `existingId` is
+  // set when this group has already measured that face, which turns the highlight into a
+  // "already taken off" cue and makes the click a no-op instead of a duplicate.
+  const [wallFaceHover, setWallFaceHover] = useState<{
+    wall: FramingSourceWallDto;
+    side: WallFace;
+    quads: PagePoint[][];
+    existingId: number | null;
+  } | null>(null);
+  // Click-and-hold along a hovered wall draws a partial run instead of taking the whole face.
+  // `movedMm` stays null until the pointer has travelled far enough along the wall to count as a
+  // drag, so a plain click still commits the whole face exactly as before.
+  const [wallSpanDrag, setWallSpanDrag] = useState<{
+    wall: FramingSourceWallDto;
+    side: WallFace;
+    startMm: number;
+    currentMm: number;
+    dragging: boolean;
+  } | null>(null);
+  const wallSpanDragRef = useRef<typeof wallSpanDrag>(null);
+  const applyWallSpanDrag = useCallback((next: typeof wallSpanDrag) => {
+    wallSpanDragRef.current = next;
+    setWallSpanDrag(next);
+  }, []);
+
   // Marquee rubber-band selection
   const [marqueeState, setMarqueeState] = useState<{ startClient: { x: number; y: number }; endClient: { x: number; y: number } } | null>(null);
   const marqueeRef = useRef<{ startClient: { x: number; y: number }; pointerId: number } | null>(null);
@@ -1507,6 +1660,8 @@ export function ViewerCanvas({
   const childCache = useAppStore((state) => state.childCache);
   const drawPolarity = useAppStore((state) => state.drawPolarity);
   const drawingDimmer = useAppStore((state) => state.drawingDimmer);
+  const framingSourceWalls = useAppStore((state) => state.framingSourceWalls);
+  const loadFramingSourceWalls = useAppStore((state) => state.loadFramingSourceWalls);
 
   // Colour/style the in-progress draft takes from the active group + current polarity.
   const activeProps = activeDimensionGroupId !== null ? groupProps[activeDimensionGroupId] : undefined;
@@ -1518,6 +1673,12 @@ export function ViewerCanvas({
   const drawingCount = activeProps?.measurement_type === "count";
   const drawingFraming = activeProps?.measurement_type === "timber_framing";
   const drawingArray = activeProps?.measurement_type === "array";
+  // Wall Surface groups don't draw a path at all — they convert an existing framing wall's face
+  // into a surface, so the whole add-mode gesture is hover-a-face / click-to-commit.
+  const drawingWallSurface = isWallSurfaceType(activeProps?.measurement_type ?? "");
+  // Insulation lives in the cavity, so the whole wall is the target and it can only be measured
+  // once — the two faces are not separately selectable the way a lining's are.
+  const drawingInsulation = isWallInsulationType(activeProps?.measurement_type ?? "");
   // Spacing in PDF points: default_width stores metres; convert using page scale.
   const arraySpacingPts = (() => {
     const spacingM = activeProps?.default_width ?? 0.6;
@@ -1539,6 +1700,39 @@ export function ViewerCanvas({
   const preview = previews.get(pageIndex) ?? null;
   const pageSize = useMemo(() => (page ? pagePixelSize(page, zoom) : { width: 0, height: 0 }), [page, zoom]);
   const activeZoomBucket = zoomBucket(zoom);
+  // Pull in (and keep in step with) the framing markup a Wall Surface group works off. The store
+  // clears it by itself for every other measurement type, so this can run unconditionally.
+  useEffect(() => {
+    void loadFramingSourceWalls().catch((error) => onStatusChange(`ERROR: ${error}`));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [drawingWallSurface, activeDimensionGroupId, activeDrawingId, pageIndex, pageScale?.mm_per_point, overlayMeasurements]);
+
+  useEffect(() => {
+    if (!drawingWallSurface) setWallFaceHover(null);
+  }, [drawingWallSurface]);
+
+  // A group switched from Lining to Insulation can be carrying two surfaces for one wall — one
+  // per face — which was legitimate as linings but double-counts the single cavity as insulation.
+  // Flagging beats silently halving or deleting one: which of the two to keep is the estimator's
+  // call, and the quantity is wrong until they make it.
+  useEffect(() => {
+    if (!drawingInsulation || activeDimensionGroupId === null) return;
+    const seen = new Set<number>();
+    const duplicated = new Set<number>();
+    for (const m of overlayMeasurements) {
+      if (!isWallSurfaceType(m.measurement_type) || m.dimension_group_id !== activeDimensionGroupId) continue;
+      const sourceId = parseWallSurfaceMeta(m.framing_json).sourceMeasurementId;
+      if (seen.has(sourceId)) duplicated.add(sourceId);
+      seen.add(sourceId);
+    }
+    if (duplicated.size > 0) {
+      onStatusChange(
+        `WARNING: ${duplicated.size} wall${duplicated.size > 1 ? "s are" : " is"} measured twice in this insulation group ` +
+          "(both faces). Insulation fills one cavity per wall — delete the duplicate to correct the quantity.",
+      );
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [drawingInsulation, activeDimensionGroupId, overlayMeasurements]);
 
   // Read by mergeTiles (a stable-identity callback held by the tile-event listener)
   // to evict against the *current* page/bucket without resubscribing the listener.
@@ -2203,6 +2397,86 @@ export function ViewerCanvas({
     const overlaysToRender = trimPreviewActive
       ? overlayMeasurements.filter((m) => !(m.measurement_type === "array" && m.dimension_group_id === activeDimensionGroupId))
       : overlayMeasurements;
+    // Wall Surface groups show the existing framing markup underneath, in a muted neutral grey
+    // that belongs to no dimension group — the visual cue that these walls are read-only here and
+    // that the estimator is not in the framing group that owns them. Anything already loaded as a
+    // real overlay (its own group is also selected) is skipped so it isn't drawn twice.
+    if (drawingWallSurface) {
+      const mmpp = pageScale?.mm_per_point ?? null;
+      const loadedIds = new Set(overlayMeasurements.map((m) => m.id));
+      ctx.save();
+      ctx.globalAlpha = READONLY_FRAMING_ALPHA;
+      for (const wall of framingSourceWalls) {
+        if (loadedIds.has(wall.measurement.id)) continue;
+        const points = sourceWallPoints(wall);
+        if (!points) continue;
+        drawFraming(
+          ctx,
+          points,
+          parseFramingSettings(wall.framing_props_json),
+          mmpp,
+          READONLY_FRAMING_COLOUR,
+          "dashed",
+          pan,
+          zoom,
+          page,
+          false,
+          false,
+          parseWallFraming(wall.measurement.framing_json),
+        );
+      }
+      ctx.restore();
+      // A run being drawn takes over from the hover highlight: only the stretch dragged so far is
+      // lit, so the estimator sees exactly what will be committed on release.
+      const runPreview = wallSpanDrag?.dragging ? wallSpanDrag : null;
+      if (runPreview && measuring) {
+        const runPoints = sourceWallPoints(runPreview.wall);
+        const runSettings = sourceWallSettings(runPreview.wall);
+        if (runPoints) {
+          const previewMeta = buildWallSurfaceMeta(
+            runPreview.wall.measurement.id,
+            runPreview.wall.measurement.dimension_group_id,
+            runPoints,
+            runSettings,
+            mmpp,
+            parseWallFraming(runPreview.wall.measurement.framing_json),
+            runPreview.side,
+            null,
+            { startMm: runPreview.startMm, endMm: runPreview.currentMm },
+          );
+          if (previewMeta) {
+            const clash = wallRunClashes(runPreview.wall, runPreview.side, {
+              startMm: runPreview.startMm,
+              endMm: runPreview.currentMm,
+            });
+            fillWallFace(
+              ctx,
+              wallSurfaceSpanQuads(runPoints, previewMeta, mmpp, drawingInsulation),
+              clash ? "#D93025" : draftColour,
+              "77",
+              2,
+              pan,
+              zoom,
+              page,
+            );
+          }
+        }
+      } else if (wallFaceHover && measuring) {
+        // The hovered face: the group's own colour when it can be taken off, the same muted grey
+        // when this group has already measured it.
+        const takeable = wallFaceHover.existingId === null;
+        fillWallFace(
+          ctx,
+          wallFaceHover.quads,
+          takeable ? draftColour : READONLY_FRAMING_COLOUR,
+          takeable ? "77" : "33",
+          2,
+          pan,
+          zoom,
+          page,
+        );
+      }
+    }
     drawOverlays(ctx, overlaysToRender, groupColours, groupProps, overlayColour, pan, zoom, page, pageIndex, selectedSet, editPreview, pageScale?.mm_per_point ?? null);
     if (pendingRake) {
       // While the raking-frame dialog is open, mark which real wall vertex is "Start" vs "End" —
@@ -2517,7 +2791,7 @@ export function ViewerCanvas({
         }
       }
     }
-  }, [activeProps, activeDimensionGroupId, arrayDirection, arrayExtraMembers, arraySpacingPts, arrayTrimDraft, arrayTrimKeepPt, arrayTrimMode, arrayTrimType, calibDialog, calibPoints, calibrating, clipboard, cursorPagePoint, doc, doubleStudSelect, draftColour, draftPoints, draftStyle, drawingArea, drawingArray, drawingFraming, drawingType, editPreview, groupColours, groupProps, lightMode, lineSnapResult, marqueeState, measuring, moveMode, openingGhost, openingPlacement, overlayColour, overlayMeasurements, page, pageIndex, pageScale, pageSize.height, pageSize.width, pan, pasteMode, pendingRake, pitchDirectionMode, pitchPickStart, selectedSet, shiftHeld, snapPoint, snapType, studGhost, viewportSize.height, viewportSize.width, zoom]);
+  }, [drawingWallSurface, drawingInsulation, framingSourceWalls, wallFaceHover, wallSpanDrag, activeProps, activeDimensionGroupId, arrayDirection, arrayExtraMembers, arraySpacingPts, arrayTrimDraft, arrayTrimKeepPt, arrayTrimMode, arrayTrimType, calibDialog, calibPoints, calibrating, clipboard, cursorPagePoint, doc, doubleStudSelect, draftColour, draftPoints, draftStyle, drawingArea, drawingArray, drawingFraming, drawingType, editPreview, groupColours, groupProps, lightMode, lineSnapResult, marqueeState, measuring, moveMode, openingGhost, openingPlacement, overlayColour, overlayMeasurements, page, pageIndex, pageScale, pageSize.height, pageSize.width, pan, pasteMode, pendingRake, pitchDirectionMode, pitchPickStart, selectedSet, shiftHeld, snapPoint, snapType, studGhost, viewportSize.height, viewportSize.width, zoom]);
 
   function clampPan(nextPan: { x: number; y: number }, nextZoom = zoom) {
     if (!page) return nextPan;
@@ -2631,6 +2905,24 @@ export function ViewerCanvas({
     }
 
     if (measuring && page) {
+      // Wall Surface: a click on a highlighted wall face commits that face as a surface. There is
+      // no path to draw — the geometry comes from the framing wall that's already been measured.
+      if (drawingWallSurface) {
+        if (!wallFaceHover) {
+          onStatusChange(drawingInsulation ? "Hover a wall to take off its insulation." : "Hover a wall face to take off its surface.");
+          return;
+        }
+        // Arm a run: holding and dragging along the wall draws a partial length, while releasing
+        // without moving falls through to the whole-face take-off in handlePointerUp.
+        const point = clientToPagePoint(event.clientX, event.clientY);
+        const startMm = point ? wallArcLengthAt(wallFaceHover.wall, point) : null;
+        if (startMm !== null) {
+          event.currentTarget.setPointerCapture(event.pointerId);
+          applyWallSpanDrag({ wall: wallFaceHover.wall, side: wallFaceHover.side, startMm, currentMm: startMm, dragging: false });
+        }
+        return;
+      }
+
       // Line mode: one click places a measurement along the detected wall segment.
       if (drawingType === "line") {
         const result = useAppStore.getState().lineSnapResult;
@@ -2707,8 +2999,12 @@ export function ViewerCanvas({
         commitExtraStud();
         return;
       }
-      // Drag a handle of the already-selected dimension to move that vertex.
-      if (singleSelectedId !== null) {
+      // Drag a handle of the already-selected dimension to move that vertex. A wall surface has
+      // no handles of its own — it follows its framing wall — so it's skipped here.
+      if (
+        singleSelectedId !== null &&
+        !isWallSurfaceType(overlayMeasurements.find((m) => m.id === singleSelectedId)?.measurement_type ?? "")
+      ) {
         const vertexIndex = hitTestVertex(event.clientX, event.clientY, singleSelectedId);
         if (vertexIndex >= 0) {
           const points = measurementPoints(singleSelectedId);
@@ -2758,6 +3054,27 @@ export function ViewerCanvas({
       } else {
         resolveOpeningGhost(clientToPagePoint(event.clientX, event.clientY));
       }
+      return;
+    }
+
+    // Wall Surface add-mode: while a run is being drawn, track its far end along the wall;
+    // otherwise highlight the wall face under the cursor instead of tracking a draft.
+    if (drawingWallSurface && measuring && !dragRef.current) {
+      const active = wallSpanDragRef.current;
+      if (active) {
+        const point = clientToPagePoint(event.clientX, event.clientY);
+        const currentMm = point ? wallArcLengthAt(active.wall, point) : null;
+        if (currentMm !== null) {
+          // Below this the gesture is still a click, not a drag — otherwise the tiny cursor
+          // movement in an ordinary click would silently turn a whole-face take-off into a sliver.
+          const dragging = active.dragging || Math.abs(currentMm - active.startMm) > WALL_RUN_DRAG_THRESHOLD_MM;
+          applyWallSpanDrag({ ...active, currentMm, dragging });
+        }
+        setHoverInfo(null);
+        return;
+      }
+      resolveWallFaceHover(clientToPagePoint(event.clientX, event.clientY));
+      setHoverInfo(null);
       return;
     }
 
@@ -2847,6 +3164,27 @@ export function ViewerCanvas({
   }
 
   function handlePointerUp(event: React.PointerEvent<HTMLDivElement>) {
+    // Finish a wall-surface gesture: a drag commits the run it drew, a plain click the whole face.
+    const spanDrag = wallSpanDragRef.current;
+    if (spanDrag) {
+      applyWallSpanDrag(null);
+      const span = spanDrag.dragging ? { startMm: spanDrag.startMm, endMm: spanDrag.currentMm } : null;
+      if (span && Math.abs(span.endMm - span.startMm) < WALL_RUN_DRAG_THRESHOLD_MM) {
+        // Nothing meaningful drawn — treat it as a cancelled gesture rather than a sliver.
+      } else if (wallRunClashes(spanDrag.wall, spanDrag.side, span)) {
+        onStatusChange(
+          span
+            ? "That run overlaps one already measured on this wall in this group."
+            : drawingInsulation
+              ? "This wall is already insulated in this group — insulation is measured once per wall, not per face."
+              : "This wall face is already measured in this group.",
+        );
+      } else {
+        void commitWallSurface(span);
+      }
+      return;
+    }
+
     // Marquee: finalise selection based on drag direction.
     if (marqueeRef.current?.pointerId === event.pointerId) {
       const mq = marqueeRef.current;
@@ -2895,6 +3233,11 @@ export function ViewerCanvas({
     if (measuring) {
       if (drawingType === "line") {
         // No draft to finish in line mode; just suppress the context menu.
+        event.preventDefault();
+        return;
+      }
+      if (drawingWallSurface) {
+        // Nothing is drafted in a Wall Surface group, so there's no finish gesture to make.
         event.preventDefault();
         return;
       }
@@ -2984,6 +3327,41 @@ export function ViewerCanvas({
 
       const items: ViewerMenuItem[] = [];
       const multiSelected = selectedMeasurementIds.length > 1 && selectedSet.has(id);
+
+      // A wall surface has no geometry of its own to edit — it follows the framing wall it was
+      // taken off. Its only per-measurement setting is whether openings come out of the area.
+      if (isWallSurfaceType(measurement.measurement_type)) {
+        const meta = parseWallSurfaceMeta(measurement.framing_json);
+        const groupDefault = parseWallSurfaceSettings(groupProps[measurement.dimension_group_id]?.framing_props_json ?? null).deductOpenings;
+        const items: ViewerMenuItem[] = [{ label: "View in 3D", action: () => setWall3dId(id) }];
+        items.push({
+          label: meta.deductOpenings === true || (meta.deductOpenings === null && groupDefault)
+            ? "Don't deduct openings"
+            : "Deduct openings",
+          action: () => setSurfaceDeduction(id, !(meta.deductOpenings ?? groupDefault)),
+        });
+        if (meta.deductOpenings !== null) {
+          items.push({
+            label: `Use group default (${groupDefault ? "deduct" : "don't deduct"})`,
+            action: () => setSurfaceDeduction(id, null),
+          });
+        }
+        items.push({
+          label: `Delete ${
+            selectedMeasurementIds.length > 1 && selectedSet.has(id)
+              ? `${selectedMeasurementIds.length} measurements`
+              : isWallInsulationType(measurement.measurement_type)
+                ? "wall insulation"
+                : "wall surface"
+          }`,
+          danger: true,
+          action: () => {
+            void deleteSelectedMeasurements();
+          },
+        });
+        setViewerMenu({ x: event.clientX, y: event.clientY, items });
+        return;
+      }
 
       if (!multiSelected) {
         // Single-measurement geometry editing: delete/add vertex.
@@ -3166,6 +3544,163 @@ export function ViewerCanvas({
   }
 
   // While placing an opening, find the nearest framing wall to a page point and project onto it.
+  // The framing settings of the group that owns a source wall (its size, wall height, plate
+  // makeup) — the surface's heights and face offset all come from these, not from the Wall
+  // Surface group, which has no framing of its own.
+  function sourceWallSettings(wall: FramingSourceWallDto): FramingSettings {
+    return parseFramingSettings(wall.framing_props_json);
+  }
+
+  function sourceWallPoints(wall: FramingSourceWallDto): PagePoint[] | null {
+    try {
+      const parsed = JSON.parse(wall.measurement.geometry_json);
+      return Array.isArray(parsed) && parsed.length >= 2 ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** The plan footprint a committed surface is picked by: the whole wall body for insulation,
+   *  the measured face strip for a lining — matching what `drawWallSurface` fills, so what is
+   *  clickable is always what is drawn. */
+  function wallSurfaceQuadsFor(measurement: MeasurementDto, points: PagePoint[], meta: WallSurfaceMeta): PagePoint[][] {
+    return wallSurfaceSpanQuads(points, meta, pageScale?.mm_per_point ?? null, isWallInsulationType(measurement.measurement_type));
+  }
+
+  /** The surface this group already holds for a given wall face, if any. Insulation ignores the
+   *  side: there is one cavity per wall, so a second measure of the other face would be a
+   *  duplicate of the same batts rather than a separate quantity. */
+  function existingSurfaceFor(wallId: number, side: WallFace): number | null {
+    for (const m of overlayMeasurements) {
+      if (!isWallSurfaceType(m.measurement_type) || m.dimension_group_id !== activeDimensionGroupId) continue;
+      const meta = parseWallSurfaceMeta(m.framing_json);
+      if (meta.sourceMeasurementId !== wallId) continue;
+      if (drawingInsulation || meta.side === side) return m.id;
+    }
+    return null;
+  }
+
+  /** Picks the wall face under the cursor: the left/right strip of any read-only framing wall on
+   *  this page. Later walls win, matching the reverse iteration used everywhere else. */
+  function resolveWallFaceHover(pagePoint: PagePoint | null) {
+    const mmpp = pageScale?.mm_per_point ?? null;
+    if (!pagePoint || !mmpp) {
+      if (wallFaceHover) setWallFaceHover(null);
+      return;
+    }
+    for (let i = framingSourceWalls.length - 1; i >= 0; i -= 1) {
+      const wall = framingSourceWalls[i];
+      const points = sourceWallPoints(wall);
+      if (!points) continue;
+      const depthMm = framingDepthMm(sourceWallSettings(wall).framingSize);
+      if (drawingInsulation) {
+        // One target per wall: the whole body, picked and highlighted as a single object. The
+        // stored side is fixed to "left" purely so the snapshot has a definite value — the
+        // pockets it holds are side-independent (both faces look into the same cavity).
+        const quads = wallBodyQuads(points, depthMm, mmpp);
+        if (quads.length === 0 || !pointInWallFace(pagePoint, quads)) continue;
+        if (wallFaceHover?.wall.measurement.id === wall.measurement.id) return;
+        setWallFaceHover({ wall, side: "left", quads, existingId: existingSurfaceFor(wall.measurement.id, "left") });
+        return;
+      }
+      for (const side of ["left", "right"] as const) {
+        const quads = wallFaceQuads(points, depthMm, mmpp, side);
+        if (quads.length === 0 || !pointInWallFace(pagePoint, quads)) continue;
+        if (wallFaceHover?.wall.measurement.id === wall.measurement.id && wallFaceHover.side === side) return;
+        setWallFaceHover({ wall, side, quads, existingId: existingSurfaceFor(wall.measurement.id, side) });
+        return;
+      }
+    }
+    if (wallFaceHover) setWallFaceHover(null);
+  }
+
+  /** Cumulative centre-line arc-length (mm) of a page point projected onto a wall. The coordinate
+   *  a partial run is drawn and stored in. */
+  function wallArcLengthAt(wall: FramingSourceWallDto, pagePoint: PagePoint): number | null {
+    const mmpp = pageScale?.mm_per_point ?? null;
+    const points = sourceWallPoints(wall);
+    if (!mmpp || !points) return null;
+    const hit = projectOntoPath(points, pagePoint, mmpp);
+    if (!hit) return null;
+    let cumulative = 0;
+    for (let i = 0; i < hit.segmentIndex; i += 1) {
+      cumulative += Math.hypot(points[i + 1].x - points[i].x, points[i + 1].y - points[i].y) * mmpp;
+    }
+    return cumulative + hit.centreMm;
+  }
+
+  /** Whether a proposed run clashes with a surface this group already holds on the same wall —
+   *  the same face for a lining, the same cavity (either face) for insulation. */
+  function wallRunClashes(wall: FramingSourceWallDto, side: WallFace, span: { startMm: number; endMm: number } | null): boolean {
+    const mmpp = pageScale?.mm_per_point ?? null;
+    const points = sourceWallPoints(wall);
+    if (!mmpp || !points) return false;
+    const wallLengthMm = wallPathLengthMm(points, mmpp);
+    const proposed = {
+      ...EMPTY_WALL_SURFACE_META,
+      spanStartMm: span ? Math.min(span.startMm, span.endMm) : null,
+      spanEndMm: span ? Math.max(span.startMm, span.endMm) : null,
+    };
+    for (const m of overlayMeasurements) {
+      if (!isWallSurfaceType(m.measurement_type) || m.dimension_group_id !== activeDimensionGroupId) continue;
+      const meta = parseWallSurfaceMeta(m.framing_json);
+      if (meta.sourceMeasurementId !== wall.measurement.id) continue;
+      if (!drawingInsulation && meta.side !== side) continue;
+      if (wallSpansOverlap(proposed, meta, wallLengthMm)) return true;
+    }
+    return false;
+  }
+
+  /** Commits the hovered wall face as a Wall Surface measurement in the active group. The wall's
+   *  centre line becomes the measurement's geometry (so it lives on the page and hit-tests like
+   *  anything else) and the face snapshot goes into framing_json. */
+  async function commitWallSurface(span?: { startMm: number; endMm: number } | null) {
+    const hover = wallFaceHover;
+    const mmpp = pageScale?.mm_per_point ?? null;
+    if (!hover || !mmpp || activeDimensionGroupId === null) return;
+    if (!span && hover.existingId !== null) return;
+    const points = sourceWallPoints(hover.wall);
+    if (!points) return;
+    const meta = buildWallSurfaceMeta(
+      hover.wall.measurement.id,
+      hover.wall.measurement.dimension_group_id,
+      points,
+      sourceWallSettings(hover.wall),
+      mmpp,
+      parseWallFraming(hover.wall.measurement.framing_json),
+      hover.side,
+      null,
+      span,
+    );
+    if (!meta) {
+      onStatusChange("This wall has no measurable face — check the page scale and the wall's framing settings.");
+      return;
+    }
+    try {
+      const created = await createMeasurement({
+        geometryJson: hover.wall.measurement.geometry_json,
+        measurementType: activeProps?.measurement_type ?? WALL_SURFACE_TYPE,
+      });
+      await updateMeasurementFraming(created.id, serializeWallSurfaceMeta(meta));
+      // Only a whole-face take-off closes the face off; further partial runs may still be drawn
+      // alongside an existing one, so long as they do not overlap it.
+      if (!span) setWallFaceHover({ ...hover, existingId: created.id });
+    } catch (error) {
+      onStatusChange(`ERROR: ${error}`);
+    }
+  }
+
+  /** Sets (or clears) one surface's own Deduct Openings override. `null` hands it back to the
+   *  group default from the properties dialog. */
+  function setSurfaceDeduction(measurementId: number, deduct: boolean | null) {
+    const measurement = overlayMeasurements.find((m) => m.id === measurementId);
+    if (!measurement) return;
+    const meta = parseWallSurfaceMeta(measurement.framing_json);
+    void updateMeasurementFraming(measurementId, serializeWallSurfaceMeta({ ...meta, deductOpenings: deduct })).catch((error) =>
+      onStatusChange(`ERROR: ${error}`),
+    );
+  }
+
   function resolveOpeningGhost(pagePoint: PagePoint | null) {
     const mmpp = pageScale?.mm_per_point ?? null;
     if (!pagePoint || !openingPlacement || !page || !mmpp) {
@@ -3467,6 +4002,16 @@ export function ViewerCanvas({
         continue;
       }
       if (screenPts.length < 2) continue;
+
+      // Wall surface: picked by its face strip (what's actually drawn), not by the wall's
+      // centre line, which is only where the geometry happens to be stored.
+      if (isWallSurfaceType(measurement.measurement_type)) {
+        const meta = parseWallSurfaceMeta(measurement.framing_json);
+        const cursorPage = clientToPagePoint(clientX, clientY);
+        const quads = wallSurfaceQuadsFor(measurement, points, meta);
+        if (cursorPage && pointInWallFace(cursorPage, quads)) return measurement.id;
+        continue;
+      }
 
       // Array: test all (trimmed) member segments.
       if (measurement.measurement_type === "array") {
@@ -3819,6 +4364,71 @@ export function ViewerCanvas({
           });
           return;
         }
+      }
+
+      // Wall surface: hovered over its face strip, and reported as gross face / openings / net —
+      // the three numbers an estimator wants to sanity-check a lining take-off against.
+      if (isWallSurfaceType(measurement.measurement_type)) {
+        const meta = parseWallSurfaceMeta(measurement.framing_json);
+        const cursorPage = clientToPagePoint(clientX, clientY);
+        const quads = wallSurfaceQuadsFor(measurement, points, meta);
+        if (!cursorPage || !pointInWallFace(cursorPage, quads)) continue;
+        const insulation = isWallInsulationType(measurement.measurement_type);
+        const deducts = props ? wallSurfaceDeducts(meta, props) : true;
+        const grossM2 = wallSurfaceAreaM2(meta, false);
+        const netM2 = wallSurfaceAreaM2(meta, deducts);
+        const pocketsM2 = wallInsulationAreaM2(meta, deducts);
+        const pocketsGrossM2 = wallInsulationAreaM2(meta, false);
+        const quantity = props ? deriveQuantity(points, pageScale?.mm_per_point ?? null, props, measurement.framing_json) : null;
+        const faceRunM = meta.segments.reduce((sum, seg) => sum + seg.faceLengthMm, 0) / 1000;
+        const heights = meta.segments.flatMap((seg) => [seg.startHeightMm, seg.endHeightMm, ...(seg.apexHeightMm !== undefined ? [seg.apexHeightMm] : [])]);
+        const minH = heights.length ? Math.min(...heights) : 0;
+        const maxH = heights.length ? Math.max(...heights) : 0;
+        const commonRows: HoverCardRow[] = [
+          { label: "Plate Run", value: `${faceRunM.toFixed(2)} M` },
+          {
+            label: "Wall Height",
+            value: minH === maxH ? `${(maxH / 1000).toFixed(2)} M` : `${(minH / 1000).toFixed(2)} – ${(maxH / 1000).toFixed(2)} M (raking)`,
+          },
+          { label: "Gross Face", value: `${grossM2.toFixed(2)} M²` },
+        ];
+        setHoverInfo({
+          x: clientX,
+          y: clientY,
+          icon: MEASUREMENT_TYPE_ICONS[measurement.measurement_type] ?? MEASUREMENT_TYPE_ICONS.wall_surface,
+          groupTypeLabel: MEASUREMENT_TYPE_LABELS[measurement.measurement_type] ?? MEASUREMENT_TYPE_LABELS.wall_surface,
+          groupName,
+          mainValue: quantity ? quantityValueText(quantity) : (insulation ? pocketsM2 : netM2).toFixed(2),
+          mainValueUom: "m²",
+          rows: insulation
+            ? [
+                ...commonRows,
+                // What the frame itself takes out — the number an estimator sanity-checks a batt
+                // order against, since it's the whole difference from a lining take-off.
+                { label: "Framing", value: `−${(grossM2 - pocketsGrossM2).toFixed(2)} M²` },
+                {
+                  label: "Openings",
+                  value: meta.openings.length === 0
+                    ? "none"
+                    : deducts
+                      ? `${meta.openings.length} NO, −${(pocketsGrossM2 - pocketsM2).toFixed(2)} M²`
+                      : `${meta.openings.length} NO, not deducted`,
+                },
+                { label: "Pockets", value: `${wallInsulationPocketsFor(meta, deducts).length} NO` },
+              ]
+            : [
+                ...commonRows,
+                {
+                  label: "Openings",
+                  value: meta.openings.length === 0
+                    ? "none"
+                    : deducts
+                      ? `${meta.openings.length} NO, −${(grossM2 - netM2).toFixed(2)} M²`
+                      : `${meta.openings.length} NO, not deducted`,
+                },
+              ],
+        });
+        return;
       }
 
       const isArea = isAreaType(measurement.measurement_type);
@@ -4566,6 +5176,14 @@ export function ViewerCanvas({
                   offsetM,
                   color,
                   pitchAngleDeg: props?.pitch_angle_deg ?? 0,
+                });
+              } else if (isWallSurfaceType(m.measurement_type) && pts.length >= 2) {
+                const meta = parseWallSurfaceMeta(m.framing_json);
+                members = computeWallSurface3D(pts, mmpp, meta, {
+                  offsetM,
+                  color,
+                  deductOpenings: wallSurfaceDeducts(meta, { framing_props_json: props?.framing_props_json ?? null }),
+                  insulation: isWallInsulationType(m.measurement_type),
                 });
               } else if (m.measurement_type === "length" && pts.length >= 2) {
                 members = computeLengthMembers3D(pts, mmpp, {

@@ -61,6 +61,10 @@ export function possibleImportDisplays(props: GroupProps): string[] {
     }
     case "array":
       return ["count", "length"];
+    // A wall surface (or insulation) is one reading only — the net area it was taken off.
+    case "wall_surface":
+    case "wall_insulation":
+      return ["area"];
     default:
       return [];
   }
