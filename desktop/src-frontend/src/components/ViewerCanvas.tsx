@@ -2442,6 +2442,7 @@ export function ViewerCanvas({
             parseWallFraming(runPreview.wall.measurement.framing_json),
             runPreview.side,
             null,
+            runPreview.wall.group_offset_m,
             { startMm: runPreview.startMm, endMm: runPreview.currentMm },
           );
           if (previewMeta) {
@@ -3670,6 +3671,7 @@ export function ViewerCanvas({
       parseWallFraming(hover.wall.measurement.framing_json),
       hover.side,
       null,
+      hover.wall.group_offset_m,
       span,
     );
     if (!meta) {
@@ -5180,7 +5182,8 @@ export function ViewerCanvas({
               } else if (isWallSurfaceType(m.measurement_type) && pts.length >= 2) {
                 const meta = parseWallSurfaceMeta(m.framing_json);
                 members = computeWallSurface3D(pts, mmpp, meta, {
-                  offsetM,
+                  // Inherited from the framing group, not this group's own datum.
+                  offsetM: meta.sourceOffsetM,
                   color,
                   deductOpenings: wallSurfaceDeducts(meta, { framing_props_json: props?.framing_props_json ?? null }),
                   insulation: isWallInsulationType(m.measurement_type),

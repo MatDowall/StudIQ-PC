@@ -239,6 +239,13 @@ agree), and `quantity.ts` still doesn't import `lib/framing.ts` — the cycle ru
 blocking note above explains. The *builders* (`buildWallSurfaceMeta`, `wallFacePath`,
 `wallFaceQuads`, `pointInWallFace`) need real wall geometry, so they live in `framing.ts`.
 
+**The Z datum is inherited from the framing.** A surface stands at the offset of the *framing*
+group that owns its source wall (`WallSurfaceMeta.sourceOffsetM`, snapshotted from that group's
+`default_offset` and carried on `FramingSourceWallDto.group_offset_m`), not at its own group's
+`default_offset` — so a lining on a first-floor wall sits at that floor without the estimator
+having to set the datum twice. It is part of the snapshot, so moving the framing group re-cuts
+every surface taken off it via the usual drift check.
+
 **Raking frames are respected**: a plain rake contributes its mean height over the segment, a gable
 is two runs meeting at the apex (`apexFrac`), which is why a segment carries a height profile rather
 than a single wall height.

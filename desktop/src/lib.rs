@@ -386,6 +386,9 @@ pub struct FramingSourceWallDto {
     pub framing_props_json: Option<String>,
     pub group_name: String,
     pub group_colour: String,
+    /// The framing group's own Z datum (metres). A surface taken off this wall inherits it, so a
+    /// lining on a first-floor wall stands at that floor rather than at the lining group's datum.
+    pub group_offset_m: f64,
 }
 
 /// Per-drawing-page scale. `mm_per_point` converts PDF points to real-world millimetres
@@ -2041,6 +2044,7 @@ async fn get_framing_walls_for_page(
             m.uom,
             m.framing_json,
             p.framing_props_json AS framing_props_json,
+            p.default_offset AS group_offset,
             n.name AS group_name,
             n.colour AS group_colour
         FROM measurements m
@@ -2066,6 +2070,11 @@ async fn get_framing_walls_for_page(
                     .try_get::<Option<String>, _>("group_colour")
                     .map_err(|e: sqlx::Error| e.to_string())?
                     .unwrap_or_else(|| "#4A9EFF".to_string()),
+                // LEFT JOIN: a wall whose group has no props row yet sits at the default datum.
+                group_offset_m: row
+                    .try_get::<Option<f64>, _>("group_offset")
+                    .map_err(|e: sqlx::Error| e.to_string())?
+                    .unwrap_or(0.0),
             })
         })
         .collect()

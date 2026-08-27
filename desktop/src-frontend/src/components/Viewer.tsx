@@ -106,7 +106,8 @@ export function Viewer() {
         const meta = parseWallSurfaceMeta(mz.framing_json);
         members.push(
           ...computeWallSurface3D(pts, mmpp, meta, {
-            offsetM,
+            // Inherited from the framing group that owns the source wall, not this group's datum.
+            offsetM: meta.sourceOffsetM,
             color,
             deductOpenings: wallSurfaceDeducts(meta, { framing_props_json: props?.framing_props_json ?? null }),
             insulation: isWallInsulationType(mz.measurement_type),
@@ -180,7 +181,7 @@ export function Viewer() {
               const meta = parseWallSurfaceMeta(mz.framing_json);
               members.push(
                 ...computeWallSurface3D(pts, p.mmPerPoint, meta, {
-                  offsetM: g.defaultOffsetM,
+                  offsetM: meta.sourceOffsetM,
                   color,
                   deductOpenings: wallSurfaceDeducts(meta, { framing_props_json: g.framingPropsJson }),
                   insulation: isWallInsulationType(g.measurementType),

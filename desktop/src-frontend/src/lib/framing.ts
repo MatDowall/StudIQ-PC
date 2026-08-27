@@ -2145,6 +2145,8 @@ export function buildWallSurfaceMeta(
   framing: WallFraming | undefined,
   face: WallFace,
   deductOpenings: boolean | null,
+  /** Z datum of the framing group that owns this wall — inherited by the surface. */
+  sourceOffsetM: number,
   /** Measured run as cumulative centre-line arc-length (mm); omit for the whole wall. Everything
    *  downstream reads the clipped snapshot, so a partial surface needs no special handling in the
    *  area maths, the 3D builders or the plan fill. */
@@ -2251,6 +2253,7 @@ export function buildWallSurfaceMeta(
     side: face,
     deductOpenings,
     framingDepthMm: framingDepthMm(settings.framingSize),
+    sourceOffsetM,
     segments,
     openings,
     pockets,

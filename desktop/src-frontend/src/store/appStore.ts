@@ -59,6 +59,8 @@ export interface FramingSourceWallDto {
   framing_props_json: string | null;
   group_name: string;
   group_colour: string;
+  /** The framing group's Z datum (metres), inherited by any surface taken off this wall. */
+  group_offset_m: number;
 }
 
 export interface PageScaleDto {
@@ -1155,6 +1157,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
         parseWallFraming(source.measurement.framing_json),
         meta.side,
         meta.deductOpenings,
+        source.group_offset_m,
         // Re-cut to the SAME run the estimator drew. Rebuilding without this would silently
         // widen every partial surface back out to its whole wall on the next visit.
         wallSurfaceSpanOf(meta, wallPathLengthMm(wallPoints, mmPerPoint)),

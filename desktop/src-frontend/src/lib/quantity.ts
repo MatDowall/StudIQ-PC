@@ -541,6 +541,10 @@ export interface WallSurfaceMeta {
   deductOpenings: boolean | null;
   /** Wall thickness in plan (the framing size's depth) — how far the face sits off the centre line. */
   framingDepthMm: number;
+  /** Z datum (metres) inherited from the framing group that owns the source wall, so a surface
+   *  stands at the same level as the wall it was taken off rather than at its own group's datum.
+   *  Snapshotted like everything else, and re-cut by the drift check if the framing group moves. */
+  sourceOffsetM: number;
   segments: WallSurfaceSegment[];
   openings: WallSurfaceOpening[];
   /** The voids between the framing — what an insulation measure counts instead of the whole face.
@@ -563,6 +567,7 @@ export const EMPTY_WALL_SURFACE_META: WallSurfaceMeta = {
   side: "left",
   deductOpenings: null,
   framingDepthMm: 90,
+  sourceOffsetM: 0,
   segments: [],
   openings: [],
   pockets: [],
@@ -582,6 +587,7 @@ export function parseWallSurfaceMeta(json: string | null | undefined): WallSurfa
       side: parsed.side === "right" ? "right" : "left",
       deductOpenings: typeof parsed.deductOpenings === "boolean" ? parsed.deductOpenings : null,
       framingDepthMm: typeof parsed.framingDepthMm === "number" && parsed.framingDepthMm > 0 ? parsed.framingDepthMm : 90,
+      sourceOffsetM: typeof parsed.sourceOffsetM === "number" && Number.isFinite(parsed.sourceOffsetM) ? parsed.sourceOffsetM : 0,
       // Snapshots written before partial spans existed carry neither the span nor the per-segment
       // offsets; both default to "the whole segment", which is exactly what those surfaces are.
       segments: Array.isArray(parsed.segments)

@@ -78,8 +78,8 @@ describe("wall face geometry", () => {
       { x: 300, y: 0 },
       { x: 300, y: 300 },
     ];
-    const inner = buildWallSurfaceMeta(1, 2, corner, settings(), MMPP, undefined, "left", null)!;
-    const outer = buildWallSurfaceMeta(1, 2, corner, settings(), MMPP, undefined, "right", null)!;
+    const inner = buildWallSurfaceMeta(1, 2, corner, settings(), MMPP, undefined, "left", null, 0)!;
+    const outer = buildWallSurfaceMeta(1, 2, corner, settings(), MMPP, undefined, "right", null, 0)!;
     const total = (m: typeof inner) => m.segments.reduce((sum, seg) => sum + seg.faceLengthMm, 0);
     expect(total(inner)).toBeLessThan(total(outer));
     // Both segments meet the corner, and each one's mitred end moves half the wall depth in on
@@ -91,13 +91,13 @@ describe("wall face geometry", () => {
 
 describe("wall surface area", () => {
   it("is plate run × wall height for a plain wall", () => {
-    const meta = buildWallSurfaceMeta(1, 2, straightWall, settings({ wallHeightMm: 2400 }), MMPP, undefined, "left", null)!;
+    const meta = buildWallSurfaceMeta(1, 2, straightWall, settings({ wallHeightMm: 2400 }), MMPP, undefined, "left", null, 0)!;
     expect(wallSurfaceAreaM2(meta, true)).toBeCloseTo(3 * 2.4, 9);
   });
 
   it("follows a raking frame, using the mean height over the segment", () => {
     const framing: WallFraming = { openings: [], rakes: [{ segmentIndex: 0, startMm: 2400, endMm: 3600 }], extraStuds: [] };
-    const meta = buildWallSurfaceMeta(1, 2, straightWall, settings(), MMPP, framing, "left", null)!;
+    const meta = buildWallSurfaceMeta(1, 2, straightWall, settings(), MMPP, framing, "left", null, 0)!;
     expect(meta.segments[0]).toMatchObject({ startHeightMm: 2400, endHeightMm: 3600 });
     expect(wallSurfaceAreaM2(meta, true)).toBeCloseTo(3 * 3.0, 9);
   });
@@ -110,7 +110,7 @@ describe("wall surface area", () => {
       rakes: [{ segmentIndex: 0, startMm: 2400, endMm: 2000, gable: true, middleMm: 4000, middlePositionMm: 750 }],
       extraStuds: [],
     };
-    const meta = buildWallSurfaceMeta(1, 2, straightWall, settings(), MMPP, framing, "left", null)!;
+    const meta = buildWallSurfaceMeta(1, 2, straightWall, settings(), MMPP, framing, "left", null, 0)!;
     expect(meta.segments[0].apexFrac).toBeCloseTo(0.25, 9);
     const expectedMm2 = 3000 * (0.25 * ((2400 + 4000) / 2) + 0.75 * ((4000 + 2000) / 2));
     expect(wallSurfaceSegmentAreaMm2(meta.segments[0])).toBeCloseTo(expectedMm2, 6);
@@ -126,7 +126,7 @@ describe("wall surface area", () => {
       rakes: [],
       extraStuds: [],
     };
-    const meta = buildWallSurfaceMeta(1, 2, straightWall, settings({ wallHeightMm: 2400 }), MMPP, framing, "left", null)!;
+    const meta = buildWallSurfaceMeta(1, 2, straightWall, settings({ wallHeightMm: 2400 }), MMPP, framing, "left", null, 0)!;
     expect(meta.openings).toEqual([
       { segmentIndex: 0, centreMm: 700, frameCentreMm: 700, widthMm: 900, headMm: 2000, sillMm: 0 },
       { segmentIndex: 0, centreMm: 2200, frameCentreMm: 2200, widthMm: 1500, headMm: 2100, sillMm: 900 },
@@ -138,7 +138,7 @@ describe("wall surface area", () => {
   });
 
   it("takes the deduction from the surface's own override, else the group default", () => {
-    const meta = buildWallSurfaceMeta(1, 2, straightWall, settings(), MMPP, undefined, "left", null)!;
+    const meta = buildWallSurfaceMeta(1, 2, straightWall, settings(), MMPP, undefined, "left", null, 0)!;
     expect(wallSurfaceDeducts(meta, props(null))).toBe(true);
     expect(wallSurfaceDeducts(meta, props(JSON.stringify({ deductOpenings: false })))).toBe(false);
     expect(wallSurfaceDeducts({ ...meta, deductOpenings: true }, props(JSON.stringify({ deductOpenings: false })))).toBe(true);
@@ -148,13 +148,13 @@ describe("wall surface area", () => {
 
 describe("wall surface snapshot", () => {
   it("round-trips through JSON", () => {
-    const meta = buildWallSurfaceMeta(7, 9, straightWall, settings(), MMPP, undefined, "right", false)!;
+    const meta = buildWallSurfaceMeta(7, 9, straightWall, settings(), MMPP, undefined, "right", false, 0)!;
     expect(parseWallSurfaceMeta(serializeWallSurfaceMeta(meta))).toEqual(meta);
   });
 
   it("detects framing drift but ignores the estimator's own deduction choice", () => {
-    const base = buildWallSurfaceMeta(1, 2, straightWall, settings({ wallHeightMm: 2400 }), MMPP, undefined, "left", null)!;
-    const taller = buildWallSurfaceMeta(1, 2, straightWall, settings({ wallHeightMm: 2700 }), MMPP, undefined, "left", null)!;
+    const base = buildWallSurfaceMeta(1, 2, straightWall, settings({ wallHeightMm: 2400 }), MMPP, undefined, "left", null, 0)!;
+    const taller = buildWallSurfaceMeta(1, 2, straightWall, settings({ wallHeightMm: 2700 }), MMPP, undefined, "left", null, 0)!;
     expect(wallSurfaceMetaMatches(base, { ...base, deductOpenings: false })).toBe(true);
     expect(wallSurfaceMetaMatches(base, taller)).toBe(false);
   });
@@ -183,7 +183,7 @@ describe("wall surface 3D", () => {
   // mitring the offset) left a gap of the panel thickness at every corner — visible in 3D as a
   // notch where two wall faces should meet.
   it.each(["left", "right"] as const)("closes the corner on the %s face", (side) => {
-    const meta = buildWallSurfaceMeta(1, 2, corner, settings(), MMPP, undefined, side, null)!;
+    const meta = buildWallSurfaceMeta(1, 2, corner, settings(), MMPP, undefined, side, null, 0)!;
     const panels = computeWallSurface3D(corner, MMPP, meta, { offsetM: 0, color: "#fff", deductOpenings: true });
     expect(panels).toHaveLength(2);
     const [endX, endZ] = endOf(panels[0]);
@@ -194,10 +194,10 @@ describe("wall surface 3D", () => {
   it("stands the panel on the measured face, not the wall centre line", () => {
     // A single straight wall running along +X: the left face sits at +halfDepth in page Y, which
     // maps to NEGATIVE world Z (pageToWorld flips Y). 90 mm framing + 20 mm panel → 55 mm out.
-    const meta = buildWallSurfaceMeta(1, 2, straightWall, settings(), MMPP, undefined, "left", null)!;
+    const meta = buildWallSurfaceMeta(1, 2, straightWall, settings(), MMPP, undefined, "left", null, 0)!;
     const [panel] = computeWallSurface3D(straightWall, MMPP, meta, { offsetM: 0, color: "#fff", deductOpenings: true });
     expect(panel.position[2]).toBeCloseTo(-0.055, 9);
-    const right = buildWallSurfaceMeta(1, 2, straightWall, settings(), MMPP, undefined, "right", null)!;
+    const right = buildWallSurfaceMeta(1, 2, straightWall, settings(), MMPP, undefined, "right", null, 0)!;
     const [rightPanel] = computeWallSurface3D(straightWall, MMPP, right, { offsetM: 0, color: "#fff", deductOpenings: true });
     expect(rightPanel.position[2]).toBeCloseTo(0.055, 9);
   });
@@ -210,7 +210,7 @@ describe("wall surface 3D", () => {
       rakes: [],
       extraStuds: [],
     };
-    const meta = buildWallSurfaceMeta(1, 2, straightWall, settings({ wallHeightMm: 2400 }), MMPP, framing, "left", null)!;
+    const meta = buildWallSurfaceMeta(1, 2, straightWall, settings({ wallHeightMm: 2400 }), MMPP, framing, "left", null, 0)!;
     const opts = { offsetM: 0, color: "#fff" };
     // Left of the door, the spandrel over it, right of the door.
     expect(computeWallSurface3D(straightWall, MMPP, meta, { ...opts, deductOpenings: true })).toHaveLength(3);
@@ -246,22 +246,22 @@ describe("insulation pockets", () => {
     // 6 studs at 45 x 2310. The two derivations share no code beyond `wallMembers`.
     const gross = 3000 * 2400;
     const framed = 2 * (3000 * 45) + 6 * (45 * 2310);
-    const meta = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null)!;
+    const meta = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null, 0)!;
     expect(wallInsulationAreaM2(meta) * 1e6).toBeCloseTo(gross - framed, 6);
   });
 
   it("is always smaller than the lining measure of the same wall", () => {
-    const meta = buildWallSurfaceMeta(1, 2, straightWall, settings(), MMPP, undefined, "left", null)!;
+    const meta = buildWallSurfaceMeta(1, 2, straightWall, settings(), MMPP, undefined, "left", null, 0)!;
     expect(wallInsulationAreaM2(meta)).toBeGreaterThan(0);
     expect(wallInsulationAreaM2(meta)).toBeLessThan(wallSurfaceAreaM2(meta, true));
   });
 
   it("adds a pocket row when dwangs break the bays up, without changing the total", () => {
-    const noDwangs = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null)!;
+    const noDwangs = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null, 0)!;
     const withDwangs = buildWallSurfaceMeta(
       1, 2, straightWall,
       settings({ wallHeightMm: 2400, studSpacingMm: 600, dwangsOn: true, dwangCentresMm: 800 }),
-      MMPP, undefined, "left", null,
+      MMPP, undefined, "left", null, 0,
     )!;
     expect(withDwangs.pockets.length).toBeGreaterThan(noDwangs.pockets.length);
     // Dwangs are real timber, so they come out of the insulation area.
@@ -288,8 +288,8 @@ describe("insulation pockets", () => {
 
   it("follows a rake, trimming the top pockets to the roofline", () => {
     const framing: WallFraming = { openings: [], rakes: [{ segmentIndex: 0, startMm: 2400, endMm: 3600 }], extraStuds: [] };
-    const meta = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, framing, "left", null)!;
-    const flat = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null)!;
+    const meta = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, framing, "left", null, 0)!;
+    const flat = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null, 0)!;
     // A taller wall has more cavity, and no pocket may poke above the sloping top plate.
     expect(wallInsulationAreaM2(meta)).toBeGreaterThan(wallInsulationAreaM2(flat));
     for (const pocket of meta.pockets) {
@@ -300,7 +300,7 @@ describe("insulation pockets", () => {
   });
 
   it("measures by the group's own type, off one shared snapshot", () => {
-    const meta = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null)!;
+    const meta = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null, 0)!;
     expect(wallSurfaceMeasureM2(meta, surfaceProps("wall_surface"))).toBeCloseTo(3 * 2.4, 9);
     expect(wallSurfaceMeasureM2(meta, surfaceProps("wall_insulation"))).toBeCloseTo(wallInsulationAreaM2(meta), 9);
     // The deduction flag is the estimator's, for both types.
@@ -317,7 +317,7 @@ describe("insulation pockets", () => {
   });
 
   it("renders one batt per pocket, in the cavity rather than on the face", () => {
-    const meta = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null)!;
+    const meta = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null, 0)!;
     const batts = computeWallSurface3D(straightWall, MMPP, meta, {
       offsetM: 0, color: "#fff", deductOpenings: true, insulation: true,
     });
@@ -341,8 +341,8 @@ describe("insulation targets the wall, not a face", () => {
 
   it("gives both faces the same batts, so measuring either side is the same quantity", () => {
     const plain = settings({ wallHeightMm: 2400, studSpacingMm: 600, dwangsOn: false });
-    const left = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null)!;
-    const right = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "right", null)!;
+    const left = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null, 0)!;
+    const right = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "right", null, 0)!;
     expect(wallInsulationAreaM2(left)).toBeCloseTo(wallInsulationAreaM2(right), 9);
     expect(left.pockets).toEqual(right.pockets);
   });
@@ -357,7 +357,7 @@ describe("insulation opening deduction", () => {
     rakes: [],
     extraStuds: [],
   };
-  const meta = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, framing, "left", null)!;
+  const meta = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, framing, "left", null, 0)!;
 
   it("adds the daylight back exactly when openings are not deducted", () => {
     const deducted = wallInsulationAreaM2(meta, true);
@@ -386,7 +386,7 @@ describe("insulation opening deduction", () => {
     ];
     // On the inner face the mitre shortens the segment, so the face position of an opening is
     // pulled in while its position on the frame is untouched.
-    const inner = buildWallSurfaceMeta(1, 2, cornerWall, plain, MMPP, framing, "left", null)!;
+    const inner = buildWallSurfaceMeta(1, 2, cornerWall, plain, MMPP, framing, "left", null, 0)!;
     expect(inner.openings[0].frameCentreMm).toBeCloseTo(1500, 9);
     expect(inner.openings[0].centreMm).toBeLessThan(1500);
   });
@@ -408,11 +408,11 @@ describe("insulation opening deduction", () => {
 
 describe("partial runs along a wall", () => {
   const plain = settings({ wallHeightMm: 2400, studSpacingMm: 600, dwangsOn: false });
-  const whole = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null)!;
+  const whole = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null, 0)!;
 
   it("measures only the drawn stretch", () => {
     // Middle metre of a 3 m wall.
-    const run = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null, { startMm: 1000, endMm: 2000 })!;
+    const run = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null, 0, { startMm: 1000, endMm: 2000 })!;
     expect(run.spanStartMm).toBe(1000);
     expect(run.spanEndMm).toBe(2000);
     expect(wallSurfaceAreaM2(run, true)).toBeCloseTo(1 * 2.4, 9);
@@ -420,22 +420,22 @@ describe("partial runs along a wall", () => {
   });
 
   it("normalises a run drawn backwards, and clamps one drawn past the ends", () => {
-    const backwards = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null, { startMm: 2000, endMm: 1000 })!;
+    const backwards = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null, 0, { startMm: 2000, endMm: 1000 })!;
     expect(backwards.spanStartMm).toBe(1000);
     expect(backwards.spanEndMm).toBe(2000);
-    const overshoot = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null, { startMm: -500, endMm: 9999 })!;
+    const overshoot = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null, 0, { startMm: -500, endMm: 9999 })!;
     // Clamped back to the whole wall, which is stored as "no span" rather than an explicit range.
     expect(overshoot.spanStartMm).toBeNull();
     expect(wallSurfaceAreaM2(overshoot, true)).toBeCloseTo(wallSurfaceAreaM2(whole, true), 9);
   });
 
   it("keeps a whole-wall run indistinguishable from a plain take-off", () => {
-    const full = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null, { startMm: 0, endMm: 3000 })!;
+    const full = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null, 0, { startMm: 0, endMm: 3000 })!;
     expect(full).toEqual(whole);
   });
 
   it("clips the insulation pockets to the run as well", () => {
-    const run = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null, { startMm: 1000, endMm: 2000 })!;
+    const run = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null, 0, { startMm: 1000, endMm: 2000 })!;
     expect(wallInsulationAreaM2(run)).toBeGreaterThan(0);
     expect(wallInsulationAreaM2(run)).toBeLessThan(wallInsulationAreaM2(whole));
     for (const pocket of run.pockets) {
@@ -453,7 +453,7 @@ describe("partial runs along a wall", () => {
       extraStuds: [],
     };
     // Run ends halfway through the doorway: only that half comes out of the measure.
-    const run = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, framing, "left", null, { startMm: 0, endMm: 1500 })!;
+    const run = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, framing, "left", null, 0, { startMm: 0, endMm: 1500 })!;
     expect(run.openings).toHaveLength(1);
     expect(run.openings[0].widthMm).toBeCloseTo(450, 9);
     expect(run.openings[0].frameCentreMm).toBeCloseTo(1500 - 225, 9);
@@ -461,7 +461,7 @@ describe("partial runs along a wall", () => {
 
   it("samples rake heights where the run actually starts and stops", () => {
     const framing: WallFraming = { openings: [], rakes: [{ segmentIndex: 0, startMm: 2400, endMm: 3600 }], extraStuds: [] };
-    const run = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, framing, "left", null, { startMm: 1000, endMm: 2000 })!;
+    const run = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, framing, "left", null, 0, { startMm: 1000, endMm: 2000 })!;
     // Linear rake over 3 m: 2400 at 0, 3600 at 3000 -> 2800 at 1000 and 3200 at 2000.
     expect(run.segments[0].startHeightMm).toBeCloseTo(2800, 9);
     expect(run.segments[0].endHeightMm).toBeCloseTo(3200, 9);
@@ -474,16 +474,16 @@ describe("partial runs along a wall", () => {
       rakes: [{ segmentIndex: 0, startMm: 2400, endMm: 2400, gable: true, middleMm: 4000, middlePositionMm: 1500 }],
       extraStuds: [],
     };
-    const acrossApex = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, framing, "left", null, { startMm: 1000, endMm: 2000 })!;
+    const acrossApex = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, framing, "left", null, 0, { startMm: 1000, endMm: 2000 })!;
     expect(acrossApex.segments[0].apexHeightMm).toBe(4000);
-    const oneSlope = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, framing, "left", null, { startMm: 0, endMm: 1000 })!;
+    const oneSlope = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, framing, "left", null, 0, { startMm: 0, endMm: 1000 })!;
     expect(oneSlope.segments[0].apexHeightMm).toBeUndefined();
   });
 
   it("detects overlap between two runs on the same wall", () => {
     const wallLengthMm = wallPathLengthMm(straightWall, MMPP);
     const run = (startMm: number, endMm: number) =>
-      buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null, { startMm, endMm })!;
+      buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null, 0, { startMm, endMm })!;
     expect(wallSpansOverlap(run(0, 1000), run(1000, 2000), wallLengthMm)).toBe(false);
     expect(wallSpansOverlap(run(0, 1200), run(1000, 2000), wallLengthMm)).toBe(true);
     // A whole-wall surface has no explicit span, and clashes with everything on that wall.
@@ -494,9 +494,9 @@ describe("partial runs along a wall", () => {
   // it drops the run, a partial surface silently snaps back to covering the whole wall.
   it("survives being rebuilt from its own snapshot", () => {
     const wallLengthMm = wallPathLengthMm(straightWall, MMPP);
-    const run = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null, { startMm: 1000, endMm: 2000 })!;
+    const run = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null, 0, { startMm: 1000, endMm: 2000 })!;
     const rebuilt = buildWallSurfaceMeta(
-      1, 2, straightWall, plain, MMPP, undefined, "left", null,
+      1, 2, straightWall, plain, MMPP, undefined, "left", null, 0,
       wallSurfaceSpanOf(run, wallLengthMm),
     )!;
     expect(rebuilt).toEqual(run);
@@ -504,14 +504,14 @@ describe("partial runs along a wall", () => {
     // And a whole-wall surface round-trips as "no run" rather than an explicit full range.
     expect(wallSurfaceSpanOf(whole, wallLengthMm)).toBeNull();
     const wholeRebuilt = buildWallSurfaceMeta(
-      1, 2, straightWall, plain, MMPP, undefined, "left", null,
+      1, 2, straightWall, plain, MMPP, undefined, "left", null, 0,
       wallSurfaceSpanOf(whole, wallLengthMm),
     )!;
     expect(wholeRebuilt).toEqual(whole);
   });
 
   it("fills only the drawn stretch in plan", () => {
-    const run = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null, { startMm: 1000, endMm: 2000 })!;
+    const run = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null, 0, { startMm: 1000, endMm: 2000 })!;
     const quads = wallSurfaceSpanQuads(straightWall, run, MMPP, false);
     // 10 mm per point, so the run covers 100..200 pt of a 300 pt wall.
     expect(pointInWallFace({ x: 150, y: 2 }, quads)).toBe(true);
@@ -521,5 +521,36 @@ describe("partial runs along a wall", () => {
     const body = wallSurfaceSpanQuads(straightWall, run, MMPP, true);
     expect(pointInWallFace({ x: 150, y: -2 }, body)).toBe(true);
     expect(pointInWallFace({ x: 50, y: -2 }, body)).toBe(false);
+  });
+});
+
+describe("inherited Z datum", () => {
+  const plain = settings({ wallHeightMm: 2400, studSpacingMm: 600, dwangsOn: false });
+
+  it("snapshots the framing group's offset, not the surface group's", () => {
+    const firstFloor = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null, 3.1)!;
+    expect(firstFloor.sourceOffsetM).toBeCloseTo(3.1, 9);
+    const ground = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null, 0)!;
+    expect(ground.sourceOffsetM).toBe(0);
+    // The datum belongs to the wall, so it is part of the drift check: move the framing group and
+    // the surface must be re-cut rather than left standing at the old level.
+    expect(wallSurfaceMetaMatches(firstFloor, ground)).toBe(false);
+  });
+
+  it("stands both a lining panel and a batt at the inherited level", () => {
+    const meta = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null, 3.1)!;
+    const [panel] = computeWallSurface3D(straightWall, MMPP, meta, {
+      offsetM: meta.sourceOffsetM, color: "#fff", deductOpenings: true,
+    });
+    expect(panel.position[1]).toBeCloseTo(3.1, 9);
+    const [batt] = computeWallSurface3D(straightWall, MMPP, meta, {
+      offsetM: meta.sourceOffsetM, color: "#fff", deductOpenings: true, insulation: true,
+    });
+    expect(batt.position[1]).toBeCloseTo(3.1, 9);
+  });
+
+  it("defaults to the ground datum for snapshots written before it was inherited", () => {
+    const legacy = JSON.stringify({ type: "wall_surface", segments: [], openings: [], pockets: [] });
+    expect(parseWallSurfaceMeta(legacy).sourceOffsetM).toBe(0);
   });
 });
