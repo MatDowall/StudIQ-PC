@@ -6,6 +6,7 @@ import {
   parseFramingSettings,
   parseWallFraming,
   wallMembers,
+  wallInsulationPockets,
   wallPathLengthMm,
   wallSurfaceMetaMatches,
   type OpeningTemplate,
@@ -15,6 +16,11 @@ import { computeWallElevations } from "../lib/elevation2d";
 import { exportElevationPdf, type WallElevationExport } from "../lib/elevationPdf";
 
 export type DimensionGroupPropsDto = GroupProps;
+
+// Coalescing state for `loadFramingSourceWalls` — see the comment there. Module-level rather than
+// store state because it is pure scheduling: it must never trigger a re-render of its own.
+let framingSyncInFlight = false;
+let framingSyncPending = false;
 
 export interface TreeNodeDto {
   id: number;
@@ -1126,51 +1132,115 @@ export const useAppStore = create<AppStore>((set, get) => ({
       if (get().framingSourceWalls.length > 0) set({ framingSourceWalls: [] });
       return;
     }
-    const walls = await invoke<FramingSourceWallDto[]>("get_framing_walls_for_page", {
-      drawingId: state.activeDrawingId,
-      pageIndex: state.activePageIndex,
-    });
-    set({ framingSourceWalls: walls });
+    // The re-sync writes into `overlayMeasurements`, which is exactly what the effect calling this
+    // watches — so without a guard each write re-enters this function, and every re-entry redoes
+    // the full (expensive) derivation for every surface on the page. Coalesce instead: one run at
+    // a time, and if anything asked while we were busy, run once more at the end.
+    if (framingSyncInFlight) {
+      framingSyncPending = true;
+      return;
+    }
+    framingSyncInFlight = true;
+    try {
+      const walls = await invoke<FramingSourceWallDto[]>("get_framing_walls_for_page", {
+        drawingId: state.activeDrawingId,
+        pageIndex: state.activePageIndex,
+      });
+      set({ framingSourceWalls: walls });
 
-    const mmPerPoint = get().pageScale?.mm_per_point ?? null;
-    if (!mmPerPoint) return;
-    const byId = new Map(walls.map((w) => [w.measurement.id, w]));
-    for (const surface of get().overlayMeasurements) {
-      if (!isWallSurfaceType(surface.measurement_type)) continue;
-      if (surface.dimension_group_id !== get().activeDimensionGroupId) continue;
-      const meta = parseWallSurfaceMeta(surface.framing_json);
-      const source = byId.get(meta.sourceMeasurementId);
-      if (!source) continue;
-      let wallPoints: { x: number; y: number }[];
-      try {
-        wallPoints = JSON.parse(source.measurement.geometry_json);
-      } catch {
-        continue;
-      }
-      if (!Array.isArray(wallPoints)) continue;
-      const fresh = buildWallSurfaceMeta(
-        source.measurement.id,
-        source.measurement.dimension_group_id,
-        wallPoints,
-        parseFramingSettings(source.framing_props_json),
-        mmPerPoint,
-        parseWallFraming(source.measurement.framing_json),
-        meta.side,
-        meta.deductOpenings,
-        source.group_offset_m,
-        // Re-cut to the SAME run the estimator drew. Rebuilding without this would silently
-        // widen every partial surface back out to its whole wall on the next visit.
-        wallSurfaceSpanOf(meta, wallPathLengthMm(wallPoints, mmPerPoint)),
-      );
-      if (!fresh || wallSurfaceMetaMatches(fresh, meta)) continue;
-      // The source wall moved — re-cut the surface to it, and follow its centre line too.
-      try {
-        await get().updateMeasurementFraming(surface.id, serializeWallSurfaceMeta(fresh));
-        if (source.measurement.geometry_json !== surface.geometry_json) {
-          await get().updateMeasurementGeometry(surface.id, source.measurement.geometry_json);
+      const mmPerPoint = get().pageScale?.mm_per_point ?? null;
+      if (!mmPerPoint) return;
+      const byId = new Map(walls.map((w) => [w.measurement.id, w]));
+      // The pocket sweep runs `wallMembers` over a whole wall, so it is by far the costliest part
+      // of a rebuild — and it depends only on the wall, not on the surface. Many surfaces off one
+      // wall (several partial runs, or a lining and its insulation) would otherwise repeat it.
+      const pocketCache = new Map<number, ReturnType<typeof wallInsulationPockets>>();
+      const pocketsFor = (source: FramingSourceWallDto, wallPoints: { x: number; y: number }[]) => {
+        const cached = pocketCache.get(source.measurement.id);
+        if (cached) return cached;
+        const built = wallInsulationPockets(
+          wallPoints,
+          parseFramingSettings(source.framing_props_json),
+          mmPerPoint,
+          parseWallFraming(source.measurement.framing_json),
+        );
+        pocketCache.set(source.measurement.id, built);
+        return built;
+      };
+
+      const updates: { id: number; framingJson: string; geometryJson: string | null }[] = [];
+      for (const surface of get().overlayMeasurements) {
+        // Every loaded surface, not just the active group's: the 3D view and the sidebar render
+        // all selected groups, so re-syncing only the active one leaves the rest showing a stale
+        // snapshot (most visibly, at the wrong Z datum).
+        if (!isWallSurfaceType(surface.measurement_type)) continue;
+        const meta = parseWallSurfaceMeta(surface.framing_json);
+        const source = byId.get(meta.sourceMeasurementId);
+        if (!source) continue;
+        let wallPoints: { x: number; y: number }[];
+        try {
+          wallPoints = JSON.parse(source.measurement.geometry_json);
+        } catch {
+          continue;
         }
-      } catch {
-        /* a surface that can't be refreshed keeps its last good snapshot */
+        if (!Array.isArray(wallPoints)) continue;
+        const fresh = buildWallSurfaceMeta(
+          source.measurement.id,
+          source.measurement.dimension_group_id,
+          wallPoints,
+          parseFramingSettings(source.framing_props_json),
+          mmPerPoint,
+          parseWallFraming(source.measurement.framing_json),
+          meta.side,
+          meta.deductOpenings,
+          source.group_offset_m,
+          // Re-cut to the SAME run the estimator drew. Rebuilding without this would silently
+          // widen every partial surface back out to its whole wall on the next visit.
+          wallSurfaceSpanOf(meta, wallPathLengthMm(wallPoints, mmPerPoint)),
+          pocketsFor(source, wallPoints),
+        );
+        if (!fresh || wallSurfaceMetaMatches(fresh, meta)) continue;
+        updates.push({
+          id: surface.id,
+          framingJson: serializeWallSurfaceMeta(fresh),
+          // The source wall moved — follow its centre line too.
+          geometryJson: source.measurement.geometry_json !== surface.geometry_json ? source.measurement.geometry_json : null,
+        });
+      }
+      if (updates.length === 0) return;
+
+      // Persist in parallel and fold the results into ONE state update. Writing them one at a
+      // time re-rendered (and re-entered) per surface, which is what made a page carrying a lot
+      // of insulation crawl and show half its measures at the old datum while it churned.
+      const saved = await Promise.all(
+        updates.map(async (update) => {
+          try {
+            const afterFraming = await invoke<MeasurementDto>("update_measurement_framing", {
+              measurementId: update.id,
+              framingJson: update.framingJson,
+            });
+            if (!update.geometryJson) return afterFraming;
+            return await invoke<MeasurementDto>("update_measurement_geometry", {
+              measurementId: update.id,
+              geometryJson: update.geometryJson,
+            });
+          } catch {
+            // A surface that can't be refreshed keeps its last good snapshot.
+            return null;
+          }
+        }),
+      );
+      const merged = new Map<number, MeasurementDto>();
+      for (const measurement of saved) if (measurement) merged.set(measurement.id, measurement);
+      if (merged.size === 0) return;
+      set((latest) => ({
+        overlayMeasurements: latest.overlayMeasurements.map((m) => merged.get(m.id) ?? m),
+      }));
+    } finally {
+      framingSyncInFlight = false;
+      if (framingSyncPending) {
+        framingSyncPending = false;
+        void get().loadFramingSourceWalls();
       }
     }
   },

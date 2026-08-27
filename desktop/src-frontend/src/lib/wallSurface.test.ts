@@ -7,6 +7,7 @@ import {
   wallFaceQuads,
   wallInsulationPockets,
   wallPathLengthMm,
+  type WallPocket,
   wallSurfaceMetaMatches,
   wallSurfaceSpanQuads,
   DEFAULT_FRAMING_SETTINGS,
@@ -546,11 +547,81 @@ describe("inherited Z datum", () => {
     const [batt] = computeWallSurface3D(straightWall, MMPP, meta, {
       offsetM: meta.sourceOffsetM, color: "#fff", deductOpenings: true, insulation: true,
     });
-    expect(batt.position[1]).toBeCloseTo(3.1, 9);
+    // A square batt is a box, so it is centred on `position`; its underside is what sits at the
+    // inherited datum plus the pocket's own height above FFL.
+    expect(batt.position[1] - batt.size[1] / 2).toBeCloseTo(3.1 + meta.pockets[0].yb0 / 1000, 9);
   });
 
   it("defaults to the ground datum for snapshots written before it was inherited", () => {
     const legacy = JSON.stringify({ type: "wall_surface", segments: [], openings: [], pockets: [] });
     expect(parseWallSurfaceMeta(legacy).sourceOffsetM).toBe(0);
+  });
+});
+
+describe("rebuild cost", () => {
+  const plain = settings({ wallHeightMm: 2400, studSpacingMm: 600, dwangsOn: true, dwangCentresMm: 800 });
+
+  it("accepts pre-swept pockets and produces the identical snapshot", () => {
+    // The store re-syncs every loaded surface on each visit; the pocket sweep runs wallMembers
+    // over the whole wall and depends only on the wall, so it is hoisted and shared. This pins
+    // that the shortcut cannot change the result.
+    const swept: WallPocket[] = wallInsulationPockets(straightWall, plain, MMPP, undefined);
+    expect(swept.length).toBeGreaterThan(0);
+    const derived = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null, 0)!;
+    const reused = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null, 0, null, swept)!;
+    expect(reused).toEqual(derived);
+  });
+
+  it("clips pre-swept pockets to a partial run exactly as it would fresh ones", () => {
+    const swept = wallInsulationPockets(straightWall, plain, MMPP, undefined);
+    const span = { startMm: 1000, endMm: 2000 };
+    const derived = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null, 0, span)!;
+    const reused = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null, 0, span, swept)!;
+    expect(reused).toEqual(derived);
+    expect(wallInsulationAreaM2(reused)).toBeCloseTo(wallInsulationAreaM2(derived), 12);
+  });
+
+  it("is stable across rebuilds, so a settled surface stops rewriting itself", () => {
+    // wallSurfaceMetaMatches drives the drift check; if a rebuild of unchanged input ever differed
+    // the store would rewrite every surface on every visit, which is what made the app lag.
+    const first = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null, 2.7)!;
+    const second = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null, 2.7)!;
+    expect(wallSurfaceMetaMatches(second, first)).toBe(true);
+  });
+});
+
+describe("batt draw cost", () => {
+  const plain = settings({ wallHeightMm: 2400, studSpacingMm: 600, dwangsOn: false });
+  const batts = (meta: ReturnType<typeof buildWallSurfaceMeta>) =>
+    computeWallSurface3D(straightWall, MMPP, meta!, { offsetM: 0, color: "#fff", deductOpenings: true, insulation: true });
+
+  it("emits square batts as boxes so they can be instanced", () => {
+    // Every wedge is its own mesh and draw call in Framing3DView; a wall's worth of square
+    // pockets emitted as wedges is what stalled the 3D view.
+    const meta = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null, 0)!;
+    const built = batts(meta);
+    expect(built.length).toBe(meta.pockets.length);
+    expect(built.every((m) => !m.wedge)).toBe(true);
+    // Identical bays share a size, which is what lets them batch into one instanced mesh.
+    const sizes = new Set(built.map((m) => m.size.join(",")));
+    expect(sizes.size).toBeLessThan(built.length);
+  });
+
+  it("still uses a wedge where a rake has sloped the pocket", () => {
+    const framing: WallFraming = { openings: [], rakes: [{ segmentIndex: 0, startMm: 2400, endMm: 3600 }], extraStuds: [] };
+    const meta = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, framing, "left", null, 0)!;
+    const built = batts(meta);
+    expect(built.some((m) => m.wedge)).toBe(true);
+  });
+
+  it("puts a box batt in the same place the wedge form would", () => {
+    const meta = buildWallSurfaceMeta(1, 2, straightWall, plain, MMPP, undefined, "left", null, 0)!;
+    const [box] = batts(meta);
+    const pocket = meta.pockets[0];
+    // Box members are centred; the pocket runs yb..yt above FFL and x0..x1 along the wall.
+    expect(box.position[1]).toBeCloseTo((pocket.yb0 + pocket.yt0) / 2 / 1000, 9);
+    expect(box.size[0]).toBeCloseTo((pocket.x1 - pocket.x0) / 1000, 9);
+    expect(box.size[1]).toBeCloseTo((pocket.yt0 - pocket.yb0) / 1000, 9);
+    expect(box.size[2]).toBeCloseTo(0.09, 9);
   });
 });

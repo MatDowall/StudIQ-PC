@@ -2151,6 +2151,11 @@ export function buildWallSurfaceMeta(
    *  downstream reads the clipped snapshot, so a partial surface needs no special handling in the
    *  area maths, the 3D builders or the plan fill. */
   span?: { startMm: number; endMm: number } | null,
+  /** Pre-swept pockets for this wall, to skip the `wallMembers` sweep. Pass the UNCLIPPED result
+   *  of `wallInsulationPockets` for the same wall/settings/framing — it is clipped to the measured
+   *  run here. Purely an optimisation for rebuilding many surfaces off one wall; omit and it is
+   *  computed. */
+  precomputedPockets?: WallPocket[],
 ): WallSurfaceMeta | null {
   const facePath = wallFacePath(path, framingDepthMm(settings.framingSize), mmPerPoint, face);
   if (facePath.length < 2 || !mmPerPoint) return null;
@@ -2244,7 +2249,10 @@ export function buildWallSurfaceMeta(
 
   // Pockets are snapshotted unconditionally, not just for insulation groups: switching a group
   // between Lining and Insulation is then a pure display change with no re-snapshot to go stale.
-  const pockets = clipPocketsToSegments(wallInsulationPockets(path, settings, mmPerPoint, framing), segments);
+  const pockets = clipPocketsToSegments(
+    precomputedPockets ?? wallInsulationPockets(path, settings, mmPerPoint, framing),
+    segments,
+  );
 
   return {
     type: "wall_surface",

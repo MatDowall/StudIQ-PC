@@ -255,12 +255,32 @@ than a single wall height.
 surface may override it from its right-click menu (`WallSurfaceMeta.deductOpenings`, `null` =
 follow the group). `wallSurfaceDeducts` is the single place that resolves the two.
 
-**The snapshot stays live.** `loadFramingSourceWalls` re-derives every surface's snapshot from the
-wall it came off each time the group is opened on that page, and rewrites it (and the centre line)
-when the framing has moved, gained an opening, or been re-raked — that follow-through is the point
+**The snapshot stays live — but the re-sync must not feed itself.** `loadFramingSourceWalls`
+re-derives every surface's snapshot from the wall it came off each time the group is opened on that
+page, and rewrites it (and the centre line) when the framing has moved, gained an opening, or been
+re-raked — that follow-through is the point
 of the type. `wallSurfaceMetaMatches` is the drift test, and it ignores `deductOpenings`, which is
 the estimator's choice and never follows the wall. The persisted snapshot remains the source of
 truth everywhere else.
+
+Three things keep that re-sync from melting a page carrying a lot of insulation, all learned the
+hard way when `sourceOffsetM` was added and every existing snapshot went stale at once:
+- **It coalesces.** Its writes land in `overlayMeasurements`, which is what the effect calling it
+  watches, so without the `framingSyncInFlight`/`framingSyncPending` guard every write re-enters it
+  and redoes the whole derivation. One run at a time; one more at the end if anything asked while
+  busy.
+- **It writes once.** All rebuilt snapshots are persisted in parallel and folded into a single
+  `set`. Per-surface writes re-rendered per surface, and mid-storm the 3D view showed the
+  not-yet-rewritten measures at the old datum.
+- **It hoists the pocket sweep.** `wallInsulationPockets` runs `wallMembers` over a whole wall and
+  depends only on the wall, so it is cached per source wall and handed to `buildWallSurfaceMeta`
+  via `precomputedPockets` — several runs on one wall, or a lining and its insulation, would
+  otherwise repeat it.
+
+It re-syncs **every loaded surface, not just the active group's** — the 3D view and the sidebar
+render all selected groups, so re-syncing only the active one leaves the rest on a stale snapshot.
+A schema addition to the snapshot should come with a SQL backfill in the startup migration (as
+`sourceOffsetM` did), so existing projects do not pay for it as a frontend write storm on open.
 
 **Lining and insulation are two distinct measurement types**, `wall_surface` and `wall_insulation`,
 sharing this entire model — the same snapshot, the same read-only framing interaction, the same

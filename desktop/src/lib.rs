@@ -4444,6 +4444,32 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), String> {
     .await
     .map_err(|e| format!("Failed to migrate wall insulation groups: {e}"))?;
 
+    // Wall surfaces now inherit the Z datum of the framing group they were taken off, held in
+    // their own snapshot as `sourceOffsetM`. Backfill it here rather than leaving the frontend's
+    // drift check to rewrite every surface on first open — on a project carrying a lot of
+    // insulation that is a large write storm, during which the 3D view shows the not-yet-rewritten
+    // measures at the wrong datum.
+    sqlx::query(
+        r#"
+        UPDATE measurements
+        SET framing_json = json_set(
+            framing_json,
+            '$.sourceOffsetM',
+            COALESCE((
+                SELECT p.default_offset FROM dimension_group_props p
+                WHERE p.node_id = json_extract(measurements.framing_json, '$.sourceGroupId')
+            ), 0.0)
+        )
+        WHERE measurement_type IN ('wall_surface', 'wall_insulation')
+          AND framing_json IS NOT NULL
+          AND json_valid(framing_json)
+          AND json_extract(framing_json, '$.sourceOffsetM') IS NULL
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| format!("Failed to backfill wall surface Z datum: {e}"))?;
+
     // Per-drawing-page scale calibration (M3). One row per (drawing, page).
     sqlx::query(
         r#"

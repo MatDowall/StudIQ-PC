@@ -421,6 +421,32 @@ function computeWallBatts3D(
 
     // Start of the pocket on the centre line, then out to the middle of the wall's own depth —
     // the batt sits inside the frame, so it straddles the centre line rather than standing off it.
+    // A pocket only needs a wedge when a rake has left its top or bottom sloped. Square ones —
+    // the overwhelming majority, since only the top row of a raked wall is cut — go out as plain
+    // boxes so `Members` can batch them into instanced meshes. Emitting every batt as a wedge
+    // gives each one its own mesh and draw call, which is what stalled the 3D view on a page
+    // carrying a lot of insulation.
+    const sloped = Math.abs(yb1 - yb0) > 1e-9 || Math.abs(yt1 - yt0) > 1e-9;
+    if (!sloped) {
+      // Box members are centred on `position` in both the along and the vertical axis.
+      const centrePts = (pocket.x0 + pocket.x1) / 2 / mmPerPoint;
+      const centrePage = { x: a.x + dir.x * centrePts, y: a.y + dir.y * centrePts };
+      const [cx, cz] = pageToWorld(centrePage, S);
+      // `Members` keys its instanced batches on the size tuple stringified, so the float noise a
+      // pocket picks up round-tripping through world coordinates would give every identical bay
+      // its own batch of one — no batching at all. Quantise to the micrometre, far below anything
+      // visible, so bays that are the same size really do share a key.
+      const micron = (v: number) => Math.round(v * 1e6) / 1e6;
+      members.push({
+        kind: "generic",
+        position: [cx, opts.offsetM + (yb0 + yt0) / 2, cz],
+        size: [micron(width), micron(yt0 - yb0), micron(depthM)],
+        yaw,
+        pitch: 0,
+        color: opts.color,
+      });
+      continue;
+    }
     const startPage = { x: a.x + dir.x * (pocket.x0 / mmPerPoint), y: a.y + dir.y * (pocket.x0 / mmPerPoint) };
     const [originX, originZ] = pageToWorld(startPage, S);
     members.push({
