@@ -468,6 +468,34 @@ export interface FramingGeometry {
 }
 
 const GEOM_EPS = 1e-6;
+/** Two segments count as one straight run (for carrying a member's blocker across their join)
+ *  when their directions agree to within ~5 degrees. */
+const COLLINEAR_DOT = Math.cos((5 * Math.PI) / 180);
+
+/** Unit direction of each of a wall path's segments (`null` for a degenerate one). */
+function wallSegmentDirs(path: PagePoint[]): ({ x: number; y: number } | null)[] {
+  return path.slice(0, -1).map((p0, k) => {
+    const dx = path[k + 1].x - p0.x;
+    const dy = path[k + 1].y - p0.y;
+    const l = Math.hypot(dx, dy);
+    return l < GEOM_EPS ? null : { x: dx / l, y: dy / l };
+  });
+}
+
+/** The span of segments forming one straight run through `segmentIndex` — how far an opening set
+ *  out on that segment, or a member framed from it, can reach before a corner ends the run. */
+function collinearRun(dirs: ({ x: number; y: number } | null)[], segmentIndex: number): { first: number; last: number } {
+  const straight = (a: number, b: number) => {
+    const u = dirs[a];
+    const v = dirs[b];
+    return !!u && !!v && u.x * v.x + u.y * v.y >= COLLINEAR_DOT;
+  };
+  let first = segmentIndex;
+  let last = segmentIndex;
+  while (first > 0 && straight(first - 1, first)) first -= 1;
+  while (last < dirs.length - 1 && straight(last, last + 1)) last += 1;
+  return { first, last };
+}
 
 /** Removes near-duplicate arc-length positions (within `tolerancePts`) from a list of candidate
  *  stud centres. Anchor/gable-apex candidates and the regular grid are computed independently and
@@ -1015,6 +1043,104 @@ export interface WallMember {
   wedge?: { quad: [number, number][]; depthM: number };
 }
 
+/** The roofline machinery `wallMembers` sets out with: the stud layout, the per-segment rake
+ *  height, and the lowest underside-of-top-plate over any world point. Factored out so the
+ *  opening head cap below is literally the same computation the frame is built from — a surface
+ *  snapshot that re-derived it independently would drift from the lintel it is meant to match. */
+function wallRooflineContext(path: PagePoint[], settings: FramingSettings, mmPerPoint: number, framing?: WallFraming) {
+  const depthMm = framingDepthMm(settings.framingSize);
+  const topMakeup = STUD_THICKNESS_MM * topLayerCount(settings);
+  const rakes = framing?.rakes ?? [];
+  const openings = framing?.openings ?? [];
+  const depthPts = depthMm / mmPerPoint;
+  const studThkPts = STUD_THICKNESS_MM / mmPerPoint;
+  const spacingPts = Math.max(settings.studSpacingMm, 1) / mmPerPoint;
+  const gapPts = cornerGapMm(settings.framingSize) / mmPerPoint;
+  const halfDepthPts = depthPts / 2;
+  const layout = studLayout(path, depthPts, studThkPts, spacingPts, gapPts);
+
+  const heightAt = (segIndex: number, frac: number): number => {
+    const rake = rakes.find((r) => r.segmentIndex === segIndex);
+    if (!rake) return settings.wallHeightMm;
+    const f = Math.max(0, Math.min(1, frac));
+    if (rake.gable && rake.middleMm !== undefined) {
+      const segLenMm = (layout[segIndex]?.segLen ?? 0) * mmPerPoint;
+      const apexF = segLenMm > 0 ? Math.max(0, Math.min(1, rakeApexMm(rake, segLenMm) / segLenMm)) : 0.5;
+      return f <= apexF
+        ? rake.startMm + (rake.middleMm - rake.startMm) * (apexF > 0 ? f / apexF : 0)
+        : rake.middleMm + (rake.endMm - rake.middleMm) * (apexF < 1 ? (f - apexF) / (1 - apexF) : 0);
+    }
+    return rake.startMm + (rake.endMm - rake.startMm) * f;
+  };
+
+  /** The lowest underside-of-top-plate height (mm) of any segment whose footprint covers `p`. Falls
+   *  back to the plain wall height when no segment's footprint covers `p` at all — e.g. a wall
+   *  resized shorter than an opening still on it leaves the opening's king/trimmer positions
+   *  outside every segment's arc-length range. Returning `Infinity` there (the old behaviour) would
+   *  propagate into a member's `yT`, then into the dwang-row loop's upper bound below, running it
+   *  forever (a real crash: `for (h = ...; h <= maxTop; h += centresMm)` never terminates against
+   *  `Infinity`) — always returning a finite height keeps every downstream computation bounded. */
+  const ceilingMmAt = (p: PagePoint): number => {
+    let min = Infinity;
+    layout.forEach((segJ, j) => {
+      if (segJ.segLen <= 0) return;
+      const dx = p.x - segJ.a.x;
+      const dy = p.y - segJ.a.y;
+      const s = dx * segJ.dir.x + dy * segJ.dir.y;
+      const perp = -dx * segJ.dir.y + dy * segJ.dir.x;
+      if (Math.abs(perp) <= halfDepthPts + studThkPts && s >= -depthPts && s <= segJ.segLen + depthPts) {
+        const frac = Math.max(0, Math.min(1, s / segJ.segLen));
+        min = Math.min(min, heightAt(j, frac) - topMakeup);
+      }
+    });
+    return Number.isFinite(min) ? min : settings.wallHeightMm - topMakeup;
+  };
+
+  /** Underside-of-lintel height (mm above FFL) for one opening: its nominal daylight head, capped
+   *  to the lowest top plate above its king studs — this segment's own rake, or an adjacent
+   *  (possibly raked) segment's roofline at a shared corner — so the opening is trimmed rather
+   *  than poking through. */
+  const framedHeadMm = (o: Opening): number => {
+    const seg = layout[o.segmentIndex];
+    const nominal = headHeightMm(o);
+    if (!seg) return nominal;
+    const centrePts = o.centreMm / mmPerPoint;
+    const dwHalf = o.daylightWidthMm / mmPerPoint / 2;
+    const kings = openingJambs(centrePts, dwHalf, studThkPts).kings;
+    const limit = Math.min(...kings.map((k) => ceilingMmAt(pointAt(seg, k)))) - framingDepthMm(o.lintelSize);
+    return Math.min(nominal, limit);
+  };
+
+  return { layout, heightAt, ceilingMmAt, framedHeadMm, openings, rakes, depthMm, depthPts, studThkPts, spacingPts, gapPts, halfDepthPts, topMakeup };
+}
+
+/** Identifies an opening within its wall — the key `wallOpeningHeads` maps from. */
+export function openingKey(o: Pick<Opening, "segmentIndex" | "centreMm">): string {
+  return `${o.segmentIndex}:${o.centreMm}`;
+}
+
+/**
+ * The FRAMED head height (mm above FFL) of every opening on a wall, keyed by `openingKey` — the
+ * nominal daylight head capped to the underside of the lintel `wallMembers` actually places.
+ *
+ * A raking wall can pull that cap well below the door's nominal height, and the surface/insulation
+ * snapshot used to record the nominal head instead: the lining then punched a hole taller than the
+ * frame has, and the pocket sweep treated solid lintel as daylight, leaving a full-height gap in
+ * the batts above the opening.
+ */
+export function wallOpeningHeads(
+  path: PagePoint[],
+  settings: FramingSettings,
+  mmPerPoint: number | null,
+  framing?: WallFraming,
+): Map<string, number> {
+  const out = new Map<string, number>();
+  if (path.length < 2 || !mmPerPoint || !(mmPerPoint > 0)) return out;
+  const { framedHeadMm } = wallRooflineContext(path, settings, mmPerPoint, framing);
+  for (const o of framing?.openings ?? []) out.set(openingKey(o), framedHeadMm(o));
+  return out;
+}
+
 /**
  * The full member list for a wall — plates, studs, dwangs and (per opening) kings, trimmers, lintel,
  * jacks, sill + sill jacks, plus manual extra studs. Reuses the 2D set-out (`studLayout`,
@@ -1045,24 +1171,15 @@ export function wallMembers(
   const openings = framing?.openings ?? [];
   const extraStuds = framing?.extraStuds ?? [];
 
-  const depthPts = depthMm / mmPerPoint;
-  const studThkPts = STUD_THICKNESS_MM / mmPerPoint;
-  const spacingPts = Math.max(settings.studSpacingMm, 1) / mmPerPoint;
-  const gapPts = cornerGapMm(settings.framingSize) / mmPerPoint;
-  const layout = studLayout(path, depthPts, studThkPts, spacingPts, gapPts);
-  const heightAt = (segIndex: number, frac: number) => {
-    const rake = rakes.find((r) => r.segmentIndex === segIndex);
-    if (!rake) return settings.wallHeightMm;
-    const f = Math.max(0, Math.min(1, frac));
-    if (rake.gable && rake.middleMm !== undefined) {
-      const segLenMm = (layout[segIndex]?.segLen ?? 0) * mmPerPoint;
-      const apexF = segLenMm > 0 ? Math.max(0, Math.min(1, rakeApexMm(rake, segLenMm) / segLenMm)) : 0.5;
-      return f <= apexF
-        ? rake.startMm + (rake.middleMm - rake.startMm) * (apexF > 0 ? f / apexF : 0)
-        : rake.middleMm + (rake.endMm - rake.middleMm) * (apexF < 1 ? (f - apexF) / (1 - apexF) : 0);
-    }
-    return rake.startMm + (rake.endMm - rake.startMm) * f;
-  };
+  // Layout, rake heights and the roofline lookup are the shared context — `framedHeadMm` from it
+  // is the same cap the surface/insulation snapshot records, so a lining's hole and the lintel
+  // over it can't disagree.
+  const { layout, heightAt, ceilingMmAt, framedHeadMm, depthPts, studThkPts, halfDepthPts } = wallRooflineContext(
+    path,
+    settings,
+    mmPerPoint,
+    framing,
+  );
 
   // Corner-makeup anchors of one segment can sit at negative `s` (or beyond `segLen`), physically
   // overlapping the footprint of an ADJACENT segment. These two helpers test a world point against
@@ -1071,7 +1188,6 @@ export function wallMembers(
   // daylight-width check in `cut()` below, so re-testing it with this wider (+2 stud thicknesses,
   // to account for a corner anchor's own physical width) margin would over-cut studs that sit just
   // outside the door but not actually within it.
-  const halfDepthPts = depthPts / 2;
   const nearAnyOpening = (p: PagePoint, ownSegmentIndex: number): boolean => {
     for (let j = 0; j < layout.length; j += 1) {
       if (j === ownSegmentIndex) continue;
@@ -1085,29 +1201,6 @@ export function wallMembers(
     }
     return false;
   };
-  /** The lowest underside-of-top-plate height (mm) of any segment whose footprint covers `p`. Falls
-   *  back to the plain wall height when no segment's footprint covers `p` at all — e.g. a wall
-   *  resized shorter than an opening still on it leaves the opening's king/trimmer positions
-   *  outside every segment's arc-length range. Returning `Infinity` there (the old behaviour) would
-   *  propagate into a member's `yT`, then into the dwang-row loop's upper bound below, running it
-   *  forever (a real crash: `for (h = ...; h <= maxTop; h += centresMm)` never terminates against
-   *  `Infinity`) — always returning a finite height keeps every downstream computation bounded. */
-  const ceilingMmAt = (p: PagePoint): number => {
-    let min = Infinity;
-    layout.forEach((segJ, j) => {
-      if (segJ.segLen <= 0) return;
-      const dx = p.x - segJ.a.x;
-      const dy = p.y - segJ.a.y;
-      const s = dx * segJ.dir.x + dy * segJ.dir.y;
-      const perp = -dx * segJ.dir.y + dy * segJ.dir.x;
-      if (Math.abs(perp) <= halfDepthPts + studThkPts && s >= -depthPts && s <= segJ.segLen + depthPts) {
-        const frac = Math.max(0, Math.min(1, s / segJ.segLen));
-        min = Math.min(min, heightAt(j, frac) - topMakeup);
-      }
-    });
-    return Number.isFinite(min) ? min : settings.wallHeightMm - topMakeup;
-  };
-
   layout.forEach((seg, segIndex) => {
     const dir = seg.dir;
     const yaw = Math.atan2(dir.y, dir.x);
@@ -1292,11 +1385,11 @@ export function wallMembers(
       const isWindow = o.kind === "window";
       const sill = isWindow ? o.sillHeightMm ?? 0 : 0;
       const lintelDepth = framingDepthMm(o.lintelSize);
-      // Cap the head (and so the lintel/trimmers) to the underside of the lowest top plate above
-      // the king studs — whether that's this segment's own rake, or an adjacent (possibly raked)
-      // segment's roofline at a shared corner — so the opening is trimmed rather than poking through.
-      const rakeHeadLimit = Math.min(...jambs.kings.map((k) => ceilingMmAt(pointAt(seg, k)))) - lintelDepth;
-      const head = Math.min(sill + o.daylightHeightMm, rakeHeadLimit);
+      // Head (and so the lintel/trimmers) capped to the underside of the lowest top plate above the
+      // king studs — this segment's own rake, or an adjacent (possibly raked) segment's roofline at
+      // a shared corner — so the opening is trimmed rather than poking through. Shared with the
+      // surface snapshot via `wallRooflineContext`.
+      const head = framedHeadMm(o);
       return { o, centrePts, dwHalf, sill, head, jambs, lintelDepth, isWindow };
     });
 
@@ -2161,6 +2254,7 @@ export function buildWallSurfaceMeta(
   if (facePath.length < 2 || !mmPerPoint) return null;
 
   const rakes = framing?.rakes ?? [];
+  const dirs = wallSegmentDirs(path);
   const segments: WallSurfaceSegment[] = [];
   // Centre-line and face lengths differ at mitred corners; opening positions are set out along the
   // centre line, so each segment carries the ratio needed to move them onto the face.
@@ -2175,7 +2269,11 @@ export function buildWallSurfaceMeta(
   for (let i = 0; i < path.length - 1; i += 1) {
     const centreLenMm = Math.hypot(path[i + 1].x - path[i].x, path[i + 1].y - path[i].y) * mmPerPoint;
     if (centreLenMm < GEOM_EPS) {
+      // Still push a (degenerate) segment: `segments` is indexed by path segment everywhere
+      // downstream — faceRatios, opening.segmentIndex, pocket.segmentIndex — so skipping one here
+      // would silently shift every later segment's identity.
       faceRatios.push(1);
+      segments.push({ faceLengthMm: 0, faceStartMm: 0, frameStartMm: 0, frameLengthMm: 0, startHeightMm: settings.wallHeightMm, endHeightMm: settings.wallHeightMm });
       continue;
     }
     const fullFaceLengthMm = Math.hypot(facePath[i + 1].x - facePath[i].x, facePath[i + 1].y - facePath[i].y) * mmPerPoint;
@@ -2224,27 +2322,52 @@ export function buildWallSurfaceMeta(
   if (segments.length === 0 || segments.every((seg) => seg.faceLengthMm <= 1e-6)) return null;
 
   const openings: WallSurfaceOpening[] = [];
+  // Heads come from the frame, not the door schedule: a rake can pull the lintel below the door's
+  // nominal daylight height, and a snapshot recording the nominal head punches a hole taller than
+  // the wall actually has.
+  const framedHeads = wallOpeningHeads(path, settings, mmPerPoint, framing);
   for (const opening of framing?.openings ?? []) {
     if (opening.segmentIndex < 0 || opening.segmentIndex >= segments.length) continue;
-    const seg = segments[opening.segmentIndex];
     const sill = opening.kind === "window" ? opening.sillHeightMm ?? 0 : 0;
-    // An opening the run only partly covers is clipped to the part actually being measured.
+    const headMm = framedHeads.get(openingKey(opening)) ?? headHeightMm(opening);
+    // An opening is set out from its own segment's start, but nothing stops its daylight running
+    // past the end of that segment onto the next one — which is exactly what happens when a
+    // straight wall is split at a vertex so part of its run can rake, and the door then straddles
+    // the split. `wallMembers` already frames such an opening across the join, so the snapshot has
+    // to cut it the same way: on the wall's own arc-length, into one piece per segment it covers.
+    // Clipping it to its own segment (the old behaviour) silently dropped the overhang, leaving
+    // lining and batts standing in the doorway and the surviving piece shifted off the daylight.
     const half = opening.daylightWidthMm / 2;
-    const x0 = Math.max(opening.centreMm - half, seg.frameStartMm);
-    const x1 = Math.min(opening.centreMm + half, seg.frameStartMm + seg.frameLengthMm);
-    const widthMm = x1 - x0;
-    if (widthMm <= 1e-6) continue;
-    const frameCentreMm = (x0 + x1) / 2;
-    openings.push({
-      segmentIndex: opening.segmentIndex,
-      centreMm: frameCentreMm * (faceRatios[opening.segmentIndex] ?? 1),
-      // The frame (and so the pockets) is set out on the centre line, so an insulation measure
-      // needs the unscaled position; only a lining face-line set-out wants the mitred one.
-      frameCentreMm,
-      widthMm,
-      headMm: headHeightMm(opening),
-      sillMm: sill,
-    });
+    const startMm = cumulative[opening.segmentIndex] + opening.centreMm - half;
+    const endMm = startMm + opening.daylightWidthMm;
+    // ...but only along the straight run it belongs to. `wallMembers` extrapolates an overhanging
+    // jamb along its own segment's direction, straight past a corner rather than around it — so
+    // beyond a non-collinear join there is no door, and the daylight clips at the segment end the
+    // way it always did. Without this the hole wraps the corner into the return wall's lining
+    // while the jambs and lintel (which stop at the join) do not, and the two disagree.
+    const reach = collinearRun(dirs, opening.segmentIndex);
+    for (let i = reach.first; i <= reach.last; i += 1) {
+      const seg = segments[i];
+      if (!seg || seg.frameLengthMm <= 1e-6) continue;
+      // Intersect with the part of this segment the surface actually measures, so a partial run
+      // still clips the opening to the measured piece.
+      const lo = cumulative[i] + seg.frameStartMm;
+      const x0 = Math.max(startMm, lo);
+      const x1 = Math.min(endMm, lo + seg.frameLengthMm);
+      const widthMm = x1 - x0;
+      if (widthMm <= 1e-6) continue;
+      const frameCentreMm = (x0 + x1) / 2 - cumulative[i];
+      openings.push({
+        segmentIndex: i,
+        centreMm: frameCentreMm * (faceRatios[i] ?? 1),
+        // The frame (and so the pockets) is set out on the centre line, so an insulation measure
+        // needs the unscaled position; only a lining face-line set-out wants the mitred one.
+        frameCentreMm,
+        widthMm,
+        headMm,
+        sillMm: sill,
+      });
+    }
   }
 
   // Pockets are snapshotted unconditionally, not just for insulation groups: switching a group
@@ -2362,9 +2485,17 @@ export function wallInsulationPockets(
   if (path.length < 2 || !mmPerPoint || !(mmPerPoint > 0)) return [];
   const S = mmPerPoint / 1000;
   const members = wallMembers(path, settings, mmPerPoint, framing);
+  const framedHeads = wallOpeningHeads(path, settings, mmPerPoint, framing);
   const rakes = framing?.rakes ?? [];
   const openings = framing?.openings ?? [];
+  // Openings are set out from their own segment but framed across a join, so the sweep places each
+  // daylight on the wall's own arc-length and reads it back into whichever segments it covers.
+  const cumulative = wallPathArcLengths(path, mmPerPoint);
   const pockets: WallPocket[] = [];
+  // Footprint band a member has to stand in to block a segment's cavity — the same test
+  // `ceilingMmAt` uses to decide which segment's roofline covers a point.
+  const bandPts = framingDepthMm(settings.framingSize) / mmPerPoint / 2 + STUD_THICKNESS_MM / mmPerPoint;
+  const unitDirs = wallSegmentDirs(path);
 
   for (let i = 0; i < path.length - 1; i += 1) {
     const a = path[i];
@@ -2386,7 +2517,20 @@ export function wallInsulationPockets(
 
     const blockers: PocketBlocker[] = [];
     for (const m of members) {
-      if (m.segmentIndex !== i) continue;
+      if (m.segmentIndex !== i) {
+        // A member set out from another segment can physically stand on this one: an opening near
+        // a segment end puts its kings, trimmers and lintel past the join, and splitting a straight
+        // wall so part of its run can rake is exactly that shape. Take such a member as a blocker
+        // here when it really is on this segment's line — running the same way (so its wedge's
+        // local along-axis is still this segment's) and inside the wall's footprint. A member on a
+        // segment that turns a corner fails the direction test and is left alone, so corner
+        // cavities keep the approximate treatment they already had.
+        const own = unitDirs[m.segmentIndex];
+        if (!own || own.x * dir.x + own.y * dir.y < COLLINEAR_DOT) continue;
+        const px = m.position[0] / S;
+        const py = -m.position[2] / S;
+        if (Math.abs(-(px - a.x) * dir.y + (py - a.y) * dir.x) > bandPts) continue;
+      }
       const s = alongMm(m.position);
       const wedge = m.wedge;
       if (wedge) {
@@ -2414,20 +2558,20 @@ export function wallInsulationPockets(
       }
     }
 
-    // A daylight opening is a hole, not a pocket — there is nothing to insulate in a doorway.
+    // A daylight opening is a hole, not a pocket — there is nothing to insulate in a doorway. The
+    // hole stops at the lintel the frame actually carries (`framedHeads`), so a rake-trimmed
+    // opening leaves the band between its lowered head and the roofline as real pockets instead of
+    // swallowing solid lintel as daylight.
     for (const opening of openings) {
-      if (opening.segmentIndex !== i) continue;
+      const base = cumulative[opening.segmentIndex];
+      if (base === undefined) continue;
       const sill = opening.kind === "window" ? opening.sillHeightMm ?? 0 : 0;
-      const head = headHeightMm(opening);
+      const head = framedHeads.get(openingKey(opening)) ?? headHeightMm(opening);
       const half = opening.daylightWidthMm / 2;
-      blockers.push({
-        x0: opening.centreMm - half,
-        x1: opening.centreMm + half,
-        yb0: sill,
-        yb1: sill,
-        yt0: head,
-        yt1: head,
-      });
+      const x0 = base + opening.centreMm - half - cumulative[i];
+      const x1 = x0 + opening.daylightWidthMm;
+      if (x1 <= GEOM_EPS || x0 >= segLenMm - GEOM_EPS) continue;
+      blockers.push({ x0, x1, yb0: sill, yb1: sill, yt0: head, yt1: head });
     }
 
     const rake = rakes.find((r) => r.segmentIndex === i);

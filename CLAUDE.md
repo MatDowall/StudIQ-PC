@@ -248,7 +248,19 @@ every surface taken off it via the usual drift check.
 
 **Raking frames are respected**: a plain rake contributes its mean height over the segment, a gable
 is two runs meeting at the apex (`apexFrac`), which is why a segment carries a height profile rather
-than a single wall height.
+than a single wall height. An opening's snapshotted `headMm` is the **framed** head, not the door
+schedule's nominal one: `wallMembers` caps a lintel to the underside of the lowest top plate over
+the opening's king studs, and under a rake that cap can sit well below the nominal daylight height.
+`wallRooflineContext` (framing.ts) owns that computation and `wallOpeningHeads` exposes it, so the
+frame, the snapshot and the pocket sweep all read one head; and an opening is cut on the WALL's
+arc-length, into one piece per segment it covers, rather than clipped to the segment it is set out
+from — but only along its own **straight run** (`collinearRun`), since `wallMembers` extrapolates an
+overhanging jamb along its own segment's direction, straight past a corner rather than around it. Both matter for the same shape — a straight wall split at a vertex so part of its run can
+rake, with a door straddling the split. `segments` is index-aligned with the path's segments (a
+degenerate one is pushed, not skipped) because openings, pockets and face ratios are all keyed by
+that index — a snapshot deriving it independently
+punched a lining hole taller than the wall had and fed the sweep an inverted pocket, which dropped
+the batts above the opening entirely.
 
 **Openings are deducted by default.** The group-wide default lives in the group's
 `framing_props_json` (`WallSurfaceSettings.deductOpenings`, edited in the properties dialog); each
@@ -300,7 +312,13 @@ disagree. `wallSurfaceMeasureM2` is the single place the types diverge.
 The pocket sweep works per wall segment in its along/height plane: every member is projected to a
 blocker with *linear* top and bottom edges (which covers plain rectangles and rake-cut wedges
 alike), the segment is split at every blocker edge so the covering set is constant within a slab,
-and each gap up the slab becomes a pocket capped by the roofline.
+and each gap up the slab becomes a pocket capped by the roofline. A member set out from a
+*neighbouring* segment counts too, but only across a **collinear** join (`COLLINEAR_DOT`, ~5°) and
+within the wall's footprint band: an opening near a segment end puts its kings, trimmers and lintel
+past the join, and a straight wall split so part of its run can rake is exactly that shape — without
+this the batts are drawn straight through them. A segment that turns a corner fails the direction
+test (its wedge's local along-axis is not this segment's either), so corner cavities keep the
+approximate treatment described above.
 
 Daylight openings are injected into the sweep as blockers, so `meta.pockets` is always the
 openings-deducted set. **Deduct Openings stays the estimator's choice in insulation mode too**: with

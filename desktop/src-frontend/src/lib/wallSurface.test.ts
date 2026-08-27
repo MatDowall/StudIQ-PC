@@ -219,6 +219,195 @@ describe("wall surface 3D", () => {
   });
 });
 
+describe("openings trimmed by a rake", () => {
+  // The reported edge case: a "gable" whose apex and end are at the same height, so the wall rakes
+  // up over the first third of its run and is flat thereafter. A 6 m wall, apex at 2 m.
+  const rakeThenFlat: PagePoint[] = [
+    { x: 0, y: 0 },
+    { x: 600, y: 0 },
+  ];
+  const raked = settings({ wallHeightMm: 2400 });
+  const framing = (centreMm: number): WallFraming => ({
+    openings: [{ kind: "door", segmentIndex: 0, centreMm, daylightHeightMm: 2100, daylightWidthMm: 910, lintelSize: "190x45", lintelPly: 2 }],
+    rakes: [{ segmentIndex: 0, startMm: 1200, endMm: 2400, gable: true, middleMm: 2400, middlePositionMm: 2000 }],
+    extraStuds: [],
+  });
+
+  it("snapshots the head the frame actually carries, not the nominal daylight height", () => {
+    // Under the rake the lintel is pushed down to the underside of the top plate over the LOWER
+    // king (at 945 mm: roofline 1767, less the 190 lintel and the 45 plate makeup) — well below
+    // the door's nominal 2100 head.
+    const under = buildWallSurfaceMeta(1, 2, rakeThenFlat, raked, MMPP, framing(1400), "left", true, 0)!;
+    expect(under.openings[0].headMm).toBeCloseTo(1491.5, 6);
+    // Clear of the rake, the nominal head stands.
+    const clear = buildWallSurfaceMeta(1, 2, rakeThenFlat, raked, MMPP, framing(4000), "left", true, 0)!;
+    expect(clear.openings[0].headMm).toBeCloseTo(2100, 6);
+  });
+
+  it("leaves the band between a trimmed head and the roofline as insulation pockets", () => {
+    const pockets = wallInsulationPockets(rakeThenFlat, raked, MMPP, framing(1400));
+    // Nothing may start at the nominal head — the space between the lintel top (1681.5) and the
+    // roofline is solid frame to be insulated, not daylight.
+    expect(pockets.some((p) => Math.abs(p.yb0 - 2100) < 1e-6)).toBe(false);
+    const overDoor = pockets.filter((p) => p.x0 >= 945 - 1e-6 && p.x1 <= 1855 + 1e-6);
+    expect(overDoor.length).toBeGreaterThan(0);
+    for (const pocket of overDoor) {
+      expect(pocket.yb0).toBeCloseTo(1681.5, 6);
+      // A pocket is never inverted: the sweep must not put a floor above its own roofline.
+      expect(pocket.yt0).toBeGreaterThan(pocket.yb0);
+      expect(pocket.yt1).toBeGreaterThan(pocket.yb1);
+    }
+  });
+
+  it("stops the lining hole at the trimmed head", () => {
+    const meta = buildWallSurfaceMeta(1, 2, rakeThenFlat, raked, MMPP, framing(1400), "left", true, 0)!;
+    const panels = computeWallSurface3D(rakeThenFlat, MMPP, meta, { offsetM: 0, color: "#fff", deductOpenings: true });
+    // The spandrel over the door survives (it would collapse to nothing at a 2100 head, leaving a
+    // full-height hole in the lining) and its underside sits on the lintel, not at 2100.
+    const spandrel = panels.find((m) => m.wedge!.quad[0][1] > 1e-6)!;
+    expect(spandrel.wedge!.quad[0][1]).toBeCloseTo(1.4915, 6);
+    expect(spandrel.wedge!.quad[3][1]).toBeGreaterThan(spandrel.wedge!.quad[0][1]);
+  });
+});
+
+describe("openings straddling a segment join", () => {
+  // How a wall is made to rake over part of its run: one straight line split at a vertex, the
+  // first stretch raked and the rest flat. A door set out near the start of the flat stretch runs
+  // back past the split — `wallMembers` frames it across the join, so the surface must cut it
+  // across the join too. 1 pt = 10 mm, so this is 3 m of rake then 3 m flat.
+  const split: PagePoint[] = [
+    { x: 0, y: 0 },
+    { x: 300, y: 0 },
+    { x: 600, y: 0 },
+  ];
+  const raked = settings({ wallHeightMm: 2400 });
+  // Daylight 1700 wide centred 600 along segment 1 -> it overhangs 250 mm back onto segment 0.
+  const straddling: WallFraming = {
+    openings: [{ kind: "door", segmentIndex: 1, centreMm: 600, daylightHeightMm: 2100, daylightWidthMm: 1700, lintelSize: "140x45", lintelPly: 2 }],
+    rakes: [{ segmentIndex: 0, startMm: 1300, endMm: 2400 }],
+    extraStuds: [],
+  };
+
+  it("cuts the daylight across both segments instead of clipping it to its own", () => {
+    const meta = buildWallSurfaceMeta(1, 2, split, raked, MMPP, straddling, "left", true, 0)!;
+    expect(meta.openings.map((o) => o.segmentIndex)).toEqual([0, 1]);
+    expect(meta.openings[0].widthMm).toBeCloseTo(250, 6);
+    expect(meta.openings[1].widthMm).toBeCloseTo(1450, 6);
+    // The whole door is accounted for, and the piece on its own segment keeps its true set-out
+    // rather than being re-centred on what survived the clip.
+    expect(meta.openings.reduce((a, o) => a + o.widthMm, 0)).toBeCloseTo(1700, 6);
+    expect(meta.openings[1].frameCentreMm).toBeCloseTo(725, 6);
+    // One lintel spans the join, so both pieces carry the same head.
+    expect(meta.openings[0].headMm).toBeCloseTo(meta.openings[1].headMm, 9);
+  });
+
+  it("punches the lining on both sides of the join", () => {
+    const meta = buildWallSurfaceMeta(1, 2, split, raked, MMPP, straddling, "left", true, 0)!;
+    const panels = computeWallSurface3D(split, MMPP, meta, { offsetM: 0, color: "#fff", deductOpenings: true });
+    // Segment 0 previously ran solid over the doorway. Anything of it still covering the last
+    // 250 mm before the join must now start at the head — only the spandrel survives there.
+    const headM = meta.openings[0].headMm / 1000;
+    const overDoorway = panels.filter((m) => m.position[0] + m.size[0] > 2.75 + 1e-6 && m.position[0] < 3 - 1e-6);
+    expect(overDoorway.length).toBeGreaterThan(0);
+    for (const panel of overDoorway) {
+      expect(Math.min(panel.wedge!.quad[0][1], panel.wedge!.quad[1][1])).toBeCloseTo(headM, 6);
+    }
+  });
+
+  it("blocks the batts with the jambs and lintel that stand past the join", () => {
+    // The opening's kings, trimmers and lintel are set out from segment 1 but physically stand on
+    // segment 0. They have to block segment 0's cavity, or a batt is drawn straight through them.
+    const pockets = wallInsulationPockets(split, raked, MMPP, straddling);
+    const meta = buildWallSurfaceMeta(1, 2, split, raked, MMPP, straddling, "left", true, 0)!;
+    const lintelTopMm = meta.openings[0].headMm + 140;
+    // The king sits at 2660, so from there on nothing may run below the lintel: the jamb studs and
+    // the lintel itself fill that stretch, and a pocket through them draws a batt inside timber.
+    const past = pockets.filter((p) => p.segmentIndex === 0 && p.x1 > 2660 + 1e-6);
+    expect(past.length).toBeGreaterThan(0);
+    for (const p of past) expect(Math.min(p.yb0, p.yb1)).toBeGreaterThanOrEqual(lintelTopMm - 1e-6);
+    // The bay before the king is untouched and still runs off the bottom plate.
+    expect(pockets.some((p) => p.segmentIndex === 0 && p.x1 <= 2660 + 1e-6 && p.yb0 < 100)).toBe(true);
+  });
+
+  it("carries the cut along a whole straight run, however many segments", () => {
+    // Nothing about this is two-segment-specific: a wide opening reaches as far as the run does.
+    const threeSeg: PagePoint[] = [
+      { x: 0, y: 0 },
+      { x: 100, y: 0 },
+      { x: 160, y: 0 },
+      { x: 500, y: 0 },
+    ];
+    const wide: WallFraming = {
+      openings: [{ kind: "door", segmentIndex: 1, centreMm: 300, daylightHeightMm: 2100, daylightWidthMm: 2400, lintelSize: "140x45", lintelPly: 2 }],
+      rakes: [],
+      extraStuds: [],
+    };
+    const meta = buildWallSurfaceMeta(1, 2, threeSeg, raked, MMPP, wide, "left", true, 0)!;
+    expect(meta.openings.map((o) => o.segmentIndex)).toEqual([0, 1, 2]);
+    expect(meta.openings.reduce((a, o) => a + o.widthMm, 0)).toBeCloseTo(2400, 6);
+  });
+
+  it("works the other way round, and for a window's sill", () => {
+    // An opening set out on an EARLIER segment running past its end is the same problem mirrored.
+    const forward: WallFraming = {
+      openings: [{ kind: "window", segmentIndex: 0, centreMm: 2700, daylightHeightMm: 1200, daylightWidthMm: 1800, sillHeightMm: 900, lintelSize: "140x45", lintelPly: 2 }],
+      rakes: [],
+      extraStuds: [],
+    };
+    const meta = buildWallSurfaceMeta(1, 2, split, raked, MMPP, forward, "left", true, 0)!;
+    expect(meta.openings.map((o) => o.segmentIndex)).toEqual([0, 1]);
+    expect(meta.openings.reduce((a, o) => a + o.widthMm, 0)).toBeCloseTo(1800, 6);
+    for (const o of meta.openings) expect(o.sillMm).toBeCloseTo(900, 6);
+  });
+
+  it("stops the cut at a corner, where the frame puts no door either", () => {
+    // `wallMembers` extrapolates an overhanging jamb along its own segment's direction, straight
+    // past a corner rather than around it. So the daylight must clip at the join, or the hole
+    // wraps into the return wall's lining while the jambs and lintel do not follow it there.
+    const corner: PagePoint[] = [
+      { x: 0, y: 0 },
+      { x: 300, y: 0 },
+      { x: 300, y: 300 },
+    ];
+    const overhang: WallFraming = {
+      openings: [{ kind: "door", segmentIndex: 1, centreMm: 600, daylightHeightMm: 2100, daylightWidthMm: 1700, lintelSize: "140x45", lintelPly: 2 }],
+      rakes: [],
+      extraStuds: [],
+    };
+    const meta = buildWallSurfaceMeta(1, 2, corner, raked, MMPP, overhang, "left", true, 0)!;
+    expect(meta.openings.map((o) => o.segmentIndex)).toEqual([1]);
+    expect(meta.openings[0].widthMm).toBeCloseTo(1450, 6);
+  });
+
+  it("leaves a corner's cavities alone", () => {
+    // The cross-join rule is for one straight run split at a vertex. A segment that turns a corner
+    // must not start blocking its neighbour's bays, or every corner in the job changes quantity.
+    const corner: PagePoint[] = [
+      { x: 0, y: 0 },
+      { x: 300, y: 0 },
+      { x: 300, y: 300 },
+    ];
+    const plainWall = settings({ wallHeightMm: 2400, studSpacingMm: 600, dwangsOn: false });
+    const first = wallInsulationPockets(corner, plainWall, MMPP, undefined).filter((p) => p.segmentIndex === 0);
+    expect(first.length).toBeGreaterThan(0);
+    // Every bay still runs plate to plate; the return wall's studs cross this segment's line but
+    // must not be taken as blockers on it.
+    for (const p of first) {
+      expect(p.yb0).toBeCloseTo(45, 6);
+      expect(p.yt0).toBeCloseTo(2355, 6);
+    }
+  });
+
+  it("stops the batts at the true edge of the doorway", () => {
+    const pockets = wallInsulationPockets(split, raked, MMPP, straddling);
+    // Nothing on the raked segment may sit inside the overhang (2750 mm along it) below the head.
+    const inDoorway = pockets.filter(
+      (p) => p.segmentIndex === 0 && p.x1 > 2750 + 1e-6 && p.yb0 < 1700,
+    );
+    expect(inDoorway).toEqual([]);
+  });
+});
+
 describe("insulation pockets", () => {
   // A plain 3 m x 2.4 m wall, single top and bottom plate, no dwangs. Its stud set-out is flush
   // end studs at 22.5 and 2977.5 with 600 centres between, so the pockets are hand-checkable.
