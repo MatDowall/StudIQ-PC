@@ -94,6 +94,7 @@ export interface MultiPage3DGroupEntry {
   defaultWidthM: number;
   defaultHeightM: number;
   pitchAngleDeg: number;
+  pitchDirectionDeg: number;
   countType: string;
   posColour: string;
   negColour: string;
@@ -1006,6 +1007,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
           defaultWidthM: props.default_width ?? 0,
           defaultHeightM: props.default_height ?? 0,
           pitchAngleDeg: props.pitch_angle_deg ?? 0,
+          pitchDirectionDeg: props.pitch_direction_deg ?? 0,
           countType: props.count_type,
           posColour: props.pos_colour,
           negColour: props.neg_colour,
@@ -1027,6 +1029,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
       defaultWidthM,
       defaultHeightM,
       pitchAngleDeg,
+      pitchDirectionDeg,
       countType,
       posColour,
       negColour,
@@ -1050,6 +1053,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
           defaultWidthM,
           defaultHeightM,
           pitchAngleDeg,
+          pitchDirectionDeg,
           countType,
           posColour,
           negColour,

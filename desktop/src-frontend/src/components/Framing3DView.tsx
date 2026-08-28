@@ -50,28 +50,38 @@ function WedgeMesh({ mem }: { mem: Member3D }) {
 /** Builds a polygon footprint (world X/Z, `points`) extruded up from `baseY` by `heightM` — the
  *  top/bottom caps are triangulated with `THREE.ShapeUtils` (simple, non-self-intersecting
  *  polygons only, which is all a takeoff area measurement ever is) and the side walls are one
- *  quad per edge. */
-function extrudedPolygonGeometry(points: [number, number][], baseY: number, heightM: number): THREE.BufferGeometry {
+ *  quad per edge. `rises` lifts each vertex individually so a pitched area comes out as a tilted
+ *  slab of constant vertical thickness, its plan footprint unchanged. */
+function extrudedPolygonGeometry(
+  points: [number, number][],
+  rises: number[],
+  baseY: number,
+  heightM: number,
+): THREE.BufferGeometry {
   const shapePts = points.map(([x, z]) => new THREE.Vector2(x, z));
   const triangles = THREE.ShapeUtils.triangulateShape(shapePts, []);
+  const yAt = (idx: number) => baseY + (rises[idx] ?? 0);
   const positions: number[] = [];
-  const pushTri = (ia: number, ib: number, ic: number, y: number, flip: boolean) => {
+  const pushTri = (ia: number, ib: number, ic: number, lift: number, flip: boolean) => {
     const seq = flip ? [ic, ib, ia] : [ia, ib, ic];
     for (const idx of seq) {
       const [x, z] = points[idx];
-      positions.push(x, y, z);
+      positions.push(x, yAt(idx) + lift, z);
     }
   };
   for (const [ia, ib, ic] of triangles) {
-    pushTri(ia, ib, ic, baseY + heightM, false);
-    pushTri(ia, ib, ic, baseY, true);
+    pushTri(ia, ib, ic, heightM, false);
+    pushTri(ia, ib, ic, 0, true);
   }
   const n = points.length;
   for (let i = 0; i < n; i += 1) {
+    const j = (i + 1) % n;
     const [x1, z1] = points[i];
-    const [x2, z2] = points[(i + 1) % n];
-    positions.push(x1, baseY, z1, x2, baseY, z2, x2, baseY + heightM, z2);
-    positions.push(x1, baseY, z1, x2, baseY + heightM, z2, x1, baseY + heightM, z1);
+    const [x2, z2] = points[j];
+    const y1 = yAt(i);
+    const y2 = yAt(j);
+    positions.push(x1, y1, z1, x2, y2, z2, x2, y2 + heightM, z2);
+    positions.push(x1, y1, z1, x2, y2 + heightM, z2, x1, y1 + heightM, z1);
   }
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(positions), 3));
@@ -81,7 +91,7 @@ function extrudedPolygonGeometry(points: [number, number][], baseY: number, heig
 
 function AreaMeshItem({ area }: { area: AreaMesh3D }) {
   const geometry = useMemo(
-    () => extrudedPolygonGeometry(area.points, area.baseY, area.heightM),
+    () => extrudedPolygonGeometry(area.points, area.rises, area.baseY, area.heightM),
     [area],
   );
   return (
@@ -302,10 +312,11 @@ export function Framing3DView({ members, areas, pageWidthM, pageHeightM, preview
         box.expandByPoint(v.set(mem.position[0] + h, mem.position[1] + h + page.offsetM, mem.position[2] + h));
       }
       for (const area of page.areas ?? []) {
-        for (const [x, z] of area.points) {
-          box.expandByPoint(v.set(x, area.baseY + page.offsetM, z));
-          box.expandByPoint(v.set(x, area.baseY + area.heightM + page.offsetM, z));
-        }
+        area.points.forEach(([x, z], i) => {
+          const y = area.baseY + (area.rises[i] ?? 0) + page.offsetM;
+          box.expandByPoint(v.set(x, y, z));
+          box.expandByPoint(v.set(x, y + area.heightM, z));
+        });
       }
     }
     if (box.isEmpty()) box.set(new THREE.Vector3(-1, 0, -1), new THREE.Vector3(1, 2, 1));

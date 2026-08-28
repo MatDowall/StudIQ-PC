@@ -5,7 +5,7 @@ import { theme } from "../theme";
 import { DocumentMeta, ViewerCanvas } from "./ViewerCanvas";
 import { Framing3DView, type Framing3DPage } from "./Framing3DView";
 import { parseFramingSettings, parseJoistRafterSettings, parseWallFraming } from "../lib/framing";
-import { isWallInsulationType, isWallSurfaceType, parseArrayMeta, parseWallSurfaceMeta, wallSurfaceDeducts } from "../lib/quantity";
+import { isWallInsulationType, isWallSurfaceType, parseArrayMeta, parseWallSurfaceMeta, resolvePitch, wallSurfaceDeducts } from "../lib/quantity";
 import {
   computeAreaMesh3D,
   computeArrayMembers3D,
@@ -89,7 +89,15 @@ export function Viewer() {
         });
         if (marker) members.push(marker);
       } else if (mz.measurement_type === "area") {
-        const mesh = computeAreaMesh3D(pts, mmpp, { heightM: props?.default_height ?? 0, offsetM, color });
+        const pitch = resolvePitch(mz.framing_json, props?.pitch_angle_deg, props?.pitch_direction_deg);
+        const mesh = computeAreaMesh3D(pts, mmpp, {
+          heightM: props?.default_height ?? 0,
+          offsetM,
+          color,
+          pitchAngleDeg: pitch.angleDeg,
+          pitchDirectionDeg: pitch.directionDeg,
+          pitchOrigin: pitch.origin,
+        });
         if (mesh) areas.push(mesh);
       } else if (mz.measurement_type === "array") {
         if (pts.length < 2) continue;
@@ -164,7 +172,15 @@ export function Viewer() {
               });
               if (marker) members.push(marker);
             } else if (g.measurementType === "area") {
-              const mesh = computeAreaMesh3D(pts, p.mmPerPoint, { heightM: g.defaultHeightM, offsetM: g.defaultOffsetM, color });
+              const pitch = resolvePitch(mz.framing_json, g.pitchAngleDeg, g.pitchDirectionDeg);
+              const mesh = computeAreaMesh3D(pts, p.mmPerPoint, {
+                heightM: g.defaultHeightM,
+                offsetM: g.defaultOffsetM,
+                color,
+                pitchAngleDeg: pitch.angleDeg,
+                pitchDirectionDeg: pitch.directionDeg,
+                pitchOrigin: pitch.origin,
+              });
               if (mesh) areas.push(mesh);
             } else if (g.measurementType === "array") {
               if (pts.length < 2) continue;

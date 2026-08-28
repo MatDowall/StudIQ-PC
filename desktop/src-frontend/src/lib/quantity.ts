@@ -120,6 +120,135 @@ export function pitchedPolygonPerimeterPts(points: PagePoint[], pitchRad: number
   return pitchedPolylineLengthPts(points, pitchRad, dirRad) + closing;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Per-measurement pitch axis
+//
+// A group's `pitch_angle_deg`/`pitch_direction_deg` describe one mono-pitch for every measurement
+// in it, hinged nowhere in particular. That is not enough for a roof: two planes of the same
+// group fall different ways, and which way a plane tips only reads correctly in 3D once you say
+// what it pivots ABOUT. So a measurement may carry its own `PitchAxis`, which supersedes the
+// group's angle and direction and adds the pivot the group props have no room for.
+//
+// It rides in the measurement's `framing_json` under the `pitch` key rather than in a column of
+// its own: that blob is already the frontend-owned per-measurement extras bag (wall framing,
+// array meta, wall-surface snapshots), every command and copy/paste/export path carries it
+// unchanged, and `deriveQuantity` is already handed it at every call site — so the override
+// reaches the quantities with no plumbing and no migration. `withPitchAxis` merges rather than
+// replaces, so an array's meta and its axis can coexist in the one blob.
+// ---------------------------------------------------------------------------------------------
+
+/** One measurement's own pitch plane. */
+export interface PitchAxis {
+  /** Slope from horizontal, degrees. Signed: the surface rises along `directionDeg` when
+   *  positive and falls along it when negative, so a plane can be tipped either way about the
+   *  same pivot without spinning the direction 180°. */
+  angleDeg: number;
+  /** The uphill direction — the compass bearing the surface RISES towards — in degrees CCW from
+   *  page +X, in the same Y-up page space as `geometry_json`. Accepts anything in [-360, 360];
+   *  the group's `pitch_direction_deg` (0 = along X, 90 = along Y) is the same convention, so a
+   *  group default reads straight across into it. */
+  directionDeg: number;
+  /** The pivot, in PDF points: the plane passes through this point at the group's Z datum, and
+   *  the surface rises on its uphill side and drops below the datum on the other. Picked on the
+   *  measure itself — a vertex, or an edge midpoint when hinging on an edge. */
+  originX: number;
+  originY: number;
+}
+
+/** Clamp to a sane, storable axis. Angle is capped just short of vertical (tan blows up at 90°);
+ *  direction is left anywhere in [-360, 360] since that is the range the estimator types into. */
+export function normalizePitchAxis(axis: PitchAxis): PitchAxis {
+  const angle = Number.isFinite(axis.angleDeg) ? Math.max(-89.9, Math.min(89.9, axis.angleDeg)) : 0;
+  const dir = Number.isFinite(axis.directionDeg) ? Math.max(-360, Math.min(360, axis.directionDeg)) : 0;
+  return {
+    angleDeg: angle,
+    directionDeg: dir,
+    originX: Number.isFinite(axis.originX) ? axis.originX : 0,
+    originY: Number.isFinite(axis.originY) ? axis.originY : 0,
+  };
+}
+
+/** Reads a measurement's own pitch axis out of its `framing_json`; null when it has none (which
+ *  is the normal case — the measure then follows its group's pitch). */
+export function parsePitchAxis(framingJson: string | null | undefined): PitchAxis | null {
+  if (!framingJson) return null;
+  try {
+    const raw = JSON.parse(framingJson);
+    const pitch = raw && typeof raw === "object" ? (raw as Record<string, unknown>).pitch : null;
+    if (!pitch || typeof pitch !== "object") return null;
+    const p = pitch as Record<string, unknown>;
+    if (typeof p.originX !== "number" || typeof p.originY !== "number") return null;
+    return normalizePitchAxis({
+      angleDeg: typeof p.angleDeg === "number" ? p.angleDeg : 0,
+      directionDeg: typeof p.directionDeg === "number" ? p.directionDeg : 0,
+      originX: p.originX,
+      originY: p.originY,
+    });
+  } catch {
+    return null;
+  }
+}
+
+/** Writes (or with `null`, removes) the pitch axis in a measurement's `framing_json`, preserving
+ *  whatever else that blob holds. Returns null when the result would be an empty object, so a
+ *  measure that never had framing extras goes back to a null column. */
+export function withPitchAxis(framingJson: string | null | undefined, axis: PitchAxis | null): string | null {
+  let base: Record<string, unknown> = {};
+  if (framingJson) {
+    try {
+      const raw = JSON.parse(framingJson);
+      if (raw && typeof raw === "object" && !Array.isArray(raw)) base = raw as Record<string, unknown>;
+    } catch {
+      base = {};
+    }
+  }
+  if (axis) base.pitch = normalizePitchAxis(axis);
+  else delete base.pitch;
+  return Object.keys(base).length > 0 ? JSON.stringify(base) : null;
+}
+
+/**
+ * Carries a measurement's pitch axis through a transform of its geometry. The pivot is an
+ * ABSOLUTE page point, so — unlike an array's trims, which are stored relative to `points[0]` and
+ * follow the geometry for free — it does NOT move with the shape on its own. Left behind, it turns
+ * a translation into height: a plane pitched 45° that is moved 3 m from its pivot now floats 3 m
+ * up, which swamps whatever Z offset its group is set to.
+ *
+ * **Anything that moves, copies, flips or rotates a measurement must put its geometry through
+ * this.** `mapPoint` moves the pivot the same way the vertices moved; `mapDirectionDeg` turns the
+ * uphill bearing (identity for a translation, `180 - d` for an x-mirror, `-d` for a y-mirror,
+ * `d ± 90` for a quarter turn). The result is wrapped into (-180, 180] so repeated transforms
+ * can't walk the stored direction out of range — half turns settle on +180 rather than -180,
+ * which is the same bearing but the one an estimator expects to read. A measurement with no axis
+ * passes through untouched.
+ */
+export function transformPitchAxisJson(
+  framingJson: string | null | undefined,
+  mapPoint: (p: PagePoint) => PagePoint,
+  mapDirectionDeg: (deg: number) => number = (deg) => deg,
+): string | null {
+  const axis = parsePitchAxis(framingJson);
+  if (!axis) return framingJson ?? null;
+  const origin = mapPoint({ x: axis.originX, y: axis.originY });
+  const raw = mapDirectionDeg(axis.directionDeg);
+  const halfOpen = ((((raw + 180) % 360) + 360) % 360) - 180;
+  const wrapped = halfOpen === -180 ? 180 : halfOpen;
+  return withPitchAxis(framingJson, { ...axis, originX: origin.x, originY: origin.y, directionDeg: wrapped });
+}
+
+/** The pitch a measurement actually renders and derives at: its own axis when it has one, else
+ *  the group's angle/direction with no pivot (which hinges on the shape's own low edge). The one
+ *  place the override rule lives, so quantities, the 2D indicator and the 3D mesh can't drift. */
+export function resolvePitch(
+  framingJson: string | null | undefined,
+  groupAngleDeg: number | null | undefined,
+  groupDirectionDeg: number | null | undefined,
+): { angleDeg: number; directionDeg: number; origin: PagePoint | null } {
+  const axis = parsePitchAxis(framingJson);
+  if (axis) return { angleDeg: axis.angleDeg, directionDeg: axis.directionDeg, origin: { x: axis.originX, y: axis.originY } };
+  return { angleDeg: groupAngleDeg ?? 0, directionDeg: groupDirectionDeg ?? 0, origin: null };
+}
+
 /** Parsed array metadata from framing_json for an array-type measurement. */
 export interface ArrayMeta {
   extraMembers: number;
@@ -366,8 +495,12 @@ export function deriveQuantity(points: PagePoint[], mmPerPoint: number | null, p
   const h = props.default_height;
   const isAreaMeasure = props.measurement_type === "area";
 
-  const pitchRad = ((props.pitch_angle_deg ?? 0) * Math.PI) / 180;
-  const dirRad = ((props.pitch_direction_deg ?? 0) * Math.PI) / 180;
+  // A measurement carrying its own pitch axis supersedes the group's angle and direction (the
+  // pivot doesn't enter here — a mono-pitch's area and edge lengths don't depend on where the
+  // plane is hinged, only on how steeply and which way it tips).
+  const pitch = resolvePitch(framingJson ?? null, props.pitch_angle_deg, props.pitch_direction_deg);
+  const pitchRad = (pitch.angleDeg * Math.PI) / 180;
+  const dirRad = (pitch.directionDeg * Math.PI) / 180;
   const hasPitch = pitchRad !== 0;
 
   // Length-type groups: a single 2-point segment is drawn directly along the rake, so it's a flat

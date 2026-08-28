@@ -46,6 +46,10 @@ export interface Member3D {
 export interface AreaMesh3D {
   /** World [x, z] polygon vertices, metres, not repeating the closing point. */
   points: [number, number][];
+  /** Per-vertex rise (metres) above `baseY`, index-aligned with `points`, from the group's mono-
+   *  pitch. All zero for an unpitched area; the lowest vertex is always 0, so a pitched area
+   *  hinges up off its own low edge rather than sinking below the group's Z datum. */
+  rises: number[];
   baseY: number;
   heightM: number;
   color: string;
@@ -324,15 +328,51 @@ function dotAcross(vx: number, vz: number, runX: number, runZ: number): number {
 /** An "area" measurement's 3D extrusion: the polygon footprint extruded up from `offsetM` by the
  *  group's default height (or a thin slab when unset, so a flat area group still renders as a
  *  visible floor plate rather than nothing). */
+/**
+ * An area measurement's 3D geometry. A pitch (`pitchAngleDeg` ≠ 0) tilts the slab into its
+ * mono-pitch plane: every vertex is displaced by its distance along the uphill direction times
+ * tan(pitch), so the plan footprint is unchanged — the same mono-pitch model by which
+ * `deriveQuantity` scales the area to (plan area / cos θ). `pitchDirectionDeg` is the uphill
+ * bearing in PAGE space (0 = along page +X, 90 = along page +Y), the convention shared with
+ * `pitchedSegmentLengthPts` and with the group's own `pitch_direction_deg`.
+ *
+ * `pitchOrigin` is the pivot the plane rotates about, in page points — from the measurement's own
+ * `PitchAxis`. The plane passes through it at `offsetM`, rising on its uphill side and dropping
+ * BELOW the datum on the other, which is what makes a picked ridge or eaves line behave like a
+ * real hinge. With no origin (a group-wide pitch, which has no pivot to give) the shape's own
+ * lowest vertex is used instead, so the slab hinges up off its low edge and never sinks below the
+ * group's Z datum.
+ */
 export function computeAreaMesh3D(
   points: PagePoint[],
   mmPerPoint: number | null,
-  opts: { heightM: number; offsetM: number; color: string },
+  opts: {
+    heightM: number;
+    offsetM: number;
+    color: string;
+    pitchAngleDeg?: number;
+    pitchDirectionDeg?: number;
+    pitchOrigin?: PagePoint | null;
+  },
 ): AreaMesh3D | null {
   if (!mmPerPoint || !(mmPerPoint > 0) || points.length < 3) return null;
   const S = mmPerPoint / 1000;
+  const world = points.map((p) => pageToWorld(p, S));
+  const pitchRad = ((opts.pitchAngleDeg ?? 0) * Math.PI) / 180;
+  let rises = world.map(() => 0);
+  if (pitchRad !== 0) {
+    const dirRad = ((opts.pitchDirectionDeg ?? 0) * Math.PI) / 180;
+    // Page-space uphill axis (cos dir, sin dir) expressed in world terms: world x = page x * S and
+    // world z = -page y * S, so the page's +y component reads as -z.
+    const alongOf = (x: number, z: number) => x * Math.cos(dirRad) - z * Math.sin(dirRad);
+    const along = world.map(([x, z]) => alongOf(x, z));
+    const origin = opts.pitchOrigin;
+    const base = origin ? alongOf(...pageToWorld(origin, S)) : Math.min(...along);
+    rises = along.map((u) => (u - base) * Math.tan(pitchRad));
+  }
   return {
-    points: points.map((p) => pageToWorld(p, S)),
+    points: world,
+    rises,
     baseY: opts.offsetM,
     heightM: Math.max(opts.heightM, MIN_AREA_HEIGHT_M),
     color: opts.color,

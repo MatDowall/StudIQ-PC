@@ -12,6 +12,10 @@ import {
   polygonAreaPts,
   polygonPerimeterPts,
   quantityValueText,
+  parsePitchAxis,
+  resolvePitch,
+  transformPitchAxisJson,
+  withPitchAxis,
   isWallInsulationType,
   isWallSurfaceType,
   WALL_SURFACE_TYPE,
@@ -31,6 +35,7 @@ import {
   type ArrayTrim,
   type BoxTrim,
   type GroupProps,
+  type PitchAxis,
   type WallSurfaceMeta,
 } from "../lib/quantity";
 import {
@@ -77,6 +82,7 @@ import {
   type Member3D,
 } from "../lib/framing3d";
 import { ContextMenu, type ContextMenuItem } from "./ContextMenu";
+import { PitchAxisDialog } from "./PitchAxisDialog";
 import { OpeningDialog } from "./OpeningDialog";
 import { RakingDialog } from "./RakingDialog";
 import { Framing3DView } from "./Framing3DView";
@@ -804,7 +810,13 @@ function shiftMeasurements(measurements: MeasurementDto[], dx: number, dy: numbe
   return measurements.map((m) => {
     try {
       const pts = JSON.parse(m.geometry_json) as PagePoint[];
-      return { ...m, geometry_json: JSON.stringify(pts.map((p) => ({ x: p.x + dx, y: p.y + dy }))) };
+      return {
+        ...m,
+        geometry_json: JSON.stringify(pts.map((p) => ({ x: p.x + dx, y: p.y + dy }))),
+        // The pitch axis pivots on an absolute page point, so it has to be carried along —
+        // see `transformPitchAxisJson`.
+        framing_json: transformPitchAxisJson(m.framing_json, (p) => ({ x: p.x + dx, y: p.y + dy })),
+      };
     } catch {
       return m;
     }
@@ -816,11 +828,15 @@ function flipMeasurements(measurements: MeasurementDto[], centroid: PagePoint, a
   return measurements.map((m) => {
     try {
       const pts = JSON.parse(m.geometry_json) as PagePoint[];
-      const flipped =
-        axis === "x"
-          ? pts.map((p) => ({ x: 2 * centroid.x - p.x, y: p.y }))
-          : pts.map((p) => ({ x: p.x, y: 2 * centroid.y - p.y }));
-      return { ...m, geometry_json: JSON.stringify(flipped) };
+      const mapPoint = (p: PagePoint) =>
+        axis === "x" ? { x: 2 * centroid.x - p.x, y: p.y } : { x: p.x, y: 2 * centroid.y - p.y };
+      // Mirroring x reflects a bearing about the Y axis (180 − d); mirroring y about the X axis (−d).
+      const mapDirection = (deg: number) => (axis === "x" ? 180 - deg : -deg);
+      return {
+        ...m,
+        geometry_json: JSON.stringify(pts.map(mapPoint)),
+        framing_json: transformPitchAxisJson(m.framing_json, mapPoint, mapDirection),
+      };
     } catch {
       return m;
     }
@@ -832,12 +848,16 @@ function rotateMeasurements(measurements: MeasurementDto[], centroid: PagePoint,
   return measurements.map((m) => {
     try {
       const pts = JSON.parse(m.geometry_json) as PagePoint[];
-      const rotated = pts.map((p) => {
+      const mapPoint = (p: PagePoint) => {
         const rx = p.x - centroid.x;
         const ry = p.y - centroid.y;
         return ccw ? { x: centroid.x - ry, y: centroid.y + rx } : { x: centroid.x + ry, y: centroid.y - rx };
-      });
-      return { ...m, geometry_json: JSON.stringify(rotated) };
+      };
+      return {
+        ...m,
+        geometry_json: JSON.stringify(pts.map(mapPoint)),
+        framing_json: transformPitchAxisJson(m.framing_json, mapPoint, (deg) => (ccw ? deg + 90 : deg - 90)),
+      };
     } catch {
       return m;
     }
@@ -1264,6 +1284,80 @@ function drawPitchDirectionOutline(
   ctx.restore();
 }
 
+/** Screen-pixel pick radius for a pitch-axis corner grab; beyond it the edge under the cursor
+ *  wins instead. Generous, because the corner is the fiddlier of the two targets to hit. */
+const PITCH_PICK_VERTEX_RADIUS = 14;
+/** Colour of the pitch-axis pick affordances — deliberately not a group colour, since the axis is
+ *  a property of the measure rather than another measured thing. Shared with PitchAxisDialog's
+ *  plan preview so the corner/edge you clicked reads the same in both. */
+const PITCH_AXIS_COLOUR = "#FFB300";
+
+/** Uphill bearing (degrees CCW from page +X, Y-up) for hinging on edge `index` of `points`: the
+ *  edge's normal pointing INTO the shape, so picking an edge tips the surface up and away from it
+ *  — an eaves line with the ridge somewhere on the far side, which is the way an estimator reads
+ *  "hinge here". Flipping to fall the other way is a sign change on the angle. */
+function edgeUphillDirectionDeg(points: PagePoint[], index: number): number {
+  const a = points[index];
+  const b = points[(index + 1) % points.length];
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const len = Math.hypot(dx, dy);
+  if (len < 1e-9) return 0;
+  let nx = -dy / len;
+  let ny = dx / len;
+  const cx = points.reduce((sum, p) => sum + p.x, 0) / points.length;
+  const cy = points.reduce((sum, p) => sum + p.y, 0) / points.length;
+  const mx = (a.x + b.x) / 2;
+  const my = (a.y + b.y) / 2;
+  if (nx * (cx - mx) + ny * (cy - my) < 0) {
+    nx = -nx;
+    ny = -ny;
+  }
+  return (Math.atan2(ny, nx) * 180) / Math.PI;
+}
+
+/** Highlights whichever corner or edge the pitch-axis pick would take if clicked now. */
+function drawPitchAxisHoverTarget(
+  ctx: CanvasRenderingContext2D,
+  points: PagePoint[],
+  hover: { kind: "vertex" | "edge"; index: number },
+  pan: { x: number; y: number },
+  zoom: number,
+  page: { height_pts: number },
+) {
+  ctx.save();
+  ctx.strokeStyle = PITCH_AXIS_COLOUR;
+  ctx.fillStyle = PITCH_AXIS_COLOUR;
+  if (hover.kind === "vertex") {
+    const p = points[hover.index];
+    if (p) {
+      const s = pageToScreen(p.x, p.y, page.height_pts, pan, zoom);
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, 7, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, 12, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+  } else {
+    const a = points[hover.index];
+    const b = points[(hover.index + 1) % points.length];
+    if (a && b) {
+      const sa = pageToScreen(a.x, a.y, page.height_pts, pan, zoom);
+      const sb = pageToScreen(b.x, b.y, page.height_pts, pan, zoom);
+      ctx.lineWidth = 6;
+      ctx.lineCap = "round";
+      ctx.globalAlpha = 0.85;
+      ctx.beginPath();
+      ctx.moveTo(sa.x, sa.y);
+      ctx.lineTo(sb.x, sb.y);
+      ctx.stroke();
+    }
+  }
+  ctx.restore();
+}
+
 /**
  * Page-space anchor for the pitch-direction hover indicator: the shape's centroid (average of its
  * points, a good-enough anchor for this affordance) plus its own extent *along the pitch
@@ -1539,6 +1633,14 @@ export function ViewerCanvas({
     startPoint: PagePoint;
     endPoint: PagePoint;
   } | null>(null);
+  // Right-click → Set pitch axis: the pick gesture is armed for this measurement, and the hover
+  // target under the cursor (a corner, or an edge to hinge along). Committing the pick opens the
+  // dialog in `pendingPitchAxis`, where the angle and direction are typed.
+  const [pitchAxisPick, setPitchAxisPick] = useState<{ measurementId: number } | null>(null);
+  const [pitchAxisHover, setPitchAxisHover] = useState<
+    { measurementId: number; kind: "vertex" | "edge"; index: number; origin: PagePoint; directionDeg: number } | null
+  >(null);
+  const [pendingPitchAxis, setPendingPitchAxis] = useState<{ measurementId: number; axis: PitchAxis } | null>(null);
   // Ctrl-hover (select mode): ghost position for a manually-placed extra stud.
   const [studGhost, setStudGhost] = useState<{ measurementId: number; segmentIndex: number; centreMm: number } | null>(null);
   // Right-click → Double studs → Select studs: interactive stud-pick mode.
@@ -2711,6 +2813,25 @@ export function ViewerCanvas({
       ctx.restore();
     }
 
+    // Pitch-axis pick: light up the corner or edge the click would take. The axis itself is NOT
+    // drawn on the page — an arrow and angle pinned to every pitched measure cluttered the
+    // drawing (and swung outside the shape whenever the angle or direction went negative). The
+    // green on-hover pitch indicator already tells the estimator a measure is pitched and which
+    // way it falls; the pivot is shown in the Pitch Axis dialog.
+    if (page && pitchAxisHover) {
+      const hoverPoints = (() => {
+        const m = overlayMeasurements.find((x) => x.id === pitchAxisHover.measurementId);
+        if (!m) return null;
+        try {
+          const parsed = JSON.parse(m.geometry_json);
+          return Array.isArray(parsed) ? (parsed as PagePoint[]) : null;
+        } catch {
+          return null;
+        }
+      })();
+      if (hoverPoints) drawPitchAxisHoverTarget(ctx, hoverPoints, pitchAxisHover, pan, zoom, page);
+    }
+
     // Pitch-direction pick: dashed axis-snapped preview from the clicked start point to the cursor.
     if (pitchDirectionMode && page && pitchPickStart) {
       const livePoint = cursorPagePoint;
@@ -2792,7 +2913,7 @@ export function ViewerCanvas({
         }
       }
     }
-  }, [drawingWallSurface, drawingInsulation, framingSourceWalls, wallFaceHover, wallSpanDrag, activeProps, activeDimensionGroupId, arrayDirection, arrayExtraMembers, arraySpacingPts, arrayTrimDraft, arrayTrimKeepPt, arrayTrimMode, arrayTrimType, calibDialog, calibPoints, calibrating, clipboard, cursorPagePoint, doc, doubleStudSelect, draftColour, draftPoints, draftStyle, drawingArea, drawingArray, drawingFraming, drawingType, editPreview, groupColours, groupProps, lightMode, lineSnapResult, marqueeState, measuring, moveMode, openingGhost, openingPlacement, overlayColour, overlayMeasurements, page, pageIndex, pageScale, pageSize.height, pageSize.width, pan, pasteMode, pendingRake, pitchDirectionMode, pitchPickStart, selectedSet, shiftHeld, snapPoint, snapType, studGhost, viewportSize.height, viewportSize.width, zoom]);
+  }, [drawingWallSurface, drawingInsulation, framingSourceWalls, wallFaceHover, wallSpanDrag, activeProps, activeDimensionGroupId, arrayDirection, arrayExtraMembers, arraySpacingPts, arrayTrimDraft, arrayTrimKeepPt, arrayTrimMode, arrayTrimType, calibDialog, calibPoints, calibrating, clipboard, cursorPagePoint, doc, doubleStudSelect, draftColour, draftPoints, draftStyle, drawingArea, drawingArray, drawingFraming, drawingType, editPreview, groupColours, groupProps, lightMode, lineSnapResult, marqueeState, measuring, moveMode, openingGhost, openingPlacement, overlayColour, overlayMeasurements, page, pageIndex, pageScale, pageSize.height, pageSize.width, pan, pasteMode, pendingRake, pitchAxisHover, pitchDirectionMode, pitchPickStart, selectedSet, shiftHeld, snapPoint, snapType, studGhost, viewportSize.height, viewportSize.width, zoom]);
 
   function clampPan(nextPan: { x: number; y: number }, nextZoom = zoom) {
     if (!page) return nextPan;
@@ -2852,6 +2973,13 @@ export function ViewerCanvas({
         applyCalib([start, point]);
         if (pixelLength > 1e-6) setCalibDialog({ pixelLength });
       }
+      return;
+    }
+
+    // Pitch-axis pick: one click on a corner or an edge of the measure sets the centre of
+    // rotation (and, for an edge, the slope direction), then the dialog opens to settle the angle.
+    if (pitchAxisPick && page) {
+      commitPitchAxisPick(event.clientX, event.clientY);
       return;
     }
 
@@ -3156,6 +3284,14 @@ export function ViewerCanvas({
       }
     }
 
+    // Pitch-axis pick: light up the corner or edge the click would take. The hover card is
+    // suppressed while picking — the affordance under the cursor is the thing to look at.
+    if (pitchAxisPick) {
+      setHoverInfo(null);
+      setPitchAxisHover(resolvePitchAxisTarget(event.clientX, event.clientY));
+      return;
+    }
+
     // Hover-to-inspect committed dimensions works in add-mode too (add-mode is
     // always on while a group is selected). It's suppressed mid-path below, where
     // the live length readout takes over.
@@ -3378,6 +3514,18 @@ export function ViewerCanvas({
         // View in 3D — any measurement type (marker/extrusion/mesh built from the group's
         // measurement_type; timber framing additionally gets raking-frame/double-stud extras below).
         items.push({ label: "View in 3D", action: () => setWall3dId(id) });
+        // Pitch axis: an area measure's own slope, hinged where the estimator picks rather than
+        // on the group-wide direction (which has no pivot and so can only tip off the low edge).
+        if (measurement.measurement_type === "area" && points.length >= 3) {
+          const axis = parsePitchAxis(measurement.framing_json);
+          items.push({ label: axis ? "Edit pitch axis…" : "Set pitch axis…", action: () => startPitchAxisPick(id) });
+          if (axis) {
+            items.push({
+              label: "Clear pitch axis (use group pitch)",
+              action: () => savePitchAxis(id, null),
+            });
+          }
+        }
         if (measurement.measurement_type === "timber_framing") {
           const seg = hitTestSegment(event.clientX, event.clientY, id);
           if (seg) {
@@ -3694,6 +3842,88 @@ export function ViewerCanvas({
 
   /** Sets (or clears) one surface's own Deduct Openings override. `null` hands it back to the
    *  group default from the properties dialog. */
+  // ---- Pitch axis (right-click an area measure → Set pitch axis) --------------------------
+  // The centre of rotation is picked ON the measure: a corner takes that corner, an edge hinges
+  // along it and points the slope away from that edge. The dialog then fine-tunes the angle and
+  // the direction, so the pick only has to get the estimator close.
+
+  function startPitchAxisPick(measurementId: number) {
+    setPitchAxisHover(null);
+    setPitchAxisPick({ measurementId });
+    onStatusChange("Click a corner or an edge of the measure to set the pitch centre — Esc to cancel.");
+  }
+
+  /** Which corner/edge of the pick's measure is under the cursor, and the axis that would give. */
+  function resolvePitchAxisTarget(clientX: number, clientY: number) {
+    const pick = pitchAxisPick;
+    if (!pick) return null;
+    const points = measurementPoints(pick.measurementId);
+    if (!points || points.length < 3) return null;
+    const measurement = overlayMeasurements.find((m) => m.id === pick.measurementId);
+    const existing = parsePitchAxis(measurement?.framing_json);
+    const groupDirection = groupProps[measurement?.dimension_group_id ?? -1]?.pitch_direction_deg ?? 0;
+
+    const vertexIndex = nearestVertex(clientX, clientY, pick.measurementId, PITCH_PICK_VERTEX_RADIUS);
+    if (vertexIndex >= 0) {
+      return {
+        measurementId: pick.measurementId,
+        kind: "vertex" as const,
+        index: vertexIndex,
+        origin: points[vertexIndex],
+        // A corner says nothing about which way the slope runs, so keep whatever direction the
+        // measure already had (else the group's) and let the dialog settle it.
+        directionDeg: existing?.directionDeg ?? groupDirection,
+      };
+    }
+    const segment = hitTestSegment(clientX, clientY, pick.measurementId);
+    if (segment) {
+      const a = points[segment.segmentIndex];
+      const b = points[(segment.segmentIndex + 1) % points.length];
+      return {
+        measurementId: pick.measurementId,
+        kind: "edge" as const,
+        index: segment.segmentIndex,
+        origin: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 },
+        // Rounded: an edge normal otherwise lands on -90.1170192°, which reads as noise in the
+        // dialog's Direction field and is far finer than any drawn edge is actually surveyed.
+        directionDeg: Math.round(edgeUphillDirectionDeg(points, segment.segmentIndex) * 10) / 10,
+      };
+    }
+    return null;
+  }
+
+  function commitPitchAxisPick(clientX: number, clientY: number) {
+    const target = resolvePitchAxisTarget(clientX, clientY);
+    if (!target) {
+      onStatusChange("Pitch centre must be a corner or an edge of the measure — Esc to cancel.");
+      return;
+    }
+    const measurement = overlayMeasurements.find((m) => m.id === target.measurementId);
+    const existing = parsePitchAxis(measurement?.framing_json);
+    const groupAngle = groupProps[measurement?.dimension_group_id ?? -1]?.pitch_angle_deg ?? 0;
+    setPitchAxisPick(null);
+    setPitchAxisHover(null);
+    setPendingPitchAxis({
+      measurementId: target.measurementId,
+      axis: {
+        angleDeg: existing?.angleDeg ?? groupAngle,
+        directionDeg: target.directionDeg,
+        originX: target.origin.x,
+        originY: target.origin.y,
+      },
+    });
+    onStatusChange("");
+  }
+
+  /** Persists (or with `null`, removes) a measurement's own pitch axis. */
+  function savePitchAxis(measurementId: number, axis: PitchAxis | null) {
+    const measurement = overlayMeasurements.find((m) => m.id === measurementId);
+    if (!measurement) return;
+    void updateMeasurementFraming(measurementId, withPitchAxis(measurement.framing_json, axis)).catch((error) =>
+      onStatusChange(`ERROR: ${error}`),
+    );
+  }
+
   function setSurfaceDeduction(measurementId: number, deduct: boolean | null) {
     const measurement = overlayMeasurements.find((m) => m.id === measurementId);
     if (!measurement) return;
@@ -4101,6 +4331,12 @@ export function ViewerCanvas({
         : flipMeasurements(selected, centroid, action === "flipH" ? "x" : "y");
     for (const m of transformed) {
       await updateMeasurementGeometry(m.id, m.geometry_json).catch((e) => onStatusChange(`ERROR: ${e}`));
+      // `rotateMeasurements`/`flipMeasurements` also swing any pitch axis with the shape; persist
+      // it whenever it actually changed, so a rotated roof plane keeps falling the way it looks.
+      const source = selected.find((x) => x.id === m.id);
+      if (source && m.framing_json !== source.framing_json) {
+        await updateMeasurementFraming(m.id, m.framing_json).catch((e) => onStatusChange(`ERROR: ${e}`));
+      }
     }
   }
 
@@ -4135,8 +4371,13 @@ export function ViewerCanvas({
         const pts = JSON.parse(m.geometry_json) as PagePoint[];
         const newPts = pts.map((p) => ({ x: p.x + dx, y: p.y + dy }));
         await updateMeasurementGeometry(id, JSON.stringify(newPts)).catch((e) => onStatusChange(`ERROR: ${e}`));
-        // Trims are stored relative to pts[0], so they follow the geometry automatically —
-        // no framing_json update needed here.
+        // Trims are stored relative to pts[0], so they follow the geometry automatically. A pitch
+        // axis does NOT — its pivot is an absolute page point, and leaving it behind turns the
+        // move into height (see `transformPitchAxisJson`).
+        const movedFraming = transformPitchAxisJson(m.framing_json, (p) => ({ x: p.x + dx, y: p.y + dy }));
+        if (movedFraming !== m.framing_json) {
+          await updateMeasurementFraming(id, movedFraming).catch((e) => onStatusChange(`ERROR: ${e}`));
+        }
       } catch {
         // skip unparseable
       }
@@ -4174,8 +4415,11 @@ export function ViewerCanvas({
           // For timber-framing walls, carry over openings (doors/windows), extra studs,
           // and raking frames.  These are all stored as arc-length positions along the
           // wall path (in mm), so they're valid regardless of where the wall is placed.
-          if (m.framing_json) {
-            await updateMeasurementFraming(created.id, m.framing_json).catch((e) => onStatusChange(`ERROR: ${e}`));
+          // A pitch axis is the exception — its pivot is absolute, so it is moved by the same
+          // delta as the geometry rather than copied verbatim.
+          const pastedFraming = transformPitchAxisJson(m.framing_json, (p) => ({ x: p.x + dx, y: p.y + dy }));
+          if (pastedFraming) {
+            await updateMeasurementFraming(created.id, pastedFraming).catch((e) => onStatusChange(`ERROR: ${e}`));
           }
           newIds.push(created.id);
         }
@@ -4480,11 +4724,13 @@ export function ViewerCanvas({
             return;
           }
 
-          const quantity = props ? deriveQuantity(points, pageScale?.mm_per_point ?? null, props) : null;
+          const quantity = props ? deriveQuantity(points, pageScale?.mm_per_point ?? null, props, measurement.framing_json) : null;
           const h = props?.default_height ?? 0;
           const m = props?.default_multiplier ?? 1;
-          const pitchRad = ((props?.pitch_angle_deg ?? 0) * Math.PI) / 180;
-          const dirRad = ((props?.pitch_direction_deg ?? 0) * Math.PI) / 180;
+          // Same override rule the quantity uses: the measure's own axis, else the group's pitch.
+          const hoverPitch = resolvePitch(measurement.framing_json, props?.pitch_angle_deg, props?.pitch_direction_deg);
+          const pitchRad = (hoverPitch.angleDeg * Math.PI) / 180;
+          const dirRad = (hoverPitch.directionDeg * Math.PI) / 180;
           const hasPitch = pitchRad !== 0;
 
           if (isArea) {
@@ -4514,7 +4760,7 @@ export function ViewerCanvas({
                 { label: "Perimeter Total", value: perimeterM != null ? formatQuantity({ value: perimeterM * m, uom: "m" }) : "—" },
                 { label: "Volume Total", value: areaM2 != null ? formatQuantity({ value: areaM2 * h * m, uom: "m³" }) : "—" },
               ],
-              pitchIndicator: hasPitch ? computePitchIndicator(points, props?.pitch_angle_deg ?? 0, dirRad) : undefined,
+              pitchIndicator: hasPitch ? computePitchIndicator(points, hoverPitch.angleDeg, dirRad) : undefined,
             });
             return;
           }
@@ -4551,7 +4797,7 @@ export function ViewerCanvas({
               { label: "Total Length", value: boundaryM != null ? formatQuantity({ value: boundaryM * m, uom: "m" }) : formatLength(pathLengthPts(points), pageScale) },
               { label: "Total Wall Area", value: boundaryM != null ? formatQuantity({ value: boundaryM * h * m, uom: "m²" }) : "—" },
             ],
-            pitchIndicator: hasPitch ? computePitchIndicator(points, props?.pitch_angle_deg ?? 0, dirRad) : undefined,
+            pitchIndicator: hasPitch ? computePitchIndicator(points, hoverPitch.angleDeg, dirRad) : undefined,
           });
           return;
         }
@@ -4724,6 +4970,21 @@ export function ViewerCanvas({
     return () => window.removeEventListener("keydown", onKeyDown);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [arrayTrimMode, arrayTrimType, arrayTrimKeepPt, commitArrayTrim]);
+
+  // Pitch-axis pick keyboard: Esc abandons the pick, leaving any existing axis untouched.
+  useEffect(() => {
+    if (!pitchAxisPick) return;
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        setPitchAxisPick(null);
+        setPitchAxisHover(null);
+        onStatusChange("");
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pitchAxisPick]);
 
   // Pitch-direction pick keyboard: Esc cancels (dialog reopens with direction unchanged).
   useEffect(() => {
@@ -4947,7 +5208,7 @@ export function ViewerCanvas({
         minHeight: 0,
         overflow: "hidden",
         cursor: doc
-          ? measuring || calibrating || openingPlacement || arrayTrimMode || pitchDirectionMode
+          ? measuring || calibrating || openingPlacement || arrayTrimMode || pitchDirectionMode || pitchAxisPick
             ? "crosshair"
             : moveMode || pasteMode
               ? "crosshair"
@@ -5057,6 +5318,28 @@ export function ViewerCanvas({
           </svg>
         </div>
       ) : null}
+      {pitchAxisPick ? (
+        <div
+          style={{
+            position: "absolute",
+            bottom: 12,
+            left: "50%",
+            transform: "translateX(-50%)",
+            padding: "6px 16px",
+            background: "rgba(20,22,26,0.92)",
+            color: "#FFB300",
+            border: "1px solid #FFB300",
+            borderRadius: 4,
+            fontSize: 12,
+            fontFamily: "Segoe UI, sans-serif",
+            pointerEvents: "none",
+            whiteSpace: "nowrap",
+            zIndex: 10,
+          }}
+        >
+          Click a corner to pivot on it, or an edge to hinge along it · Esc to cancel
+        </div>
+      ) : null}
       {doubleStudSelect ? (
         <div
           style={{
@@ -5117,6 +5400,33 @@ export function ViewerCanvas({
         }}
       />
     ) : null}
+    {pendingPitchAxis ? (() => {
+      const m = overlayMeasurements.find((x) => x.id === pendingPitchAxis.measurementId);
+      const pts = m ? measurementPoints(m.id) : null;
+      if (!m || !pts || pts.length < 3) return null;
+      const gp = groupProps[m.dimension_group_id];
+      return (
+        <PitchAxisDialog
+          initial={pendingPitchAxis.axis}
+          points={pts}
+          groupAngleDeg={gp?.pitch_angle_deg ?? 0}
+          groupDirectionDeg={gp?.pitch_direction_deg ?? 0}
+          onCancel={() => setPendingPitchAxis(null)}
+          onPickCentre={() => {
+            setPendingPitchAxis(null);
+            startPitchAxisPick(pendingPitchAxis.measurementId);
+          }}
+          onClear={() => {
+            savePitchAxis(pendingPitchAxis.measurementId, null);
+            setPendingPitchAxis(null);
+          }}
+          onConfirm={(axis) => {
+            savePitchAxis(pendingPitchAxis.measurementId, axis);
+            setPendingPitchAxis(null);
+          }}
+        />
+      );
+    })() : null}
     {pendingRake ? (
       <RakingDialog
         initialStart={pendingRake.start}
@@ -5169,7 +5479,15 @@ export function ViewerCanvas({
                 });
                 if (marker) members = [marker];
               } else if (m.measurement_type === "area" && pts.length >= 3) {
-                const mesh = computeAreaMesh3D(pts, mmpp, { heightM: props?.default_height ?? 0, offsetM, color });
+                const pitch = resolvePitch(m.framing_json, props?.pitch_angle_deg, props?.pitch_direction_deg);
+                const mesh = computeAreaMesh3D(pts, mmpp, {
+                  heightM: props?.default_height ?? 0,
+                  offsetM,
+                  color,
+                  pitchAngleDeg: pitch.angleDeg,
+                  pitchDirectionDeg: pitch.directionDeg,
+                  pitchOrigin: pitch.origin,
+                });
                 if (mesh) areas = [mesh];
               } else if (m.measurement_type === "array" && pts.length >= 2) {
                 const meta = parseArrayMeta(m.framing_json ?? null);

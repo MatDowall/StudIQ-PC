@@ -385,6 +385,70 @@ being pushed out along each segment's own normal — offsetting per-segment leav
 thickness at every corner, because the two segments' normals differ there. A gable segment is split at its apex so each half stays a straight-topped
 `wedge` quad.
 
+### Pitch: a group-wide slope, or one measurement's own hinged plane
+
+A dimension group's `pitch_angle_deg`/`pitch_direction_deg` describe a single mono-pitch for every
+measurement in the group, and direction there is only ever 0 (along page X) or 90 (along page Y) —
+what the properties dialog's Along X / Along Y toggle and its "Pick on Drawing" gesture produce.
+That is enough for the quantity (a mono-pitch's area is `plan / cos θ` no matter where it is
+hinged) but not for a roof: two planes in one group fall different ways, and which way a plane tips
+only reads correctly in 3D once you say what it pivots about.
+
+So an **area** measurement may carry its own `PitchAxis` (quantity.ts) — a signed `angleDeg`, a free
+`directionDeg` in [-360, 360], and the `originX`/`originY` it rotates about — which supersedes the
+group's angle *and* direction for that measure alone. `resolvePitch` is the single place that
+override rule lives; every consumer (quantities, the hover card's pitch indicator, the 3D mesh)
+goes through it, so they cannot drift apart. Clearing the axis drops the measure back to the
+group's pitch.
+
+`directionDeg` is the **uphill** bearing (CCW from page +X, in the same Y-up page space as
+`geometry_json`), which is the convention `pitch_direction_deg` already used — so a group default
+reads straight across into it. A **negative angle falls** along that bearing instead of rising,
+so a plane can be tipped either way about one pivot without spinning the direction 180°.
+
+**It rides in `framing_json` under the `pitch` key**, not in a column of its own. That blob is
+already the frontend-owned per-measurement extras bag (wall framing, array meta, wall-surface
+snapshots), every backend command and copy/paste/export path carries it unchanged, and
+`deriveQuantity` is handed it at every call site — so the override reaches the quantities, the
+workbook and the Excel bridge with no plumbing and no migration. `withPitchAxis` merges rather than
+replaces (an array's meta and its axis coexist), and returns `null` once nothing else is left, so a
+measure that never had framing extras goes back to a null column.
+
+**The pivot changes nothing about the quantity** — only where the plane sits in 3D.
+`computeAreaMesh3D` displaces each vertex by its distance along the uphill direction × tan θ,
+measured *from the pivot*, so the surface rises on one side of it and drops **below the group's Z
+datum** on the other. That is what makes a picked ridge or eaves line behave like a real hinge. With
+no axis (a group-wide pitch, which has no pivot to give) the shape's own lowest vertex is used
+instead, so the slab hinges up off its low edge and never sinks below the datum.
+
+**Picking is done on the measure**: right-click an area measurement → *Set pitch axis…*, then click
+a **corner** (pivot there, keeping whatever direction the measure or its group already had — a
+corner says nothing about which way the slope runs) or an **edge** (pivot on its midpoint, with the
+direction set to that edge's inward normal, so the surface tips up and away from it — an eaves line
+with the ridge on the far side). The dialog (`PitchAxisDialog`) then settles the angle and direction
+numerically over a plan preview of the shape.
+
+**The pivot is an absolute page point, so it must be transported with the geometry.** Unlike an
+array's trims (stored relative to `points[0]`, so they follow the shape for free), an axis left
+behind turns a translation into height: a plane pitched 45° moved 3 m away from its pivot now
+floats 3 m up, which swamps whatever Z offset its group is set to — copies of a ceiling group,
+moved onto their own units, scattered vertically instead of stacking at their offsets.
+`transformPitchAxisJson` is the one primitive for this, and **anything that moves, copies, flips or
+rotates a measurement must put `framing_json` through it**: `shiftMeasurements`,
+`flipMeasurements`, `rotateMeasurements` (the ghosts) and `commitMove`, `commitPaste`,
+`rotateOrFlipSelected` (the persists). A flip mirrors the bearing (`180 - d` about Y, `-d` about X)
+and a quarter turn rotates it (`d ± 90`); results wrap into (-180, 180].
+
+**The axis is never drawn on the page.** Pinning a hinge line, arrow and angle to every pitched
+measure cluttered the drawing, and a negative angle or direction swung the arrow outside the shape
+altogether. The dialog's preview is the only place it is drawn; on the page, the existing green
+on-hover pitch indicator (`computePitchIndicator`, which reads through `resolvePitch` and so shows
+the measure's own angle) is what says a measure is pitched. `PITCH_AXIS_COLOUR` is now only the
+pick-time corner/edge highlight.
+
+Length and array groups still take their pitch from the group. The data model is type-agnostic (a
+stored axis is honoured wherever `resolvePitch` runs), but only area exposes the pick UI.
+
 ### Workbook → Excel export is built in Rust, not JS
 
 `WorkbookView.tsx`'s `exportExcel` flattens the workbook (unchanged, in the frontend) and hands
@@ -626,8 +690,9 @@ files working without a versioned migration system. Follow this pattern for any 
 
 - No build/CI yet. Vitest covers the pure geometry/quantity logic — `npm test` (`vitest run`) in
   `desktop/src-frontend`; see `src/lib/framing.test.ts` (wall framing), `src/lib/blocking.test.ts`
-  (joist/rafter blocking + its 3D placement) and `src/lib/wallSurface.test.ts` (wall-face geometry,
-  rakes, opening deductions, snapshot drift). Add to these rather than hand-rolling a throwaway
+  (joist/rafter blocking + its 3D placement), `src/lib/wallSurface.test.ts` (wall-face geometry,
+  rakes, opening deductions, snapshot drift) and `src/lib/area3d.test.ts` (the area group's
+  mono-pitch 3D tilt and the per-measurement pitch axis). Add to these rather than hand-rolling a throwaway
   script when changing that math.
 - SQL is always parameterized. Node mutations verify `expected_node_type` before acting — keep this.
 - British spelling is used in identifiers in places (`colour`). Match surrounding code.
