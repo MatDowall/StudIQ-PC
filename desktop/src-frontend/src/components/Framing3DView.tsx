@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { Canvas } from "@react-three/fiber";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Canvas, useThree } from "@react-three/fiber";
 import { OrbitControls } from "@react-three/drei";
 import * as THREE from "three";
 import { MEMBER_COLOURS, type AreaMesh3D, type Member3D } from "../lib/framing3d";
@@ -115,8 +115,15 @@ function InstancedMembers({
   members: Member3D[];
 }) {
   const ref = useRef<THREE.InstancedMesh>(null);
+  const invalidate = useThree((s) => s.invalidate);
 
-  useEffect(() => {
+  // useLayoutEffect (not useEffect): the instance matrices must be written synchronously, before
+  // the browser paints and before R3F's next scheduled frame. As a passive effect this raced the
+  // `frameloop="demand"` frame — when the frame won, the mesh painted at identity matrices
+  // (collapsed to the origin) and, with no further frame requested, stayed broken until a pan. The
+  // race resolved differently per mount, which is why only some groups collapsed. `invalidate()`
+  // then explicitly requests a repaint now that the matrices (and count) are current.
+  useLayoutEffect(() => {
     const mesh = ref.current;
     if (!mesh) return;
     const matrix = new THREE.Matrix4();
@@ -126,8 +133,11 @@ function InstancedMembers({
       matrix.compose(new THREE.Vector3(...mem.position), new THREE.Quaternion(qx, qy, qz, qw), scale);
       mesh.setMatrixAt(i, matrix);
     });
+    mesh.count = members.length;
     mesh.instanceMatrix.needsUpdate = true;
-  }, [members]);
+    mesh.computeBoundingSphere();
+    invalidate();
+  }, [members, invalidate]);
 
   return (
     <instancedMesh ref={ref} args={[undefined, undefined, members.length]}>
@@ -146,7 +156,7 @@ function Members({ members, areas }: { members: Member3D[]; areas?: AreaMesh3D[]
     const wedges: Member3D[] = [];
     const map = new Map<
       string,
-      { kind: Member3D["kind"]; size: [number, number, number]; color?: string; members: Member3D[] }
+      { key: string; kind: Member3D["kind"]; size: [number, number, number]; color?: string; members: Member3D[] }
     >();
     for (const mem of members) {
       if (mem.wedge) {
@@ -156,7 +166,7 @@ function Members({ members, areas }: { members: Member3D[]; areas?: AreaMesh3D[]
       const key = `${mem.kind}|${mem.size.join(",")}|${mem.color ?? ""}`;
       let group = map.get(key);
       if (!group) {
-        group = { kind: mem.kind, size: mem.size, color: mem.color, members: [] };
+        group = { key, kind: mem.kind, size: mem.size, color: mem.color, members: [] };
         map.set(key, group);
       }
       group.members.push(mem);
@@ -167,10 +177,17 @@ function Members({ members, areas }: { members: Member3D[]; areas?: AreaMesh3D[]
   return (
     <group>
       {wedges.map((mem, i) => (
-        <WedgeMesh key={i} mem={mem} />
+        // Stable key: a wedge is identified by its world position, so toggling other groups in/out
+        // doesn't reshuffle which React node (and geometry) belongs to which wedge.
+        <WedgeMesh key={`${mem.position.join(",")}|${i}`} mem={mem} />
       ))}
-      {groups.map((g, i) => (
-        <InstancedMembers key={i} kind={g.kind} size={g.size} color={g.color} members={g.members} />
+      {groups.map((g) => (
+        // Key by the stable (kind|size|colour) bucket key, NOT array index — and fold in the member
+        // count so a bucket that grows or shrinks is remounted with a correctly-sized instance
+        // buffer. Index keys made React reuse an InstancedMesh whose matrix buffer was sized for a
+        // different bucket when the visible set changed, dropping members past the old count and
+        // collapsing the frame.
+        <InstancedMembers key={`${g.key}|${g.members.length}`} kind={g.kind} size={g.size} color={g.color} members={g.members} />
       ))}
       {areas?.map((area, i) => (
         <AreaMeshItem key={i} area={area} />

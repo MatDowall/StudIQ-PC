@@ -30,6 +30,10 @@ export function Viewer() {
   const pageScale = useAppStore((state) => state.pageScale);
   const setViewerStatus = useAppStore((state) => state.setViewerStatus);
   const view3d = useAppStore((state) => state.view3d);
+  const visibleGroupIds3d = useAppStore((state) => state.visibleGroupIds3d);
+  const group3dCache = useAppStore((state) => state.group3dCache);
+  const refreshGroup3dCache = useAppStore((state) => state.refreshGroup3dCache);
+  const activeDrawingId = useAppStore((state) => state.activeDrawingId);
   const view3dMulti = useAppStore((state) => state.view3dMulti);
   const multiPage3DConfig = useAppStore((state) => state.multiPage3DConfig);
 
@@ -53,6 +57,15 @@ export function Viewer() {
   const pageWidthM3d = S3d && currentPage3d ? currentPage3d.width_pts * S3d : undefined;
   const pageHeightM3d = S3d && currentPage3d ? currentPage3d.height_pts * S3d : undefined;
 
+  // Keep the 3D cache in step with the enriched overlay while in 3D. The overlay picks up the
+  // re-synced wall-surface snapshots (correct Z datum) asynchronously after selection; folding
+  // those into the cache means a group still renders correctly once it drops out of the live
+  // selection, instead of reverting to the pre-sync snapshot.
+  useEffect(() => {
+    if (!view3d) return;
+    refreshGroup3dCache();
+  }, [view3d, overlayMeasurements, groupProps, refreshGroup3dCache]);
+
   // 3D geometry for every measurement on the displayed page — timber-framing walls go through
   // computeWall3D (the shared 2D/3D member model); count/length/area groups go through the
   // generic builders, coloured by the group's own positive/negative colour (same colours the
@@ -62,79 +75,91 @@ export function Viewer() {
     const mmpp = pageScale?.mm_per_point ?? null;
     const members: Member3D[] = [];
     const areas: AreaMesh3D[] = [];
-    for (const mz of overlayMeasurements) {
-      if (mz.page_index !== pageIndex) continue;
-      let pts: { x: number; y: number }[];
-      try {
-        pts = JSON.parse(mz.geometry_json);
-      } catch {
-        continue;
-      }
-      if (!Array.isArray(pts) || pts.length < 1) continue;
-      const props = groupProps[mz.dimension_group_id];
-      const offsetM = props?.default_offset ?? 0;
-      const negative = (mz.polarity ?? 1) < 0;
-      const color = negative ? props?.neg_colour ?? "#FF0000" : props?.pos_colour ?? "#4A9EFF";
-      if (mz.measurement_type === "timber_framing") {
-        if (pts.length < 2) continue;
-        const settings = parseFramingSettings(props?.framing_props_json ?? null);
-        members.push(...offsetMembers(computeWall3D(pts, settings, mmpp, parseWallFraming(mz.framing_json)), offsetM));
-      } else if (mz.measurement_type === "count") {
-        const marker = computeCountMarker3D(pts[0], mmpp, {
-          widthM: props?.default_width ?? 0,
-          heightM: props?.default_height ?? 0,
-          countType: props?.count_type ?? "marker",
-          offsetM,
-          color,
-        });
-        if (marker) members.push(marker);
-      } else if (mz.measurement_type === "area") {
-        const pitch = resolvePitch(mz.framing_json, props?.pitch_angle_deg, props?.pitch_direction_deg);
-        const mesh = computeAreaMesh3D(pts, mmpp, {
-          heightM: props?.default_height ?? 0,
-          offsetM,
-          color,
-          pitchAngleDeg: pitch.angleDeg,
-          pitchDirectionDeg: pitch.directionDeg,
-          pitchOrigin: pitch.origin,
-        });
-        if (mesh) areas.push(mesh);
-      } else if (mz.measurement_type === "array") {
-        if (pts.length < 2) continue;
-        const meta = parseArrayMeta(mz.framing_json ?? null);
-        const joistRafter = parseJoistRafterSettings(props?.framing_props_json ?? null);
-        members.push(
-          ...computeArrayMembers3D(pts, mmpp, meta, joistRafter, {
+    // The 3D scene is driven by the eye toggles (`visibleGroupIds3d`), not the 2D selection.
+    // A currently-selected group is rendered from its live overlay data (edits stay in sync);
+    // an eye-on group that isn't selected falls back to the snapshot loaded on demand into the
+    // 3D cache.
+    for (const gid of visibleGroupIds3d) {
+      const liveProps = groupProps[gid];
+      const props = liveProps ?? group3dCache[gid]?.props;
+      if (!props) continue;
+      const groupMeasurements = liveProps
+        ? overlayMeasurements.filter((m) => m.dimension_group_id === gid)
+        : group3dCache[gid]?.measurements ?? [];
+      for (const mz of groupMeasurements) {
+        if (mz.drawing_id !== activeDrawingId) continue;
+        if (mz.page_index !== pageIndex) continue;
+        let pts: { x: number; y: number }[];
+        try {
+          pts = JSON.parse(mz.geometry_json);
+        } catch {
+          continue;
+        }
+        if (!Array.isArray(pts) || pts.length < 1) continue;
+        const offsetM = props?.default_offset ?? 0;
+        const negative = (mz.polarity ?? 1) < 0;
+        const color = negative ? props?.neg_colour ?? "#FF0000" : props?.pos_colour ?? "#4A9EFF";
+        if (mz.measurement_type === "timber_framing") {
+          if (pts.length < 2) continue;
+          const settings = parseFramingSettings(props?.framing_props_json ?? null);
+          members.push(...offsetMembers(computeWall3D(pts, settings, mmpp, parseWallFraming(mz.framing_json)), offsetM));
+        } else if (mz.measurement_type === "count") {
+          const marker = computeCountMarker3D(pts[0], mmpp, {
+            widthM: props?.default_width ?? 0,
+            heightM: props?.default_height ?? 0,
+            countType: props?.count_type ?? "marker",
             offsetM,
             color,
-            pitchAngleDeg: props?.pitch_angle_deg ?? 0,
-          }),
-        );
-      } else if (isWallSurfaceType(mz.measurement_type)) {
-        const meta = parseWallSurfaceMeta(mz.framing_json);
-        members.push(
-          ...computeWallSurface3D(pts, mmpp, meta, {
-            // Inherited from the framing group that owns the source wall, not this group's datum.
-            offsetM: meta.sourceOffsetM,
-            color,
-            deductOpenings: wallSurfaceDeducts(meta, { framing_props_json: props?.framing_props_json ?? null }),
-            insulation: isWallInsulationType(mz.measurement_type),
-          }),
-        );
-      } else if (mz.measurement_type === "length") {
-        members.push(
-          ...computeLengthMembers3D(pts, mmpp, {
-            widthM: props?.default_width ?? 0,
+          });
+          if (marker) members.push(marker);
+        } else if (mz.measurement_type === "area") {
+          const pitch = resolvePitch(mz.framing_json, props?.pitch_angle_deg, props?.pitch_direction_deg);
+          const mesh = computeAreaMesh3D(pts, mmpp, {
             heightM: props?.default_height ?? 0,
             offsetM,
             color,
-            display: props?.default_display ?? "length",
-          }),
-        );
+            pitchAngleDeg: pitch.angleDeg,
+            pitchDirectionDeg: pitch.directionDeg,
+            pitchOrigin: pitch.origin,
+          });
+          if (mesh) areas.push(mesh);
+        } else if (mz.measurement_type === "array") {
+          if (pts.length < 2) continue;
+          const meta = parseArrayMeta(mz.framing_json ?? null);
+          const joistRafter = parseJoistRafterSettings(props?.framing_props_json ?? null);
+          members.push(
+            ...computeArrayMembers3D(pts, mmpp, meta, joistRafter, {
+              offsetM,
+              color,
+              pitchAngleDeg: props?.pitch_angle_deg ?? 0,
+            }),
+          );
+        } else if (isWallSurfaceType(mz.measurement_type)) {
+          const meta = parseWallSurfaceMeta(mz.framing_json);
+          members.push(
+            ...computeWallSurface3D(pts, mmpp, meta, {
+              // Inherited from the framing group that owns the source wall, not this group's datum.
+              offsetM: meta.sourceOffsetM,
+              color,
+              deductOpenings: wallSurfaceDeducts(meta, { framing_props_json: props?.framing_props_json ?? null }),
+              insulation: isWallInsulationType(mz.measurement_type),
+            }),
+          );
+        } else if (mz.measurement_type === "length") {
+          members.push(
+            ...computeLengthMembers3D(pts, mmpp, {
+              widthM: props?.default_width ?? 0,
+              heightM: props?.default_height ?? 0,
+              offsetM,
+              color,
+              display: props?.default_display ?? "length",
+            }),
+          );
+        }
       }
     }
     return { members3d: members, areas3d: areas };
-  }, [view3d, overlayMeasurements, groupProps, pageScale, pageIndex]);
+  }, [view3d, visibleGroupIds3d, group3dCache, overlayMeasurements, groupProps, pageScale, pageIndex, activeDrawingId]);
   // 3D scene pages for the multi-page view: each included page's measurement geometry, offset
   // along world Y by its configured Z-offset. The PDF page is never rendered as a ground
   // plane here — with no offset specified every page sits at world Y=0, so any ground
@@ -148,6 +173,10 @@ export function Viewer() {
         const areas: AreaMesh3D[] = [];
         for (const g of p.groups) {
           if (!g.included) continue;
+          // The eye toggles (`visibleGroupIds3d`) filter within the dialog's selection, so hiding a
+          // group in the sidebar drops it from the multi-page scene too — the same driver as the
+          // single-page view.
+          if (!visibleGroupIds3d.includes(g.groupId)) continue;
           const settings = parseFramingSettings(g.framingPropsJson);
           for (const mz of g.measurements) {
             let pts: { x: number; y: number }[];
@@ -223,7 +252,7 @@ export function Viewer() {
           showGround: false,
         };
       });
-  }, [view3d, view3dMulti, multiPage3DConfig]);
+  }, [view3d, view3dMulti, multiPage3DConfig, visibleGroupIds3d]);
 
   // Debug/QA: console-only export of the current page's timber-framing walls as a 2D
   // elevation PDF. Run `exportFramingElevations()` in devtools. Same action backs the

@@ -76,6 +76,102 @@ export interface PageScaleDto {
   unit: string;
 }
 
+/** Re-derive the wall-surface / insulation snapshots for `measurements` on one page against the
+ *  current framing there, persist any that drifted, and return the measurements with the fresh
+ *  snapshots merged in. This mirrors the surface half of `loadFramingSourceWalls`, but for a group
+ *  that is NOT the active selection — the "eye"-toggled 3D groups. `loadFramingSourceWalls` only
+ *  ever runs for the *active* wall-surface group, so a group shown in 3D on demand never gets
+ *  re-synced: its DB snapshot keeps a stale `sourceOffsetM` (Z datum) and the surfaces collapse to
+ *  Z≈0 in 3D. No-ops when nothing drifted (so a fresh snapshot is never needlessly rewritten). */
+async function resyncWallSurfacesOnPage(
+  measurements: MeasurementDto[],
+  drawingId: number,
+  pageIndex: number,
+  mmPerPoint: number | null,
+): Promise<MeasurementDto[]> {
+  const onPage = (m: MeasurementDto) =>
+    isWallSurfaceType(m.measurement_type) && m.drawing_id === drawingId && m.page_index === pageIndex;
+  if (!mmPerPoint || !measurements.some(onPage)) return measurements;
+
+  let walls: FramingSourceWallDto[];
+  try {
+    walls = await invoke<FramingSourceWallDto[]>("get_framing_walls_for_page", { drawingId, pageIndex });
+  } catch {
+    return measurements;
+  }
+  const byId = new Map(walls.map((w) => [w.measurement.id, w]));
+  const pocketCache = new Map<number, ReturnType<typeof wallInsulationPockets>>();
+  const pocketsFor = (source: FramingSourceWallDto, wallPoints: { x: number; y: number }[]) => {
+    const cached = pocketCache.get(source.measurement.id);
+    if (cached) return cached;
+    const built = wallInsulationPockets(
+      wallPoints,
+      parseFramingSettings(source.framing_props_json),
+      mmPerPoint,
+      parseWallFraming(source.measurement.framing_json),
+    );
+    pocketCache.set(source.measurement.id, built);
+    return built;
+  };
+
+  const updates: { id: number; framingJson: string; geometryJson: string | null }[] = [];
+  for (const surface of measurements) {
+    if (!onPage(surface)) continue;
+    const meta = parseWallSurfaceMeta(surface.framing_json);
+    const source = byId.get(meta.sourceMeasurementId);
+    if (!source) continue;
+    let wallPoints: { x: number; y: number }[];
+    try {
+      wallPoints = JSON.parse(source.measurement.geometry_json);
+    } catch {
+      continue;
+    }
+    if (!Array.isArray(wallPoints)) continue;
+    const fresh = buildWallSurfaceMeta(
+      source.measurement.id,
+      source.measurement.dimension_group_id,
+      wallPoints,
+      parseFramingSettings(source.framing_props_json),
+      mmPerPoint,
+      parseWallFraming(source.measurement.framing_json),
+      meta.side,
+      meta.deductOpenings,
+      source.group_offset_m,
+      wallSurfaceSpanOf(meta, wallPathLengthMm(wallPoints, mmPerPoint)),
+      pocketsFor(source, wallPoints),
+    );
+    if (!fresh || wallSurfaceMetaMatches(fresh, meta)) continue;
+    updates.push({
+      id: surface.id,
+      framingJson: serializeWallSurfaceMeta(fresh),
+      geometryJson: source.measurement.geometry_json !== surface.geometry_json ? source.measurement.geometry_json : null,
+    });
+  }
+  if (updates.length === 0) return measurements;
+
+  const saved = await Promise.all(
+    updates.map(async (update) => {
+      try {
+        const afterFraming = await invoke<MeasurementDto>("update_measurement_framing", {
+          measurementId: update.id,
+          framingJson: update.framingJson,
+        });
+        if (!update.geometryJson) return afterFraming;
+        return await invoke<MeasurementDto>("update_measurement_geometry", {
+          measurementId: update.id,
+          geometryJson: update.geometryJson,
+        });
+      } catch {
+        return null;
+      }
+    }),
+  );
+  const merged = new Map<number, MeasurementDto>();
+  for (const m of saved) if (m) merged.set(m.id, m);
+  if (merged.size === 0) return measurements;
+  return measurements.map((m) => merged.get(m.id) ?? m);
+}
+
 export interface PageMeta {
   index: number;
   width_pts: number;
@@ -362,6 +458,14 @@ interface AppStore {
   pitchDirectionResult: { axis: "x" | "y" | null; seq: number } | null;
   // Drawing ribbon: false = 2D plan view (default), true = 3D framing view.
   view3d: boolean;
+  // The dimension groups shown in the 3D view — the sole driver of 3D content, decoupled from
+  // 2D selection. The per-group eye toggle in the sidebar (only shown while `view3d` is on) adds
+  // and removes ids here. A view preference, not persisted; cleared when a project loads.
+  visibleGroupIds3d: number[];
+  // On-demand data for every group ever made 3D-visible this session — its measurements and CostX
+  // props, loaded independently of the 2D selection so a group can appear in 3D without being
+  // selected. Kept even after an eye is switched off, so re-showing is instant.
+  group3dCache: Record<number, { measurements: MeasurementDto[]; props: DimensionGroupPropsDto }>;
   // When true (and view3d is set), render the multi-page scene from `multiPage3DConfig`
   // instead of the current page's framing.
   view3dMulti: boolean;
@@ -415,6 +519,13 @@ interface AppStore {
   /** Called by the canvas when the pitch-direction drag commits (or Esc cancels with `null`). */
   resolvePitchDirectionPick: (axis: "x" | "y" | null) => void;
   setView3d: (on: boolean) => void;
+  /** Show or hide a dimension group in the 3D view. Loads its geometry on demand when shown, so a
+   *  group need not be selected in the 2D tree to appear in 3D. */
+  setGroup3dVisible: (groupId: number, visible: boolean) => Promise<void>;
+  /** Fold the current (enriched) overlay measurements + props into `group3dCache`, keeping the 3D
+   *  cache fresh for groups that later leave the 2D selection. Called while in 3D whenever the
+   *  overlay changes. */
+  refreshGroup3dCache: () => void;
   setView3dMulti: (on: boolean) => void;
   setMultiPage3DConfig: (config: MultiPage3DConfig | null) => void;
   setMultiPage3DDialogOpen: (open: boolean) => void;
@@ -857,6 +968,8 @@ export const useAppStore = create<AppStore>((set, get) => ({
   pitchDirectionMode: false,
   pitchDirectionResult: null,
   view3d: false,
+  visibleGroupIds3d: [],
+  group3dCache: {},
   view3dMulti: false,
   multiPage3DConfig: null,
   multiPage3DDialogOpen: false,
@@ -971,14 +1084,109 @@ export const useAppStore = create<AppStore>((set, get) => ({
   },
 
   setView3d: (on) => {
+    // The 3D visibility set (eye toggles) is seeded by `setView3dMulti` — from the 2D selection for
+    // the single-page view, from the config for the multi-page view — so it always reflects the mode
+    // being entered. `setView3d` just flips the master 3D flag; leaving 3D drops the set so the next
+    // entry starts clean (otherwise a multi-page set lingers and hides the next single-group view).
+    if (!on) {
+      set({ view3d: on, visibleGroupIds3d: [] });
+      return;
+    }
     set({ view3d: on });
   },
 
+  refreshGroup3dCache: () => {
+    // Fold every currently-loaded (selected) group's live, enriched measurements + props into the
+    // 3D cache. Called whenever the overlay changes while in 3D, so a group that later drops out of
+    // the 2D selection still renders in 3D from its latest snapshot — critically the re-synced
+    // wall-surface `sourceOffsetM` (Z datum), which `loadFramingSourceWalls` writes into the overlay
+    // asynchronously after selection. Without this the cached copy stays at the pre-sync datum and
+    // the surfaces collapse toward Z=0 the moment their group stops being the live one.
+    set((state) => {
+      const byGroup = new Map<number, MeasurementDto[]>();
+      for (const m of state.overlayMeasurements) {
+        const arr = byGroup.get(m.dimension_group_id);
+        if (arr) arr.push(m);
+        else byGroup.set(m.dimension_group_id, [m]);
+      }
+      const cache = { ...state.group3dCache };
+      for (const [gid, measurements] of byGroup) {
+        const props = state.groupProps[gid];
+        if (props) cache[gid] = { measurements, props };
+      }
+      return { group3dCache: cache };
+    });
+  },
+
+  setGroup3dVisible: async (groupId, visible) => {
+    if (!visible) {
+      set((state) => ({ visibleGroupIds3d: state.visibleGroupIds3d.filter((id) => id !== groupId) }));
+      return;
+    }
+    // Showing a group: load its geometry + props on demand if we haven't already this session,
+    // so a group can be added to the 3D scene without ever selecting it in the 2D tree.
+    if (!get().group3dCache[groupId]) {
+      try {
+        const [measurements, props] = await Promise.all([
+          invoke<MeasurementDto[]>("get_measurements_for_group", { groupId }),
+          invoke<DimensionGroupPropsDto>("get_dimension_group_props", { nodeId: groupId }),
+        ]);
+        // Re-sync this group's wall-surface / insulation snapshots against the current framing on
+        // the displayed page. An on-demand 3D group is never the active selection, so the normal
+        // re-sync (`loadFramingSourceWalls`) never touches it — without this its linings/insulation
+        // render at a stale Z datum and collapse to the ground plane.
+        const latest = get();
+        const enriched =
+          latest.activeDrawingId !== null
+            ? await resyncWallSurfacesOnPage(
+                measurements,
+                latest.activeDrawingId,
+                latest.activePageIndex,
+                latest.pageScale?.mm_per_point ?? null,
+              )
+            : measurements;
+        set((state) => ({ group3dCache: { ...state.group3dCache, [groupId]: { measurements: enriched, props } } }));
+      } catch {
+        return; // load failed — leave the group hidden rather than showing an empty entry
+      }
+    }
+    set((state) => ({
+      visibleGroupIds3d: state.visibleGroupIds3d.includes(groupId)
+        ? state.visibleGroupIds3d
+        : [...state.visibleGroupIds3d, groupId],
+    }));
+  },
+
   setView3dMulti: (on) => {
+    // Switching to the single-page view: reseed the eye set from the current 2D selection, so
+    // "View in 3D" always shows exactly what's selected and never a stale set carried over from the
+    // multi-page view (whose config groups would otherwise linger and hide the new selection). The
+    // multi-page case seeds its own set from the config in `setMultiPage3DConfig`, so leave it be.
+    if (!on) {
+      set((state) => ({ view3dMulti: on, visibleGroupIds3d: [...state.selectedGroupIds] }));
+      get().refreshGroup3dCache();
+      return;
+    }
     set({ view3dMulti: on });
   },
 
   setMultiPage3DConfig: (config) => {
+    // Seed the 3D visibility set (the eye toggles) from the config's included groups so the
+    // multi-page scene starts with everything the dialog selected shown. The eye buttons then
+    // filter within that set — the same driver as the single-page view. Union rather than replace,
+    // so a single-page eye selection isn't lost. Multi-page only ever renders config groups, so
+    // extra ids here are harmless there.
+    if (config) {
+      set((state) => {
+        const ids = new Set(state.visibleGroupIds3d);
+        for (const page of config.pages) {
+          if (!page.included) continue;
+          for (const g of page.groups) if (g.included) ids.add(g.groupId);
+        }
+        return { multiPage3DConfig: config, visibleGroupIds3d: Array.from(ids) };
+      });
+      return;
+    }
     set({ multiPage3DConfig: config });
   },
 
@@ -1293,6 +1501,8 @@ export const useAppStore = create<AppStore>((set, get) => ({
       openingPlacement: null,
       arrayTrimMode: false,
       view3d: false,
+      visibleGroupIds3d: [],
+      group3dCache: {},
       view3dMulti: false,
       multiPage3DConfig: null,
       multiPage3DDialogOpen: false,
@@ -1485,6 +1695,9 @@ export const useAppStore = create<AppStore>((set, get) => ({
         activeBreadcrumb: "",
         overlayMeasurements: [],
         overlayColour: "#4A9EFF",
+        // Drop the 3D visibility set + cache: a deleted group's geometry must not linger in 3D.
+        visibleGroupIds3d: [],
+        group3dCache: {},
         treeRevision: latest.treeRevision + 1,
       }));
       return;

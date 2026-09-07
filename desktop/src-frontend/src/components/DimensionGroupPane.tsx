@@ -25,7 +25,10 @@ import { RateLibraryPane } from "./RateLibraryPane";
 
 const tabs = ["Dimension Groups", "Rate Library"] as const;
 type PaneTab = (typeof tabs)[number];
-const gridColumns = "22px minmax(150px, 1fr) 72px 48px 26px";
+// The trailing column holds the colour swatch. In 3D view it also holds the per-group
+// show/hide-in-3D eye button to the swatch's right, so it widens to fit both.
+const gridColumnsFor = (view3d: boolean) =>
+  `22px minmax(150px, 1fr) 72px 48px ${view3d ? "52px" : "26px"}`;
 
 function findPath(nodes: TreeNodeDto[], targetId: number, childCache: Record<number, TreeNodeDto[]>, path: string[] = []): string[] | null {
   for (const node of nodes) {
@@ -148,6 +151,11 @@ function DimensionTreeRow({
   const childCache = useAppStore((state) => state.childCache);
   const loadChildren = useAppStore((state) => state.loadChildren);
   const treeRevision = useAppStore((state) => state.treeRevision);
+  const view3d = useAppStore((state) => state.view3d);
+  const visibleGroupIds3d = useAppStore((state) => state.visibleGroupIds3d);
+  const setGroup3dVisible = useAppStore((state) => state.setGroup3dVisible);
+  const gridColumns = gridColumnsFor(view3d);
+  const visibleIn3d = visibleGroupIds3d.includes(node.id);
   const children = childCache[node.id] ?? [];
   const canExpand = isFolder && (node.has_children || children.length > 0);
   const isActive = activeNodeId === node.id || selectedGroupIds.includes(node.id);
@@ -253,9 +261,34 @@ function DimensionTreeRow({
         </div>
         <div style={{ paddingRight: 8, textAlign: "right", color: theme.text.primary }}>{summary.quantity}</div>
         <div style={{ paddingLeft: 6, color: theme.text.primary }}>{summary.uom}</div>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "center" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 4 }}>
           {node.node_type === "dimension_group" ? (
             <span style={{ width: 16, height: 16, background: node.colour ?? theme.accent, border: `1px solid ${theme.border.divider}` }} />
+          ) : null}
+          {view3d && node.node_type === "dimension_group" ? (
+            <button
+              onClick={(event) => {
+                event.stopPropagation();
+                void setGroup3dVisible(node.id, !visibleIn3d);
+              }}
+              title={visibleIn3d ? "Hide in 3D" : "Show in 3D"}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                width: 18,
+                height: 18,
+                padding: 0,
+                border: "none",
+                background: "transparent",
+                cursor: "pointer",
+                color: visibleIn3d ? theme.iconAccent : theme.text.disabled,
+              }}
+            >
+              <span className="material-symbols-outlined" style={{ fontSize: 16, lineHeight: 1 }}>
+                {visibleIn3d ? "visibility" : "visibility_off"}
+              </span>
+            </button>
           ) : null}
         </div>
       </div>
@@ -343,6 +376,7 @@ export function DimensionGroupPane() {
   const selectDimensionGroup = useAppStore((state) => state.selectDimensionGroup);
   const activeDimensionGroupId = useAppStore((state) => state.activeDimensionGroupId);
   const selectedGroupIds = useAppStore((state) => state.selectedGroupIds);
+  const paneView3d = useAppStore((state) => state.view3d);
   const activeBreadcrumb = useAppStore((state) => state.activeBreadcrumb);
   const overlayMeasurements = useAppStore((state) => state.overlayMeasurements);
   const overlayColour = useAppStore((state) => state.overlayColour);
@@ -810,7 +844,7 @@ export function DimensionGroupPane() {
           Add Folder
         </button>
       </div>
-      <div style={{ display: "grid", gridTemplateColumns: gridColumns, minWidth: 360, height: 24, borderBottom: `1px solid ${theme.border.subtle}`, background: theme.bg.shell, color: theme.text.primary, fontSize: 12 }}>
+      <div style={{ display: "grid", gridTemplateColumns: gridColumnsFor(paneView3d), minWidth: 360, height: 24, borderBottom: `1px solid ${theme.border.subtle}`, background: theme.bg.shell, color: theme.text.primary, fontSize: 12 }}>
         <div style={{ borderRight: `1px solid ${theme.border.subtle}` }} />
         <div style={{ display: "flex", alignItems: "center", padding: "0 6px", borderRight: `1px solid ${theme.border.subtle}` }}>
           <span>Name</span>
