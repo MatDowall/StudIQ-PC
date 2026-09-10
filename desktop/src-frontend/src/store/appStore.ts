@@ -252,6 +252,8 @@ export interface WorkbookRevisionDto {
   project_total: number | null;
   /** Per-workbook column layout (M2) as JSON, or null for the shipped default layout. */
   layout_json: string | null;
+  /** Calculation engine version (M4): 1 = legacy baked rollups, 2 = declarative formulas. */
+  engine_version: number;
 }
 
 export interface WorkbookDto {
@@ -612,6 +614,8 @@ interface AppStore {
   setWorkbookRevisionProjectTotal: (revisionId: number, total: number | null) => Promise<void>;
   /** Persist a revision's column layout (M2). `layoutJson` is null to reset to the default. */
   saveWorkbookLayout: (revisionId: number, layoutJson: string | null) => Promise<void>;
+  /** Set a revision's calculation engine version (M4): 1 = legacy, 2 = declarative. */
+  saveWorkbookEngineVersion: (revisionId: number, version: number) => Promise<void>;
 
   openColumnLayoutManager: () => void;
   closeColumnLayoutManager: () => void;
@@ -2310,6 +2314,18 @@ export const useAppStore = create<AppStore>((set, get) => ({
       })),
     }));
     await invoke("save_workbook_layout", { revisionId, layoutJson });
+  },
+
+  saveWorkbookEngineVersion: async (revisionId, version) => {
+    set((state) => ({
+      workbooks: state.workbooks.map((wb) => ({
+        ...wb,
+        revisions: wb.revisions.map((rev) =>
+          rev.id === revisionId ? { ...rev, engine_version: version } : rev,
+        ),
+      })),
+    }));
+    await invoke("save_workbook_engine_version", { revisionId, version });
   },
 
   loadTemplates: async () => {

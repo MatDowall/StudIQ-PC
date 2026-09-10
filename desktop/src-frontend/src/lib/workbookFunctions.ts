@@ -27,7 +27,9 @@ const MAX_CHILD_ROWS = 1000; // upper bound when summing a child column (sheets 
 
 type ChildKind = "R" | "Q"; // rate/cost build-up vs quantity build-up
 
-/** Rounds to `dp` decimals (CostX's XSUM* second/last argument), or returns the raw sum for dp<0. */
+/** Rounds to `dp` decimals (CostX's XSUM* second/last argument). When `dp` is omitted (NaN) or
+ *  negative, returns the raw sum unrounded — this is what the v1→v2 upgrade emits (`=XSUMTOT()`)
+ *  so the declarative value matches the full-precision literal drillUp used to bake in. */
 function roundTo(value: number, dp: number): number {
   if (!isFinite(dp) || dp < 0) return value;
   const f = Math.pow(10, Math.floor(dp));
@@ -57,8 +59,9 @@ export class WorkbookFunctionsPlugin extends FunctionPlugin {
   }
 
   /** dp argument: the first arg for XSUMTOT/XSUMRATE/XSUMQTY/XSUMTOTQTY, the SECOND for the
-   *  *USER variants (first there is the 1-based user-column number). */
-  private argNum(state: any, ast: any, index: number, fallback = 0): number {
+   *  *USER variants (first there is the 1-based user-column number). Defaults to NaN so an omitted
+   *  `dp` means "no rounding" (see roundTo). */
+  private argNum(state: any, ast: any, index: number, fallback = NaN): number {
     if (!ast.args || ast.args.length <= index) return fallback;
     const v = (this as any).evaluateAst(ast.args[index], state);
     const n = typeof v === "number" ? v : Number(v);
@@ -91,7 +94,9 @@ export class WorkbookFunctionsPlugin extends FunctionPlugin {
   }
 }
 
-const NUM_OPT = { argumentType: FunctionArgumentType.NUMBER, optionalArg: true, defaultValue: 0 };
+// dp parameter: optional, and deliberately NO defaultValue — an omitted dp must reach the method
+// as "absent" (ast.args.length check) so it means "no rounding", not "round to 0".
+const NUM_OPT = { argumentType: FunctionArgumentType.NUMBER, optionalArg: true };
 
 (WorkbookFunctionsPlugin as any).implementedFunctions = {
   XSUMTOT:     { method: "xsumtot",     isVolatile: true, parameters: [NUM_OPT] },

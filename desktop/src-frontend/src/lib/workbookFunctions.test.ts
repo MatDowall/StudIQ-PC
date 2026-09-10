@@ -29,6 +29,18 @@ describe("XSUMTOT / XSUMTOTQTY / XSUMUSER — cost sub-sheet (/R)", () => {
     expect(eng.getCellValue("L1", 0, COL_SUBTOTAL)).toBeCloseTo(350.13, 10);
   });
 
+  it("XSUMTOT() with no dp returns the UNROUNDED sum (what the upgrade emits)", () => {
+    const eng = new WorkbookEngine();
+    const child = sheet(2);
+    child[0][COL_TOTAL] = "100.126"; child[1][COL_TOTAL] = "0.007";
+    eng.loadAll([{ path: "L1", data: sheet(1) }, { path: "L1/R0", data: child }]);
+    const parent = sheet(1);
+    parent[0][COL_SUBTOTAL] = "=XSUMTOT()";
+    eng.setSheet("L1", parent);
+    expect(eng.getCellValue("L1", 0, COL_SUBTOTAL)).toBeCloseTo(100.133, 10); // not rounded to 100
+    eng.destroy();
+  });
+
   it("XSUMTOTQTY sums the child's C (Quantity) column", () => {
     const eng = new WorkbookEngine();
     const child = sheet(2);

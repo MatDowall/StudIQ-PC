@@ -520,6 +520,8 @@ pub struct WorkbookRevisionDto {
     pub project_total: Option<f64>,
     /// Per-workbook column layout (M2) as JSON, or NULL for the shipped default layout.
     pub layout_json: Option<String>,
+    /// Calculation engine version (M4): 1 = legacy baked rollups, 2 = declarative formulas.
+    pub engine_version: i64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -2778,6 +2780,24 @@ async fn save_workbook_layout(
     Ok(())
 }
 
+/// Set a revision's calculation engine version (M4): 1 = legacy baked rollups, 2 = declarative.
+/// Written by the opt-in upgrade only after its equivalence gate passes.
+#[tauri::command]
+async fn save_workbook_engine_version(
+    state: State<'_, AppState>,
+    revision_id: i64,
+    version: i64,
+) -> Result<(), String> {
+    let db = active_project_db(state.inner())?;
+    sqlx::query("UPDATE workbook_revisions SET engine_version = ? WHERE id = ?")
+        .bind(version)
+        .bind(revision_id)
+        .execute(&db)
+        .await
+        .map_err(|e| format!("Failed to save engine version: {e}"))?;
+    Ok(())
+}
+
 /// Create or update a named cell — a workbook-wide name bound to a single cell
 /// (identified by sheet path + row/col) that can be referenced from formulas at
 /// any level. Names are unique per revision; saving an existing name moves it.
@@ -2949,7 +2969,7 @@ async fn list_workbooks(state: State<'_, AppState>) -> Result<Vec<WorkbookDto>, 
         let wb_name: String = wb_row.try_get("name").map_err(|e| e.to_string())?;
 
         let rev_rows = sqlx::query(
-            "SELECT id, workbook_id, name, created_at, sort_order, project_total, layout_json \
+            "SELECT id, workbook_id, name, created_at, sort_order, project_total, layout_json, engine_version \
              FROM workbook_revisions WHERE workbook_id = ? ORDER BY sort_order, id",
         )
         .bind(wb_id)
@@ -2977,6 +2997,9 @@ async fn list_workbooks(state: State<'_, AppState>) -> Result<Vec<WorkbookDto>, 
                         .map_err(|e: sqlx::Error| e.to_string())?,
                     layout_json: row
                         .try_get("layout_json")
+                        .map_err(|e: sqlx::Error| e.to_string())?,
+                    engine_version: row
+                        .try_get("engine_version")
                         .map_err(|e: sqlx::Error| e.to_string())?,
                 })
             })
@@ -3049,6 +3072,7 @@ async fn create_workbook_revision(
         sort_order,
         project_total: None,
         layout_json: None,
+        engine_version: 1,
     })
 }
 
@@ -3242,6 +3266,7 @@ async fn create_workbook_revision_from_template(
         sort_order,
         project_total: None,
         layout_json: None,
+        engine_version: 1,
     })
 }
 
@@ -3447,6 +3472,7 @@ async fn copy_workbook_revision(
         sort_order,
         project_total: None,
         layout_json: None,
+        engine_version: 1,
     })
 }
 
@@ -4695,6 +4721,14 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), String> {
     // Additive: per-workbook column layout (M2) as JSON. NULL = the shipped default layout,
     // so every pre-existing revision is already correct with no backfill.
     let _ = sqlx::query("ALTER TABLE workbook_revisions ADD COLUMN layout_json TEXT")
+        .execute(pool)
+        .await;
+
+    // Additive: workbook calculation engine version (M4). 1 = legacy baked-literal rollups
+    // (drillUp writes numbers); 2 = declarative (parent cells hold SUM/XSUM formulas that read
+    // their child live). Default 1 so every existing workbook stays on the proven path until
+    // it is explicitly, verifiably upgraded.
+    let _ = sqlx::query("ALTER TABLE workbook_revisions ADD COLUMN engine_version INTEGER NOT NULL DEFAULT 1")
         .execute(pool)
         .await;
 
@@ -6091,6 +6125,7 @@ pub fn run() {
             load_workbook_named_cells,
             save_workbook_project_total,
             save_workbook_layout,
+            save_workbook_engine_version,
             delete_workbook_sheet_subtree,
             clear_workbook_revision_data,
             list_workbooks,
