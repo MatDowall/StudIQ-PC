@@ -27,6 +27,14 @@ import {
   deriveLinkedQuantity,
   type GroupImportContext,
 } from "../lib/groupImport";
+import {
+  COL_CODE, COL_DESC, COL_QTY, COL_UNIT, COL_RATE, COL_SUBTOTAL, COL_FACTOR, COL_TOTAL,
+  COL_LAB, COL_LAB_TOTAL, COL_MAT, COL_MAT_TOTAL, COL_SUB, COL_SUB_TOTAL, COL_SUM, COL_SUM_TOTAL,
+  COL_COUNT, COL_LENGTH, COL_WIDTH, COL_HEIGHT,
+  qtyTotalFormula, toNum, numOrUndefined, textOrBlank, sumComputedCol,
+  rollupRateIntoL2, rollupQtyIntoL2, rollupL2IntoL1, deriveFactorTotal,
+} from "../lib/workbookCalc";
+import { WorkbookEngine } from "../lib/workbookEngine";
 
 registerAllModules();
 
@@ -104,22 +112,9 @@ const COL_GROWTH_THRESHOLD = 2;  // grow once an edit lands within this many col
 let NUM_ROWS = 100;
 const ROW_GROWTH_CHUNK     = 50;
 const ROW_GROWTH_THRESHOLD = 5;  // grow once an edit lands within this many rows of the bottom
-const COL_SUBTOTAL = 5;                // F – drillable at Level 1
-const COL_TOTAL    = 7;                // H – yellow highlight only
-const COL_RATE     = 4;                // E – drillable at Level 2
-const COL_QTY      = 2;                // C
-const COL_FACTOR   = 6;                // G
-const COL_LAB       = 8;               // I  – pulled through from rate build-up
-const COL_LAB_TOTAL = 9;               // J  = I×C
-const COL_MAT       = 10;              // K  – pulled through from rate build-up
-const COL_MAT_TOTAL = 11;              // L  = K×C
-const COL_SUB       = 12;              // M  – pulled through from rate build-up
-const COL_SUB_TOTAL = 13;              // N  = M×C
-const COL_SUM       = 14;              // O  – pulled through from rate build-up
-const COL_SUM_TOTAL = 15;              // P  = O×C
-const COL_CODE     = 0;                // A – used to detect "empty" / cleared line items
-const COL_DESC     = 1;                // B – used to detect "empty" / cleared line items
-const COL_UNIT     = 3;                // D – populated alongside C on dimension-group import
+// Column indices (COL_*), the pure rollup arithmetic, and the numeric-coercion helpers all
+// live in lib/workbookCalc.ts so they can be unit-tested apart from this component — imported
+// at the top of this file. Keep referencing them by the same names here.
 // Reserved named-cell name: the single L1/H:Total cell a workbook author
 // designates as the project grand total (its resolved value is cached on the
 // revision via setWorkbookRevisionProjectTotal for the workbook sidebar).
@@ -169,12 +164,6 @@ function buildColWidths(base: readonly { width: number }[], numCols: number): nu
   return widths;
 }
 
-// Quantity Build-up sheets reuse the same column *indices* with different A–H meanings:
-// C=Count, D=Length, E=Width, F=Height, G=Factor (still index 6), H=Quantity (still index 7).
-const COL_COUNT  = 2;                  // C
-const COL_LENGTH = 3;                  // D
-const COL_WIDTH  = 4;                  // E
-const COL_HEIGHT = 5;                  // F
 
 // Numeric value columns — everything except Code/Description/Unit, which hold
 // text. These are displayed to a fixed number of decimal places with 1000's
@@ -453,17 +442,6 @@ function padColsTo(data: (string | null)[][], cols: number): (string | null)[][]
  * explicit empty string tells it to clear the cell. This prevents stale formulas from
  * one level leaking into another when the same sheet is reused across drill levels.
  */
-/**
- * Quantity Build-up H:Quantity formula for row `r` (0-based): C×D×E×F×G, via PRODUCT()
- * rather than `*` — PRODUCT ignores blank cells (same convention as SUM/AVERAGE) instead
- * of coercing them to 0, so leaving e.g. Width/Height unused doesn't zero out a row that
- * only needs Count×Length.
- */
-function qtyTotalFormula(r: number): string {
-  const row = r + 1;
-  return `=PRODUCT(C${row},D${row},E${row},F${row},G${row})`;
-}
-
 function dataForHot(data: (string | null)[][]): string[][] {
   return data.map(row => row.map(cell => cell ?? ""));
 }
@@ -872,21 +850,6 @@ function pathLastRow(path: string): number | null {
 }
 
 /**
- * Sum a column from Handsontable's computed (evaluated) data, skipping non-numeric cells.
- * Returns null when no numeric data is present (child sheet is blank).
- */
-function sumComputedCol(computedData: unknown[][], colIndex: number): number | null {
-  let total = 0;
-  let hasData = false;
-  for (const row of computedData) {
-    const v = (row as unknown[])[colIndex];
-    const n = typeof v === "number" ? v : typeof v === "string" && v !== "" ? parseFloat(v) : NaN;
-    if (isFinite(n)) { total += n; hasData = true; }
-  }
-  return hasData ? total : null;
-}
-
-/**
  * Evaluates a sheet's raw source rows (formula strings and all) in a standalone,
  * throwaway HyperFormula instance — needed to roll up a freshly-cloned Rate
  * Build-up sheet's Lab/Mat/Sub/Sum columns live, right after the clone is written
@@ -930,93 +893,9 @@ function evaluateWithNames(data: (string | null)[][], namedValues: Map<string, u
   }
 }
 
-/** Rolls a Rate Build-up sheet's evaluated H:Total (and Lab/Mat/Sub/Sum pull-through)
- *  into its Level-2 parent row's E:Rate / I,K,M,O / J,L,N,P — the same aggregation
- *  `drillUp` applies when leaving a Level-3 rate sheet. Shared so `recalculateWorkbook`
- *  can apply identical rollups without the user physically drilling through every row. */
-function rollupRateIntoL2(
-  parentData: (string | null)[][],
-  rowInParent: number,
-  computed: unknown[][],
-  excluded: (col: number) => boolean,
-): void {
-  const sumH = sumComputedCol(computed, COL_TOTAL);
-  // An empty Rate Build-up sheet (no rows → sumH === null) must NOT overwrite a
-  // rate the user entered directly on the parent row. Empty sub-sheets are orphans
-  // left behind by drilling into an E:Rate cell without building anything up;
-  // rolling their "null" total into E would wipe a real rate and zero the row.
-  // Treat "no build-up content" as "no rollup at all" and leave the cell as-is.
-  if (sumH === null) return;
-  if (!excluded(COL_RATE)) parentData[rowInParent][COL_RATE] = String(sumH);
-  const pullThroughCols: Array<[number, number]> = [
-    [COL_LAB, COL_LAB_TOTAL],
-    [COL_MAT, COL_MAT_TOTAL],
-    [COL_SUB, COL_SUB_TOTAL],
-    [COL_SUM, COL_SUM_TOTAL],
-  ];
-  for (const [src, total] of pullThroughCols) {
-    const s = sumComputedCol(computed, src);
-    if (!excluded(src)) parentData[rowInParent][src] = s !== null ? String(s) : null;
-    if (!excluded(total)) {
-      parentData[rowInParent][total] =
-        (s !== null) ? `=${COLUMNS[src].letter}${rowInParent + 1}*C${rowInParent + 1}` : null;
-    }
-  }
-}
-
-/** Rolls a Quantity Build-up sheet's evaluated H:Quantity into its Level-2 parent
- *  row's C:Quantity — mirrors `drillUp`'s "leaving a Quantity Build-up sheet" branch. */
-function rollupQtyIntoL2(
-  parentData: (string | null)[][],
-  rowInParent: number,
-  computed: unknown[][],
-  excluded: (col: number) => boolean,
-): void {
-  const sumH = sumComputedCol(computed, COL_TOTAL);
-  // Same guard as rollupRateIntoL2: an empty Quantity Build-up sheet must not wipe
-  // a quantity entered directly on the parent row (which would zero the whole row's
-  // Subtotal/Total). See the comment there — empty orphan sub-sheets are common.
-  if (sumH === null) return;
-  if (!excluded(COL_QTY)) parentData[rowInParent][COL_QTY] = String(sumH);
-}
-
-/** Rolls a Level-2 sheet's evaluated H:Total (and …-Total pull-throughs) into its
- *  Level-1 parent row's F:Subtotal / J,L,N,P — mirrors `drillUp`'s "leaving Level 2"
- *  branch. */
-function rollupL2IntoL1(
-  parentData: (string | null)[][],
-  rowInParent: number,
-  computed: unknown[][],
-  excluded: (col: number) => boolean,
-): void {
-  const sumH = sumComputedCol(computed, COL_TOTAL);
-  if (!excluded(COL_SUBTOTAL)) parentData[rowInParent][COL_SUBTOTAL] = sumH !== null ? String(sumH) : null;
-  for (const total of [COL_LAB_TOTAL, COL_MAT_TOTAL, COL_SUB_TOTAL, COL_SUM_TOTAL]) {
-    if (excluded(total)) continue;
-    const s = sumComputedCol(computed, total);
-    parentData[rowInParent][total] = s !== null ? String(s) : null;
-  }
-}
-
-/** Coerce a cell value (number, numeric string, formula string, null) to a finite number, defaulting to 0. */
-function toNum(v: unknown): number {
-  if (typeof v === "number") return isFinite(v) ? v : 0;
-  if (typeof v === "string" && v !== "") { const n = parseFloat(v); if (isFinite(n)) return n; }
-  return 0;
-}
-
-/** Coerce an *evaluated* cell value to a number, or `undefined` if the cell is blank —
- *  used by the Excel flatten-export so empty cells stay empty rather than rendering as 0. */
-function numOrUndefined(v: unknown): number | undefined {
-  if (v == null || v === "") return undefined;
-  const n = typeof v === "number" ? v : parseFloat(String(v));
-  return isFinite(n) ? n : undefined;
-}
-
-/** Coerce an evaluated cell value to display text, or "" if blank. */
-function textOrBlank(v: unknown): string {
-  return v != null && v !== "" ? String(v) : "";
-}
+// The three rollup helpers (rollupRateIntoL2 / rollupQtyIntoL2 / rollupL2IntoL1) and the
+// numeric-coercion helpers (toNum / numOrUndefined / textOrBlank) live in lib/workbookCalc.ts
+// — imported at the top of this file.
 
 /** Looks up a named cell's resolved value by name, case-insensitively — named cells
  *  are user-created and their casing isn't enforced, but the cost-code export's
@@ -1055,18 +934,7 @@ interface FlatExportRow {
   rowKind?: "header" | "footer";
 }
 
-/** Applies the same Factor/Total defaulting `deriveLevelFormulas` (pass 2) applies live in the
- *  grid — auto-populate Factor=1 the first time Subtotal is positive and Factor is blank, and
- *  derive Total=Subtotal×Factor when Total itself is blank. A persisted L1 row's G/H are only
- *  ever written this way when the sheet has actually been displayed in the grid (recalculateWorkbook's
- *  rollupL2IntoL1 deliberately leaves them alone), so the export — which reads straight from
- *  SQLite — must re-apply the same default or Factor/Total show blank despite Subtotal being set. */
-function deriveFactorTotal(subtotal: number | undefined, factor: number | undefined, total: number | undefined): { factor?: number; total?: number } {
-  if (subtotal == null) return { factor, total };
-  if (factor == null && subtotal > 0) factor = 1;
-  if (total == null) total = subtotal * (factor ?? 0);
-  return { factor, total };
-}
+// deriveFactorTotal lives in lib/workbookCalc.ts — imported at the top of this file.
 
 /** Build one flattened export row from an evaluated sheet row (see `evaluateClonedRows`). */
 function flatExportRowFrom(evaluated: unknown[], sectionCode: string, sectionDesc: string): FlatExportRow {
@@ -1417,6 +1285,15 @@ export function WorkbookView() {
   const sheetComputedMap = useRef<Map<string, unknown[][]>>(new Map());
   const pathStack = useRef<string[]>(["L1"]);
 
+  // ── Shadow multi-sheet engine (M1, read-only) ────────────────────────────
+  // A full multi-sheet WorkbookEngine built alongside the live single-"Sheet1" grid and kept in
+  // sync as sheets persist, but NOT yet driving the grid — nothing reads from it, so it cannot
+  // affect correctness. Its purpose is to exercise the multi-sheet engine on real workbooks and
+  // let open-time / memory be measured (window.__wbShadow()) before the switchSheet cutover. Built
+  // in its own effect (below) so it is entirely additive to the working load path.
+  const shadowEngineRef = useRef<WorkbookEngine | null>(null);
+  const shadowStatsRef = useRef<{ sheets: number; buildMs: number } | null>(null);
+
   // Per-sheet, per-cell text formatting applied via the Format toolbar
   // (font/size/bold/italic/underline/alignment/decimal places). Persisted to SQLite
   // alongside sheet data — see persistSheet / ensureSheetStylesLoaded — and keyed
@@ -1449,28 +1326,6 @@ export function WorkbookView() {
   const namedCellMap = useRef<Map<string, NamedCell>>(new Map());
   const registeredNamedExprRef = useRef<Set<string>>(new Set());
   const [namedCellDialog, setNamedCellDialog] = useState<{ row: number; col: number } | null>(null);
-
-  // TEMP DEBUG: window.__ncDump() dumps every named cell's bound path + engine
-  // formula + resolved value, plus the current sheet path. Remove once the
-  // cross-sheet named-cell bug is resolved.
-  useEffect(() => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (window as any).__ncDump = () => {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const hf = (hotRef.current?.hotInstance?.getPlugin('formulas') as any)?.engine;
-      const out: Record<string, unknown> = { curSheetPath: pathStack.current[pathStack.current.length - 1] };
-      for (const n of namedCellMap.current.values()) {
-        out[n.name] = {
-          boundPath: n.path, row: n.row, col: n.col,
-          formula: (() => { try { return hf?.getNamedExpression(n.name)?.expression; } catch { return "ERR"; } })(),
-          value: (() => { try { return hf?.getNamedExpressionValue(n.name); } catch { return "ERR"; } })(),
-        };
-      }
-      // eslint-disable-next-line no-console
-      console.log("[NC] dump", JSON.parse(JSON.stringify(out)));
-      return out;
-    };
-  }, []);
   const namedCellsManagerOpen    = useAppStore(s => s.namedCellsManagerOpen);
   const closeNamedCellsManager   = useAppStore(s => s.closeNamedCellsManager);
 
@@ -1601,8 +1456,6 @@ export function WorkbookView() {
       catch { /* invalid expression text — leave the name unregistered */ }
     }
     const resolved = (() => { try { return hf.getNamedExpressionValue(nc.name); } catch { return "ERR"; } })();
-    // eslint-disable-next-line no-console
-    console.log("[NC] reg", nc.name, "bound=", nc.path, "cur=", curSheetPath(), "formula=", formula, "->", resolved);
 
     // Cache PROJECT_TOTAL's resolved value on the revision so the workbook
     // sidebar can show it without re-evaluating formulas itself.
@@ -2647,6 +2500,10 @@ export function WorkbookView() {
       dataJson: JSON.stringify(data),
     }).catch(() => {/* non-fatal */});
 
+    // Keep the read-only shadow engine (M1) in step with what's persisted, so it stays a faithful
+    // rehearsal of the eventual multi-sheet cutover. Best-effort; never affects the grid.
+    try { shadowEngineRef.current?.setSheet(path, data); } catch { /* shadow only */ }
+
     const links = cellLinkMap.current.get(path);
     invoke("save_workbook_sheet_links", {
       revisionId,
@@ -3335,6 +3192,79 @@ export function WorkbookView() {
       })
       .catch(() => { /* non-fatal — workbook simply has no named cells yet */ });
   }, [activeRevisionId]);
+
+  // Build the read-only shadow engine for the active revision (see shadowEngineRef above).
+  // Entirely additive: best-effort, never touches the grid, tears down the previous engine.
+  useEffect(() => {
+    const revId = activeRevisionId;
+    shadowEngineRef.current?.destroy();
+    shadowEngineRef.current = null;
+    shadowStatsRef.current = null;
+    if (revId == null) return;
+    let cancelled = false;
+    invoke<string>("load_workbook_all_sheets", { revisionId: revId })
+      .then(json => {
+        if (cancelled) return;
+        let sheets: { path: string; data: (string | null)[][] }[];
+        try { sheets = JSON.parse(json) as typeof sheets; } catch { sheets = []; }
+        const t0 = performance.now();
+        const eng = new WorkbookEngine();
+        if (!sheets.some(s => s.path === "L1")) eng.addSheet("L1"); // brand-new revision
+        for (const s of sheets) eng.setSheet(s.path, Array.isArray(s.data) ? s.data : []);
+        const buildMs = performance.now() - t0;
+        if (cancelled) { eng.destroy(); return; }
+        shadowEngineRef.current = eng;
+        shadowStatsRef.current = { sheets: eng.paths().length, buildMs };
+      })
+      .catch(() => { /* shadow is best-effort — a failure never affects the grid */ });
+    return () => {
+      cancelled = true;
+      shadowEngineRef.current?.destroy();
+      shadowEngineRef.current = null;
+      shadowStatsRef.current = null;
+    };
+  }, [activeRevisionId]);
+
+  // On-demand diagnostic: window.__wbShadow() reports the shadow engine's build stats and, for
+  // the sheet currently on screen, a numeric diff of the shadow's evaluated values against the
+  // live grid's — the "does the multi-sheet engine agree?" check, run by hand rather than as
+  // always-on console spam. Named cells are registered into the shadow lazily here so the
+  // comparison is apples-to-apples. Removed on unmount.
+  useEffect(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (window as any).__wbShadow = () => {
+      const eng = shadowEngineRef.current;
+      const stats = shadowStatsRef.current;
+      if (!eng || !stats) return { ready: false };
+      const hot = hotRef.current?.hotInstance;
+      const curPath = pathStack.current[pathStack.current.length - 1];
+      // Feed the current grid's source (incl. unflushed edits) into the shadow so the compare
+      // is source-for-source, then register named cells so name-referencing formulas resolve.
+      if (hot) { try { eng.setSheet(curPath, captureSourceData(hot)); } catch { /* ignore */ } }
+      for (const nc of namedCellMap.current.values()) {
+        try { eng.setNamedCellRef(nc.name, nc.path, nc.row, nc.col); } catch { /* ignore */ }
+      }
+      const gridComputed = hot ? getEvaluatedGridData(hot) : [];
+      const shadowComputed = eng.getEvaluatedSheet(curPath);
+      let diffs = 0;
+      const samples: Array<{ cell: string; grid: unknown; shadow: unknown }> = [];
+      for (let r = 0; r < gridComputed.length; r++) {
+        const cols = gridComputed[r]?.length ?? 0;
+        for (let c = 0; c < cols; c++) {
+          const g = gridComputed[r][c];
+          const s = shadowComputed[r]?.[c];
+          const gn = typeof g === "number" ? g : NaN;
+          const sn = typeof s === "number" ? s : NaN;
+          const equal = (isFinite(gn) && isFinite(sn))
+            ? Math.abs(gn - sn) < 1e-9
+            : String(g ?? "") === String(s ?? "");
+          if (!equal) { diffs++; if (samples.length < 20) samples.push({ cell: `${colLetter(c)}${r + 1}`, grid: g, shadow: s }); }
+        }
+      }
+      return { ready: true, sheets: stats.sheets, buildMs: Math.round(stats.buildMs), curPath, diffs, samples };
+    };
+    return () => { try { delete (window as unknown as Record<string, unknown>).__wbShadow; } catch { /* ignore */ } };
+  }, []);
 
   // Track grid-container resize to drive Handsontable height
   useEffect(() => {

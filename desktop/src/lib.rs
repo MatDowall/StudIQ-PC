@@ -2565,6 +2565,46 @@ async fn load_workbook_sheet(
     Ok(row.unwrap_or_else(|| "[]".to_string()))
 }
 
+/// Load EVERY sheet of a revision in one round trip — returns a JSON array of
+/// `{ "path": <sheet_path>, "data": <data_json parsed> }` objects. The multi-sheet
+/// workbook engine (M1) needs the whole revision at once to seed one HyperFormula
+/// instance, and nothing else could even enumerate a revision's sheet paths before
+/// this. `data_json` is embedded as parsed JSON (not a string) so the frontend gets
+/// one parse of the outer array rather than N nested `JSON.parse` calls.
+#[tauri::command]
+async fn load_workbook_all_sheets(
+    state: State<'_, AppState>,
+    revision_id: i64,
+) -> Result<String, String> {
+    let db = active_project_db(state.inner())?;
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT sheet_path, data_json FROM workbook_sheet_data WHERE revision_id = ? ORDER BY sheet_path",
+    )
+    .bind(revision_id)
+    .fetch_all(&db)
+    .await
+    .map_err(|e| format!("Failed to load workbook sheets: {e}"))?;
+
+    // Build the JSON by hand so each row's stored `data_json` (already valid JSON)
+    // is embedded verbatim rather than re-serialized as a quoted string.
+    let mut out = String::from("[");
+    for (i, (path, data_json)) in rows.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let path_lit = serde_json::to_string(path)
+            .map_err(|e| format!("Failed to encode sheet path: {e}"))?;
+        let data = if data_json.trim().is_empty() { "[]" } else { data_json.as_str() };
+        out.push_str("{\"path\":");
+        out.push_str(&path_lit);
+        out.push_str(",\"data\":");
+        out.push_str(data);
+        out.push('}');
+    }
+    out.push(']');
+    Ok(out)
+}
+
 /// Persist the dimension-group cell-link map for one sheet (identified by
 /// revision + path). `links_json` is a JSON object keyed by "row,col".
 #[tauri::command]
@@ -3559,8 +3599,9 @@ async fn delete_template(template_id: i64, state: State<'_, AppState>) -> Result
         return Err(format!("Template {template_id} not found"));
     };
 
-    // Deletes the templates row (and cascades workbook_items / workbook_sheet_data
-    // for the backing revision) when its revision is removed.
+    // Deletes the templates row (and cascades the backing revision's sheet blobs
+    // in workbook_sheet_data / _links / _styles / _exclusions / _named_cells) when
+    // its revision is removed.
     sqlx::query("DELETE FROM workbook_revisions WHERE id = ?")
         .bind(revision_id)
         .execute(&db)
@@ -4515,27 +4556,10 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), String> {
     .await
     .map_err(|e| format!("Failed to create workbook_revisions: {e}"))?;
 
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS workbook_items (
-            id                 INTEGER PRIMARY KEY,
-            revision_id        INTEGER NOT NULL REFERENCES workbook_revisions(id) ON DELETE CASCADE,
-            parent_id          INTEGER REFERENCES workbook_items(id) ON DELETE CASCADE,
-            sort_order         INTEGER NOT NULL DEFAULT 0,
-            item_type          TEXT    NOT NULL CHECK(item_type IN ('folder', 'line')),
-            name               TEXT    NOT NULL,
-            dimension_group_id INTEGER REFERENCES tree_nodes(id) ON DELETE SET NULL,
-            framing_size       TEXT,
-            unit               TEXT,
-            quantity           REAL,
-            rate               REAL,
-            notes              TEXT
-        );
-        "#,
-    )
-    .execute(pool)
-    .await
-    .map_err(|e| format!("Failed to create workbook_items: {e}"))?;
+    // NOTE: the `workbook_items` table (a structured folder/line item tree) was an
+    // abandoned early design — the live workbook stores whole sheets as JSON blobs in
+    // `workbook_sheet_data`, not normalized rows. Its CREATE was removed here; existing
+    // project files keep the empty table harmlessly (we never DROP in a migration).
 
     // Additive: sheet data blob store (one row per revision × sheet path).
     sqlx::query(
@@ -6023,6 +6047,7 @@ pub fn run() {
             set_dimension_group_props,
             save_workbook_sheet,
             load_workbook_sheet,
+            load_workbook_all_sheets,
             save_workbook_sheet_links,
             load_workbook_sheet_links,
             save_workbook_sheet_styles,
