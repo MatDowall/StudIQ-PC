@@ -15,6 +15,7 @@
 
 import { HyperFormula } from "hyperformula";
 import { SheetNameRegistry, pathToSheetName } from "./workbookSheetNames";
+import { registerWorkbookFunctions } from "./workbookFunctions";
 
 export interface SheetPayload {
   path: string;
@@ -33,6 +34,9 @@ export class WorkbookEngine {
   private reg = new SheetNameRegistry();
 
   constructor() {
+    // Register the XSUM* family before building — registration is static/global, so this makes
+    // the functions available to this (and every) engine. Idempotent.
+    registerWorkbookFunctions();
     // GPL key — StudIQ is non-distributed internal software (see the re-architecture roadmap).
     this.hf = HyperFormula.buildEmpty({ licenseKey: "gpl-v3" });
   }
