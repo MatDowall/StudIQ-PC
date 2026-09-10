@@ -35,11 +35,16 @@ import {
   qtyTotalFormula, toNum, numOrUndefined, textOrBlank, sumComputedCol,
   rollupRateIntoL2, rollupQtyIntoL2, rollupL2IntoL1, deriveFactorTotal,
 } from "../lib/workbookCalc";
-import { WorkbookEngine } from "../lib/workbookEngine";
+import { pathToSheetName } from "../lib/workbookSheetNames";
+import { registerWorkbookFunctions } from "../lib/workbookFunctions";
 import {
   DEFAULT_WORKBOOK_LAYOUT, standardColumns, qtyColumns, parseLayout, serializeLayout,
   isDefaultLayout, FIRST_USER_COL, type WorkbookLayout,
 } from "../lib/workbookLayout";
+
+// Register the CostX XSUM* family globally before any engine (incl. the Handsontable formulas
+// plugin's) is built — the registration is static, so it reaches every engine.
+registerWorkbookFunctions();
 
 registerAllModules();
 
@@ -673,24 +678,60 @@ function loadLevelData(
     colHeaders: buildColHeaders(base, cols),
     colWidths:  buildColWidths(base, cols),
   });
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const hf = (hot.getPlugin('formulas') as any)?.engine;
-    if (hf) {
-      const sheetId = hf.getSheetId?.('Sheet1') as number | undefined;
-      if (sheetId !== undefined) hf.clearSheet(sheetId);
-    }
-  } catch { /* ignore if HyperFormula API differs across versions */ }
-  // Re-point named expressions to the *new* active sheet BEFORE loadData evaluates
-  // its formulas. Otherwise a cross-sheet `=margin*2` would first be evaluated while
-  // `margin` still points at the just-cleared cell (→ #VALUE!), and the plugin would
-  // paint that error; fixing the name afterwards recomputes the engine but doesn't
-  // reliably repaint. Doing it here means the first evaluation already sees the
-  // correct literal/live reference. See refreshNamedCellsForPath / namedExprFormula.
+  // Multi-sheet engine: every sheet path is its own HyperFormula sheet (name = pathToSheetName),
+  // so navigating is switchSheet — not clear+reload of a single reused sheet. Ensure the target
+  // sheet exists in the engine with the given source content, then switch the grid to it (which
+  // repaints from the engine). Named expressions are re-registered first so cross-sheet references
+  // resolve on the first evaluation. Falls back to plain loadData if the plugin/engine is absent.
   reRegisterNamed?.();
-  hot.loadData(dataForHot(data));
+  const plugin = getFormulasPlugin(hot);
+  const engine = plugin?.engine;
+  if (plugin && engine) {
+    const name = pathToSheetName(path);
+    const rows = dataForHot(data);
+    if (engine.doesSheetExist(name)) {
+      engine.setSheetContent(engine.getSheetId(name), rows);
+    } else {
+      plugin.addSheet(name, rows);
+    }
+    plugin.switchSheet(name);
+  } else {
+    hot.loadData(dataForHot(data));
+  }
   deriveLevelFormulas(hot, level, guardRef, kind, excluded);
 }
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+/** The Handsontable Formulas plugin, typed loosely (its addSheet/switchSheet/engine members
+ *  aren't in the exported types we use). */
+function getFormulasPlugin(hot: Handsontable | null | undefined): any {
+  try { return hot ? (hot.getPlugin("formulas") as any) : null; } catch { return null; }
+}
+
+/** Replace the plugin engine's sheets with exactly `sheets` (the whole revision), so cross-sheet
+ *  rollup formulas and named-cell references resolve. Adds/replaces every wanted sheet, binds the
+ *  grid to L1, then drops any sheet left over from a previous revision. Idempotent. */
+function resetEngineSheets(hot: Handsontable, sheets: Array<{ path: string; data: (string | null)[][] }>): void {
+  const plugin = getFormulasPlugin(hot);
+  const engine = plugin?.engine;
+  if (!plugin || !engine) return;
+  const l1Name = pathToSheetName("L1");
+  const wanted = new Map<string, (string | null)[][]>();
+  for (const s of sheets) wanted.set(pathToSheetName(s.path), s.data);
+  if (!wanted.has(l1Name)) wanted.set(l1Name, createEmptyData());
+  for (const [name, data] of wanted) {
+    const rows = dataForHot(data);
+    if (engine.doesSheetExist(name)) engine.setSheetContent(engine.getSheetId(name), rows);
+    else plugin.addSheet(name, rows);
+  }
+  plugin.switchSheet(l1Name); // bind to a kept sheet before removing any stale ones
+  for (const name of engine.getSheetNames() as string[]) {
+    if (!wanted.has(name)) {
+      try { engine.removeSheet(engine.getSheetId(name)); } catch { /* ignore */ }
+    }
+  }
+}
+/* eslint-enable @typescript-eslint/no-explicit-any */
 
 /**
  * Build breadcrumb display context from a row of *evaluated* data (e.g. a computed
@@ -1266,15 +1307,6 @@ export function WorkbookView() {
   const sheetComputedMap = useRef<Map<string, unknown[][]>>(new Map());
   const pathStack = useRef<string[]>(["L1"]);
 
-  // ── Shadow multi-sheet engine (M1, read-only) ────────────────────────────
-  // A full multi-sheet WorkbookEngine built alongside the live single-"Sheet1" grid and kept in
-  // sync as sheets persist, but NOT yet driving the grid — nothing reads from it, so it cannot
-  // affect correctness. Its purpose is to exercise the multi-sheet engine on real workbooks and
-  // let open-time / memory be measured (window.__wbShadow()) before the switchSheet cutover. Built
-  // in its own effect (below) so it is entirely additive to the working load path.
-  const shadowEngineRef = useRef<WorkbookEngine | null>(null);
-  const shadowStatsRef = useRef<{ sheets: number; buildMs: number } | null>(null);
-
   // Per-sheet, per-cell text formatting applied via the Format toolbar
   // (font/size/bold/italic/underline/alignment/decimal places). Persisted to SQLite
   // alongside sheet data — see persistSheet / ensureSheetStylesLoaded — and keyed
@@ -1394,23 +1426,18 @@ export function WorkbookView() {
     return sheetDataMap.current.get(path)?.[row]?.[col] ?? null;
   }
 
-  /** Builds the HyperFormula named-expression formula for `nc` given the *currently
-   *  active* sheet:
-   *
-   *  - Bound cell is on the active sheet → a **live reference** (`=Sheet1!$C$5`).
-   *    HyperFormula then tracks the dependency natively, so editing the bound cell
-   *    instantly recomputes *and repaints* every formula referencing the name —
-   *    exactly Excel's named-range behaviour. (Only one sheet is ever loaded into
-   *    HyperFormula's "Sheet1", so the reference is unambiguous while we're on it.)
-   *  - Bound cell is on a *different* sheet → a **literal snapshot** of its
-   *    last-known evaluated value. A live `Sheet1!` reference would resolve against
-   *    whichever sheet currently occupies "Sheet1" (the wrong cell); and since the
-   *    bound cell isn't even visible, there's nothing to update live anyway. The
-   *    literal is refreshed by `syncNamedExpressions` whenever sheets change. */
+  /** Builds the HyperFormula named-expression formula for `nc`. Now that the whole revision is
+   *  loaded into one multi-sheet engine, a named cell is ALWAYS a **live cross-sheet reference**
+   *  (`=L1_sR3!$C$5`) — HyperFormula tracks the dependency natively and repaints every formula
+   *  using the name the instant the bound cell changes, from any sheet, exactly like an Excel
+   *  named range. (The literal-snapshot fallback the single-"Sheet1" design needed is gone.)
+   *  Falls back to a literal only if the bound sheet somehow isn't loaded. */
   function namedExprFormula(nc: NamedCell): string {
-    if (nc.path === curSheetPath()) {
+    const engine = getFormulasPlugin(hotRef.current?.hotInstance as Handsontable | undefined)?.engine;
+    const name = pathToSheetName(nc.path);
+    if (engine?.doesSheetExist?.(name)) {
       const letter = colLetter(nc.col);
-      return `=Sheet1!$${letter}$${nc.row + 1}`;
+      return `=${name}!$${letter}$${nc.row + 1}`;
     }
     return namedExprFromValue(readCellValue(nc.path, nc.row, nc.col));
   }
@@ -2484,10 +2511,6 @@ export function WorkbookView() {
       dataJson: JSON.stringify(data),
     }).catch(() => {/* non-fatal */});
 
-    // Keep the read-only shadow engine (M1) in step with what's persisted, so it stays a faithful
-    // rehearsal of the eventual multi-sheet cutover. Best-effort; never affects the grid.
-    try { shadowEngineRef.current?.setSheet(path, data); } catch { /* shadow only */ }
-
     const links = cellLinkMap.current.get(path);
     invoke("save_workbook_sheet_links", {
       revisionId,
@@ -3149,112 +3172,45 @@ export function WorkbookView() {
     namedCellMap.current = new Map();
     registeredNamedExprRef.current = new Set();
 
-    invoke<string>("load_workbook_sheet", { revisionId: revId, sheetPath: "L1" })
-      .then(json => {
-        let data: (string | null)[][];
-        try { data = padData(JSON.parse(json) as (string | null)[][]); }
-        catch { data = createEmptyData(); }
-        sheetDataMap.current = new Map([["L1", data]]);
-        const hot = hotRef.current?.hotInstance;
-        if (hot) loadLevelDataExcl(hot, data, 1, isAutoUpdatingRef, "L1");
-        syncSheetLinks("L1");
-      })
-      .catch(() => {
-        const empty = createEmptyData();
-        sheetDataMap.current = new Map([["L1", empty]]);
-        const hot = hotRef.current?.hotInstance;
-        if (hot) loadLevelDataExcl(hot, empty, 1, isAutoUpdatingRef, "L1");
-        syncSheetLinks("L1");
-      });
+    // Load the WHOLE revision into the multi-sheet engine at once (one round trip), so cross-sheet
+    // rollup formulas and named-cell references resolve. Then display L1. Named cells are
+    // registered AFTER the sheets exist, so each binds as a live cross-sheet reference.
+    const displayL1 = (map: Map<string, (string | null)[][]>) => {
+      sheetDataMap.current = map;
+      const hot = hotRef.current?.hotInstance;
+      if (hot) {
+        resetEngineSheets(hot, [...map].map(([path, data]) => ({ path, data })));
+        loadLevelDataExcl(hot, map.get("L1")!, 1, isAutoUpdatingRef, "L1");
+      }
+      syncSheetLinks("L1");
+    };
+    const registerNamedCells = () => {
+      invoke<string>("load_workbook_named_cells", { revisionId: revId })
+        .then(json => {
+          let entries: NamedCell[];
+          try { entries = JSON.parse(json) as NamedCell[]; } catch { entries = []; }
+          namedCellMap.current = new Map(entries.map(nc => [nc.name, nc]));
+          for (const nc of entries) registerNamedExpression(nc);
+          if (entries.length > 0) hotRef.current?.hotInstance?.render();
+        })
+        .catch(() => { /* non-fatal — workbook simply has no named cells yet */ });
+    };
 
-    // Named cells are workbook-wide (not per-sheet) — load the whole set once per
-    // revision and register each with HyperFormula so they resolve from any level.
-    invoke<string>("load_workbook_named_cells", { revisionId: revId })
-      .then(json => {
-        let entries: NamedCell[];
-        try { entries = JSON.parse(json) as NamedCell[]; } catch { entries = []; }
-        namedCellMap.current = new Map(entries.map(nc => [nc.name, nc]));
-        for (const nc of entries) registerNamedExpression(nc);
-        // If the sheet finished loading before this callback fired, formula cells that
-        // reference these named expressions already rendered with stale/=0 values.
-        // Force a re-render so they pick up the now-correct named expressions.
-        if (entries.length > 0) hotRef.current?.hotInstance?.render();
-      })
-      .catch(() => { /* non-fatal — workbook simply has no named cells yet */ });
-  }, [activeRevisionId]);
-
-  // Build the read-only shadow engine for the active revision (see shadowEngineRef above).
-  // Entirely additive: best-effort, never touches the grid, tears down the previous engine.
-  useEffect(() => {
-    const revId = activeRevisionId;
-    shadowEngineRef.current?.destroy();
-    shadowEngineRef.current = null;
-    shadowStatsRef.current = null;
-    if (revId == null) return;
-    let cancelled = false;
     invoke<string>("load_workbook_all_sheets", { revisionId: revId })
       .then(json => {
-        if (cancelled) return;
-        let sheets: { path: string; data: (string | null)[][] }[];
+        let sheets: Array<{ path: string; data: (string | null)[][] }>;
         try { sheets = JSON.parse(json) as typeof sheets; } catch { sheets = []; }
-        const t0 = performance.now();
-        const eng = new WorkbookEngine();
-        if (!sheets.some(s => s.path === "L1")) eng.addSheet("L1"); // brand-new revision
-        for (const s of sheets) eng.setSheet(s.path, Array.isArray(s.data) ? s.data : []);
-        const buildMs = performance.now() - t0;
-        if (cancelled) { eng.destroy(); return; }
-        shadowEngineRef.current = eng;
-        shadowStatsRef.current = { sheets: eng.paths().length, buildMs };
+        const map = new Map<string, (string | null)[][]>();
+        for (const s of sheets) map.set(s.path, padData(Array.isArray(s.data) ? s.data : []));
+        if (!map.has("L1")) map.set("L1", createEmptyData());
+        displayL1(map);
+        registerNamedCells();
       })
-      .catch(() => { /* shadow is best-effort — a failure never affects the grid */ });
-    return () => {
-      cancelled = true;
-      shadowEngineRef.current?.destroy();
-      shadowEngineRef.current = null;
-      shadowStatsRef.current = null;
-    };
+      .catch(() => {
+        displayL1(new Map([["L1", createEmptyData()]]));
+        registerNamedCells();
+      });
   }, [activeRevisionId]);
-
-  // On-demand diagnostic: window.__wbShadow() reports the shadow engine's build stats and, for
-  // the sheet currently on screen, a numeric diff of the shadow's evaluated values against the
-  // live grid's — the "does the multi-sheet engine agree?" check, run by hand rather than as
-  // always-on console spam. Named cells are registered into the shadow lazily here so the
-  // comparison is apples-to-apples. Removed on unmount.
-  useEffect(() => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (window as any).__wbShadow = () => {
-      const eng = shadowEngineRef.current;
-      const stats = shadowStatsRef.current;
-      if (!eng || !stats) return { ready: false };
-      const hot = hotRef.current?.hotInstance;
-      const curPath = pathStack.current[pathStack.current.length - 1];
-      // Feed the current grid's source (incl. unflushed edits) into the shadow so the compare
-      // is source-for-source, then register named cells so name-referencing formulas resolve.
-      if (hot) { try { eng.setSheet(curPath, captureSourceData(hot)); } catch { /* ignore */ } }
-      for (const nc of namedCellMap.current.values()) {
-        try { eng.setNamedCellRef(nc.name, nc.path, nc.row, nc.col); } catch { /* ignore */ }
-      }
-      const gridComputed = hot ? getEvaluatedGridData(hot) : [];
-      const shadowComputed = eng.getEvaluatedSheet(curPath);
-      let diffs = 0;
-      const samples: Array<{ cell: string; grid: unknown; shadow: unknown }> = [];
-      for (let r = 0; r < gridComputed.length; r++) {
-        const cols = gridComputed[r]?.length ?? 0;
-        for (let c = 0; c < cols; c++) {
-          const g = gridComputed[r][c];
-          const s = shadowComputed[r]?.[c];
-          const gn = typeof g === "number" ? g : NaN;
-          const sn = typeof s === "number" ? s : NaN;
-          const equal = (isFinite(gn) && isFinite(sn))
-            ? Math.abs(gn - sn) < 1e-9
-            : String(g ?? "") === String(s ?? "");
-          if (!equal) { diffs++; if (samples.length < 20) samples.push({ cell: `${colLetter(c)}${r + 1}`, grid: g, shadow: s }); }
-        }
-      }
-      return { ready: true, sheets: stats.sheets, buildMs: Math.round(stats.buildMs), curPath, diffs, samples };
-    };
-    return () => { try { delete (window as unknown as Record<string, unknown>).__wbShadow; } catch { /* ignore */ } };
-  }, []);
 
   // Track grid-container resize to drive Handsontable height
   useEffect(() => {
@@ -4214,10 +4170,13 @@ export function WorkbookView() {
     // of the full multi-cell selection.
     outsideClickDeselects: false,
 
-    // ── Formula engine ──────────────────────────────────────────────────
+    // ── Formula engine (multi-sheet) ─────────────────────────────────────
+    // The plugin owns its HyperFormula engine but we drive it multi-sheet: every workbook sheet
+    // path is its own engine sheet (name = pathToSheetName), navigation is switchSheet, and the
+    // whole revision is loaded so cross-sheet rollup formulas resolve. The bound sheet is L1.
     formulas: {
       engine: HyperFormula,
-      sheetName: "Sheet1",
+      sheetName: pathToSheetName("L1"),
     },
 
     afterSelection(row: number, col: number, row2: number, col2: number) {
