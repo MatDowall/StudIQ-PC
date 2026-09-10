@@ -33,10 +33,11 @@ import {
   COL_LAB, COL_LAB_TOTAL, COL_MAT, COL_MAT_TOTAL, COL_SUB, COL_SUB_TOTAL, COL_SUM, COL_SUM_TOTAL,
   COL_COUNT, COL_LENGTH, COL_WIDTH, COL_HEIGHT,
   qtyTotalFormula, toNum, numOrUndefined, textOrBlank, sumComputedCol,
-  rollupRateIntoL2, rollupQtyIntoL2, rollupL2IntoL1, deriveFactorTotal,
+  deriveFactorTotal, legacyColLetter,
 } from "../lib/workbookCalc";
 import { pathToSheetName } from "../lib/workbookSheetNames";
 import { registerWorkbookFunctions } from "../lib/workbookFunctions";
+import { toDisplay as xsumToDisplay, toStored as xsumToStored, XSUM_ROW_BOUND } from "../lib/workbookXsumDisplay";
 import {
   DEFAULT_WORKBOOK_LAYOUT, standardColumns, qtyColumns, parseLayout, serializeLayout,
   isDefaultLayout, FIRST_USER_COL, type WorkbookLayout,
@@ -302,6 +303,15 @@ const FORMULA_FUNCTIONS: Record<string, FnInfo> = {
   COUNT:     { syntax: "COUNT(value1, [value2], ...)",       desc: "Counts the number of numeric values" },
   MIN:       { syntax: "MIN(number1, [number2], ...)",       desc: "Returns the minimum value" },
   MAX:       { syntax: "MAX(number1, [number2], ...)",       desc: "Returns the maximum value" },
+  // CostX-style rollup functions (positional syntax — the child sheet is taken from the cell's
+  // own position). [dp] is optional decimal places.
+  XSUMTOT:      { syntax: "XSUMTOT([dp])",              desc: "Sum of the drilled Sub-Total sheet's Total (H) column" },
+  XSUMTOTQTY:   { syntax: "XSUMTOTQTY([dp])",           desc: "Sum of the drilled Sub-Total sheet's Quantity (C) column" },
+  XSUMUSER:     { syntax: "XSUMUSER(user_col, [dp])",   desc: "Sum of user column n of the drilled Sub-Total sheet" },
+  XSUMRATE:     { syntax: "XSUMRATE([dp])",             desc: "Sum of the Rate build-up's Total (H) column" },
+  XSUMRATEUSER: { syntax: "XSUMRATEUSER(user_col, [dp])", desc: "Sum of user column n of the Rate build-up" },
+  XSUMQTY:      { syntax: "XSUMQTY([dp])",              desc: "Sum of the Quantity build-up's Quantity (H) column" },
+  XSUMQTYUSER:  { syntax: "XSUMQTYUSER(user_col, [dp])",  desc: "Sum of user column n of the Quantity build-up" },
 };
 
 const FUNCTION_NAMES = Object.keys(FORMULA_FUNCTIONS);
@@ -708,6 +718,23 @@ function getFormulasPlugin(hot: Handsontable | null | undefined): any {
   try { return hot ? (hot.getPlugin("formulas") as any) : null; } catch { return null; }
 }
 
+/** Ensure the engine has a sheet for `path` (empty if new). Lets a parent's positional XSUM*
+ *  read real child data the instant it is written. */
+function ensureEngineSheet(hot: Handsontable, path: string): void {
+  const plugin = getFormulasPlugin(hot);
+  const engine = plugin?.engine;
+  if (!plugin || !engine) return;
+  const name = pathToSheetName(path);
+  try { if (!engine.doesSheetExist(name)) plugin.addSheet(name, dataForHot(createEmptyData())); } catch { /* ignore */ }
+}
+
+/** Force a full engine recompute. The XSUM* rollups reference their child as an explicit range, so
+ *  HyperFormula's dependency graph settles a multi-level chain in one pass — no iteration needed. */
+function recomputeEngine(hot: Handsontable | null | undefined): void {
+  const engine = getFormulasPlugin(hot)?.engine;
+  try { engine?.rebuildAndRecalculate?.(); } catch { /* older API — a re-render still repaints */ }
+}
+
 /** Replace the plugin engine's sheets with exactly `sheets` (the whole revision), so cross-sheet
  *  rollup formulas and named-cell references resolve. Adds/replaces every wanted sheet, binds the
  *  grid to L1, then drops any sheet left over from a previous revision. Idempotent. */
@@ -756,8 +783,20 @@ function readRowCtx(rowIndex: number, data: unknown[][]): BreadcrumbCtx {
  * `getDataAtCell` resolves it fine.
  */
 function readRowCtxFromGrid(hot: Handsontable, rowIndex: number): BreadcrumbCtx {
+  const plugin = getFormulasPlugin(hot);
+  const engine = plugin?.engine;
+  const sheetId: number | null = plugin?.sheetId ?? null;
   const v = (col: number): string => {
-    const val = hot.getDataAtCell(rowIndex, col);
+    let val = hot.getDataAtCell(rowIndex, col);
+    // A cell whose rollup formula was just written can hand back its raw source here (not yet
+    // re-cached) — read the engine's evaluated value instead so the breadcrumb shows the number,
+    // not "…!H1:H1000)". Last resort: display the clean positional form rather than the raw ref.
+    if (typeof val === "string" && val.charAt(0) === "=") {
+      if (engine && sheetId != null) {
+        try { const e = engine.getCellValue({ sheet: sheetId, row: rowIndex, col }); if (e != null && typeof e !== "object") val = e; } catch { /* fall through */ }
+      }
+      if (typeof val === "string" && val.charAt(0) === "=") val = xsumToDisplay(val);
+    }
     return val != null && val !== "" ? String(val) : "";
   };
   return { code: v(0), description: v(1), quantity: v(2), unit: v(3), rate: v(4), subtotal: v(5), factor: v(6), total: v(7) };
@@ -3228,6 +3267,38 @@ export function WorkbookView() {
 
   // ── drill-down navigation ──────────────────────────────────────────────
 
+  /** Writes the declarative rollup formula(s) for a drilled cell into the parent grid: the drilled
+   *  column becomes `=SUM(child!<col>1:<col>1000)`, plus the pull-through user columns (I/K/M/O for
+   *  a rate drill, J/L/N/P for a subtotal drill). Explicit ranges (not volatile XSUM*) so a
+   *  multi-level chain converges in one recalc. Skips excluded cells and dimension-linked C cells.
+   *  Guarded by isAutoUpdatingRef so the afterChange derivation doesn't fight these writes. */
+  function writeRollupFormulasIntoGrid(hot: Handsontable, row: number, col: number, childPath: string, parentPath: string) {
+    // Ensure the child sheet exists so the reference resolves immediately (no #REF flash).
+    ensureEngineSheet(hot, childPath);
+    const childName = pathToSheetName(childPath);
+    // CostX-named XSUM over the child column. The child range is an explicit argument so
+    // HyperFormula orders the child's own formulas (F=E*C, H=F*G) BEFORE this rollup — required
+    // for correctness. All XSUM* are ROUND(SUM(range), dp); the name documents intent.
+    const xsum = (fn: string, c: number) => `=${fn}(${childName}!${legacyColLetter(c)}1:${legacyColLetter(c)}${XSUM_ROW_BOUND})`;
+    const writes: Array<[number, number, string]> = [];
+    const put = (c: number, formula: string) => { if (!isCellExcluded(parentPath, row, c)) writes.push([row, c, formula]); };
+    if (col === COL_SUBTOTAL) {
+      put(COL_SUBTOTAL, xsum("XSUMTOT", COL_TOTAL));
+      for (const n of [2, 4, 6, 8]) put(FIRST_USER_COL + n - 1, xsum("XSUMUSER", FIRST_USER_COL + n - 1));
+    } else if (col === COL_RATE) {
+      put(COL_RATE, xsum("XSUMRATE", COL_TOTAL));
+      for (const n of [1, 3, 5, 7]) put(FIRST_USER_COL + n - 1, xsum("XSUMRATEUSER", FIRST_USER_COL + n - 1));
+    } else if (col === COL_QTY) {
+      if (getCellLink(parentPath, row, COL_QTY)) return; // dimension-linked: keep the live import
+      put(COL_QTY, xsum("XSUMQTY", COL_TOTAL));
+    }
+    if (!writes.length) return;
+    const prev = isAutoUpdatingRef.current;
+    isAutoUpdatingRef.current = true;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    try { hot.setDataAtCell(writes as any); } finally { isAutoUpdatingRef.current = prev; }
+  }
+
   const drillDown = useCallback((row: number, col: number) => {
     const hot = hotRef.current?.hotInstance;
     if (!hot) return;
@@ -3240,6 +3311,16 @@ export function WorkbookView() {
     if (saveTimerRef.current) { clearTimeout(saveTimerRef.current); saveTimerRef.current = null; }
 
     const curPath = pathStack.current[pathStack.current.length - 1];
+    // C:Quantity opens a Quantity Build-up sheet ("/Q<row>"); every other drill column
+    // (F:Subtotal at L1, E:Rate at L2) opens a standard/Rate Build-up sheet ("/R<row>").
+    const isQtyDrill = levelRef.current === 2 && col === COL_QTY;
+    const newPath = `${curPath}/${isQtyDrill ? "Q" : "R"}${row}`;
+
+    // Declarative rollup: the drilled cell holds a live SUM of its child sheet's column, so the
+    // parent tracks the child with no baking on drill-up. Written into the grid (guarded so the
+    // afterChange derivation doesn't fight it) before we capture the parent's source.
+    writeRollupFormulasIntoGrid(hot, row, col, newPath, curPath);
+
     const curData = captureSourceData(hot);
     sheetDataMap.current.set(curPath, curData);
     // Cache evaluated snapshot too — needed by propagateLiveRollup to sum ancestor
@@ -3253,10 +3334,6 @@ export function WorkbookView() {
     // Use evaluated values (not source/formula strings) for the breadcrumb context —
     // see readRowCtxFromGrid doc comment.
     const ctx = readRowCtxFromGrid(hot, row);
-    // C:Quantity opens a Quantity Build-up sheet ("/Q<row>"); every other drill column
-    // (F:Subtotal at L1, E:Rate at L2) opens a standard/Rate Build-up sheet ("/R<row>").
-    const isQtyDrill = levelRef.current === 2 && col === COL_QTY;
-    const newPath = `${curPath}/${isQtyDrill ? "Q" : "R"}${row}`;
     pathStack.current = [...pathStack.current, newPath];
 
     // Level we're navigating INTO — needed by loadLevelData to run the correct
@@ -3353,54 +3430,15 @@ export function WorkbookView() {
     const curPath = pathStack.current[pathStack.current.length - 1];
     const curData = captureSourceData(hot);
     sheetDataMap.current.set(curPath, curData);
+    sheetComputedMap.current.set(curPath, getEvaluatedGridData(hot));
 
-    // ── Roll up aggregate columns into the parent sheet ───────────────────
-    // Use getEvaluatedGridData(hot) (evaluated values) rather than source data (formula
-    // strings) so formula cells contribute their computed result to the sums.
-    const computed  = getEvaluatedGridData(hot);
-    // Cache evaluated snapshot too — needed by propagateLiveRollup to sum ancestor
-    // sheets' formula columns once this sheet is no longer the displayed one.
-    sheetComputedMap.current.set(curPath, computed);
+    // Declarative engine: the parent's rollup cells are live `=SUM(child!…)` formulas written at
+    // drill-down time, so there is nothing to bake on the way up — just persist this sheet and
+    // navigate. The parent recomputes from the child automatically when it is redisplayed.
     const newStack  = pathStack.current.slice(0, -1);
     const parentPath = newStack[newStack.length - 1];
-    const rowInParent = pathLastRow(curPath);
-
-    if (rowInParent !== null) {
-      const parentData = sheetDataMap.current.get(parentPath) ?? createEmptyData();
-      const lv = levelRef.current;
-      // Skip writing any column the user has excluded from auto-calc on the parent
-      // sheet — e.g. a summary row whose F/G/H carry hand-built formulas must not be
-      // clobbered by the drill-up rollup.
-      const excluded = (col: number) => isCellExcluded(parentPath, rowInParent, col);
-
-      if (lv === 2) {
-        // Leaving Level 2 → Level 1: F:Subtotal + J/L/N/P pulled-through totals.
-        rollupL2IntoL1(parentData, rowInParent, computed, excluded);
-        sheetDataMap.current.set(parentPath, parentData);
-      } else if (lv === 3 && isQtyBuildupPath(curPath)) {
-        // Leaving a Quantity Build-up sheet → Level 2: C:Quantity.
-        // F:Subtotal/G:Factor/H:Total and the J/L/N/P pull-through formulas all
-        // reference C, so they're recomputed for free by deriveLevelFormulas when
-        // the parent (standard Level 2) sheet is redisplayed — nothing else to write.
-        rollupQtyIntoL2(parentData, rowInParent, computed, excluded);
-        sheetDataMap.current.set(parentPath, parentData);
-      } else if (lv === 3) {
-        // Leaving Level 3 → Level 2: E:Rate + I/K/M/O pulled-through + J/L/N/P formulas.
-        rollupRateIntoL2(parentData, rowInParent, computed, excluded);
-        sheetDataMap.current.set(parentPath, parentData);
-      }
-
-      // Persist the updated parent data alongside the current sheet
-      const revId = revIdRef.current;
-      if (revId != null) {
-        persistSheet(revId, curPath, curData);
-        persistSheet(revId, parentPath, parentData);
-      }
-    } else {
-      // No row context — just persist the current sheet as normal
-      const revId = revIdRef.current;
-      if (revId != null) persistSheet(revId, curPath, curData);
-    }
+    const revId = revIdRef.current;
+    if (revId != null) persistSheet(revId, curPath, curData);
 
     pathStack.current = newStack;
 
@@ -3434,152 +3472,12 @@ export function WorkbookView() {
   // current sheet, recomputing each ancestor row's derived columns the same way
   // drillUp's rollup does (live, in-memory only — nothing is persisted here), and
   // refreshes `breadcrumb` so both toolbars show live totals as you type.
+  // Live breadcrumb update on edit. With the declarative engine every ancestor rollup cell is a
+  // live formula, so this just re-reads the ancestors' evaluated values from the engine rather than
+  // re-deriving them by hand (which, post-cutover, surfaced the parent's raw =XSUM…(ref) source).
   const propagateLiveRollup = useCallback(() => {
-    const hot = hotRef.current?.hotInstance;
-    if (!hot) return;
-    const lv = levelRef.current;
-    if (lv < 2) return;
-
-    const path = pathStack.current;
-    // Snapshot the currently-displayed sheet's evaluated data once, up front — it's
-    // the base for the innermost (curLevel === lv) rollup step on every invocation.
-    const baseComputed: unknown[][] = getEvaluatedGridData(hot);
-
-    setBreadcrumb(prev => {
-      if (prev.length === 0) return prev;
-      const next = [...prev];
-      // `childComputed` is reassigned as the loop walks upward (it becomes each
-      // ancestor's computed view with the live-derived row substituted in). It must
-      // be local to this updater — React.StrictMode invokes state updaters twice in
-      // development, and a `let` shared across invocations would carry the previous
-      // run's already-rolled-up view into the next run's innermost step, compounding
-      // the sums into wildly wrong totals.
-      let childComputed: unknown[][] = baseComputed;
-
-      for (let curLevel = lv; curLevel >= 2; curLevel--) {
-        const depth      = lv - curLevel;
-        const childPath  = path[path.length - depth - 1];
-        const parentPath = path[path.length - depth - 2];
-        const rowInParent = pathLastRow(childPath);
-        if (rowInParent == null || parentPath == null) break;
-
-        const parentSource = sheetDataMap.current.get(parentPath);
-        if (!parentSource) break;
-        const parentComputed = sheetComputedMap.current.get(parentPath) ?? parentSource;
-
-        // Clone the row so we can override its derived columns without mutating the cache.
-        const liveRow = [...(parentSource[rowInParent] ?? [])] as (string | null)[];
-        // Skip live-deriving any column the user has excluded from auto-calc on the
-        // parent sheet — e.g. a summary row whose F/G/H carry hand-built formulas
-        // must keep showing those, not a rolled-up child total, in the breadcrumb.
-        const excluded = (col: number) => isCellExcluded(parentPath, rowInParent, col);
-
-        if (curLevel === 2) {
-          // Leaving L2 → L1 rollup: F = SUM(child H); J/L/N/P = SUM(child J/L/N/P)
-          // (pulled through); G auto-populate; H = F×G
-          const sumH = sumComputedCol(childComputed, COL_TOTAL);
-          const f = sumH ?? 0;
-          if (!excluded(COL_SUBTOTAL)) liveRow[COL_SUBTOTAL] = f !== 0 ? String(f) : null;
-
-          for (const total of [COL_LAB_TOTAL, COL_MAT_TOTAL, COL_SUB_TOTAL, COL_SUM_TOTAL]) {
-            if (excluded(total)) continue;
-            const s = sumComputedCol(childComputed, total);
-            liveRow[total] = s !== null ? String(s) : null;
-          }
-
-          if (!excluded(COL_FACTOR) || !excluded(COL_TOTAL)) {
-            // Read the *evaluated* Factor value, not the raw source — a formula
-            // referencing a named cell (e.g. `=1+margin_pct/100`) can't be parsed by
-            // toNum() as-is, which silently zeroed the live-rolled-up Total.
-            let gRaw: string | null = evaluatedOrRaw(parentComputed, rowInParent, COL_FACTOR, liveRow[COL_FACTOR]);
-            if (f > 0 && (gRaw == null || gRaw === "")) gRaw = "1";
-            if (!excluded(COL_FACTOR)) liveRow[COL_FACTOR] = gRaw;
-            const g = toNum(gRaw);
-            if (!excluded(COL_TOTAL)) liveRow[COL_TOTAL] = (f !== 0 || g !== 0) ? String(f * g) : null;
-          }
-        } else if (curLevel === 3 && isQtyBuildupPath(childPath)) {
-          // Leaving a Quantity Build-up sheet → L2 rollup: C:Quantity = SUM(child
-          // H:Quantity); I/K/M/O are untouched (they belong to the rate-buildup
-          // relationship, not this one) but J/L/N/P = (existing I/K/M/O) × new C must
-          // be re-derived; then F = E×C, G auto-populate, H = F×G for that L2 row.
-          const sumH = sumComputedCol(childComputed, COL_TOTAL);
-          const cVal = sumH ?? 0;
-          if (!excluded(COL_QTY)) liveRow[COL_QTY] = sumH !== null ? String(sumH) : null;
-
-          for (const [src, total] of [
-            [COL_LAB, COL_LAB_TOTAL],
-            [COL_MAT, COL_MAT_TOTAL],
-            [COL_SUB, COL_SUB_TOTAL],
-            [COL_SUM, COL_SUM_TOTAL],
-          ] as Array<[number, number]>) {
-            if (excluded(total)) continue;
-            const srcRaw = liveRow[src];
-            liveRow[total] = (srcRaw != null && srcRaw !== "") ? String(toNum(srcRaw) * cVal) : null;
-          }
-
-          const e = toNum(liveRow[COL_RATE]);
-          const f = e * cVal;
-          if (!excluded(COL_SUBTOTAL)) liveRow[COL_SUBTOTAL] = (e !== 0 || cVal !== 0) ? String(f) : null;
-
-          if (!excluded(COL_FACTOR) || !excluded(COL_TOTAL)) {
-            // See the L1-rollup branch above for why this reads the evaluated value.
-            let gRaw: string | null = evaluatedOrRaw(parentComputed, rowInParent, COL_FACTOR, liveRow[COL_FACTOR]);
-            if (f > 0 && (gRaw == null || gRaw === "")) gRaw = "1";
-            if (!excluded(COL_FACTOR)) liveRow[COL_FACTOR] = gRaw;
-            const g = toNum(gRaw);
-            if (!excluded(COL_TOTAL)) liveRow[COL_TOTAL] = (f !== 0 || g !== 0) ? String(f * g) : null;
-          }
-        } else if (curLevel === 3) {
-          // Leaving L3 → L2 rollup: E = SUM(child H); I/K/M/O = SUM(child I/K/M/O) (pulled
-          // through); J/L/N/P = pulled-through value × C; then F = E×C, G auto-populate,
-          // H = F×G for that L2 row
-          const sumH = sumComputedCol(childComputed, COL_TOTAL);
-          const e = sumH ?? 0;
-          if (!excluded(COL_RATE)) liveRow[COL_RATE] = sumH !== null ? String(sumH) : null;
-
-          const cValForTotals = toNum(liveRow[COL_QTY]);
-          for (const [src, total] of [
-            [COL_LAB, COL_LAB_TOTAL],
-            [COL_MAT, COL_MAT_TOTAL],
-            [COL_SUB, COL_SUB_TOTAL],
-            [COL_SUM, COL_SUM_TOTAL],
-          ] as Array<[number, number]>) {
-            const s = sumComputedCol(childComputed, src);
-            if (!excluded(src)) liveRow[src] = s !== null ? String(s) : null;
-            if (!excluded(total)) liveRow[total] = s !== null ? String(s * cValForTotals) : null;
-          }
-
-          const cVal = toNum(liveRow[COL_QTY]);
-          const f = e * cVal;
-          if (!excluded(COL_SUBTOTAL)) liveRow[COL_SUBTOTAL] = (e !== 0 || cVal !== 0) ? String(f) : null;
-
-          if (!excluded(COL_FACTOR) || !excluded(COL_TOTAL)) {
-            // See the L1-rollup branch above for why this reads the evaluated value.
-            let gRaw: string | null = evaluatedOrRaw(parentComputed, rowInParent, COL_FACTOR, liveRow[COL_FACTOR]);
-            if (f > 0 && (gRaw == null || gRaw === "")) gRaw = "1";
-            if (!excluded(COL_FACTOR)) liveRow[COL_FACTOR] = gRaw;
-            const g = toNum(gRaw);
-            if (!excluded(COL_TOTAL)) liveRow[COL_TOTAL] = (f !== 0 || g !== 0) ? String(f * g) : null;
-          }
-        }
-
-        // Refresh this row's breadcrumb entry from the live-derived row
-        const breadcrumbIdx = curLevel - 2;
-        if (breadcrumbIdx < next.length) {
-          next[breadcrumbIdx] = readRowCtx(0, [liveRow]);
-        }
-
-        // Build the "evaluated" view of the parent sheet for the NEXT iteration up:
-        // cached evaluated values for every row except the one we just live-derived.
-        if (curLevel > 2) {
-          childComputed = parentComputed.map((row, i) => (i === rowInParent ? liveRow : row));
-        }
-      }
-
-      return next;
-    });
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    refreshBreadcrumbFromEngine();
+  }, [])
 
   const propagateLiveRollupRef = useRef(propagateLiveRollup);
   propagateLiveRollupRef.current = propagateLiveRollup;
@@ -3680,8 +3578,11 @@ export function WorkbookView() {
     const revId = revIdRef.current;
     if (!hot || revId == null) return;
 
-    // Persist the currently displayed sheet's edits first, exactly as drillDown/
-    // drillUp/exportExcel do before reading from SQLite, so the recalc sees them.
+    // Declarative engine: rollups are live cross-sheet `=SUM(child!…)` formulas, so "recalculate"
+    // is just forcing HyperFormula to rebuild its dependency graph and re-evaluate, then
+    // repainting the displayed sheet and the breadcrumb — no baking tree-walk. This exists mainly
+    // as a manual "recompute everything" safety net (e.g. after a bulk edit); the workbook is
+    // otherwise self-updating.
     closeActiveEditor(hot);
     if (saveTimerRef.current) { clearTimeout(saveTimerRef.current); saveTimerRef.current = null; }
     const curPath = pathStack.current[pathStack.current.length - 1];
@@ -3689,102 +3590,37 @@ export function WorkbookView() {
     sheetDataMap.current.set(curPath, curSourceData);
     persistSheet(revId, curPath, curSourceData);
 
-    // 1. Resolve every named cell's current true value by evaluating its bound sheet's
-    //    own formulas.
-    const namedValues = await resolveNamedValues(revId);
+    // Force a full recompute (explicit-range edges settle in one pass), then repaint.
+    recomputeEngine(hot);
+    refreshBreadcrumbFromEngine();
+    hot.render();
+  }
 
-    // 2. Walk the L1 → L2 → L3 tree bottom-up, re-evaluating each sheet against the
-    //    resolved named values and rolling child totals into their parent row —
-    //    the same aggregation `drillUp` applies one drill-step at a time.
-    const l1Path = "L1";
-    const l1Data = await fetchSheetSourceData(revId, l1Path);
-    await ensureSheetExclusionsLoaded(revId, l1Path);
-    let l1Changed = false;
-    const l2ComputedByPath = new Map<string, unknown[][]>();
-
-    for (let r1 = 0; r1 < NUM_ROWS; r1++) {
-      if (!isLineItemRow(l1Data[r1])) continue;
-      const l2Path = `${l1Path}/R${r1}`;
-      const l2Data = await fetchSheetForRecalc(revId, l2Path);
-      if (l2Data == null) continue; // never drilled into — F/H are manually entered, leave as-is
-
-      await ensureSheetExclusionsLoaded(revId, l2Path);
-      // Links tell us which C:Quantity / E:Rate cells are driven by a live dimension
-      // group (see the getCellLink guard below) — load them before the row scan.
-      await ensureSheetLinksLoaded(revId, l2Path);
-      let l2Changed = false;
-
-      // Check every row for a Rate/Quantity Build-up child, not just rows that look
-      // like "line items" (Code/Description set) — a build-up can exist under a row
-      // whose Code/Description were never filled in, e.g. a bare rate calculation.
-      for (let r2 = 0; r2 < NUM_ROWS; r2++) {
-        const l2Excluded = (col: number) => isCellExcluded(l2Path, r2, col);
-
-        const ratePath = `${l2Path}/R${r2}`;
-        const rateData = await fetchSheetForRecalc(revId, ratePath);
-        // A cell linked to a dimension group is kept live by refreshLinkedCells from
-        // the group's current geometry; its Build-up sub-sheet is only a one-shot
-        // snapshot taken when the group was dropped and is NEVER refreshed, so it goes
-        // stale the moment the group's measurements change. Rolling that stale snapshot
-        // back into the cell would overwrite the correct live value — the exact reason
-        // recalc diverged from the (self-healing) drill path. Skip linked cells.
-        if (rateData != null && !getCellLink(l2Path, r2, COL_RATE)) {
-          rollupRateIntoL2(l2Data, r2, evaluateWithNames(rateData, namedValues), l2Excluded);
-          l2Changed = true;
-        }
-
-        const qtyPath = `${l2Path}/Q${r2}`;
-        const qtyData = await fetchSheetForRecalc(revId, qtyPath);
-        if (qtyData != null && !getCellLink(l2Path, r2, COL_QTY)) {
-          rollupQtyIntoL2(l2Data, r2, evaluateWithNames(qtyData, namedValues), l2Excluded);
-          l2Changed = true;
-        }
-      }
-
-      if (l2Changed) {
-        sheetDataMap.current.set(l2Path, l2Data);
-        persistSheet(revId, l2Path, l2Data);
-      }
-
-      // Evaluate L2 with the (possibly just-updated) rollup values in place so its
-      // own F=E×C / H=F×G / J=I×C… formulas recompute before rolling into L1.
-      const l2Computed = evaluateWithNames(l2Data, namedValues);
-      l2ComputedByPath.set(l2Path, l2Computed);
-      sheetComputedMap.current.set(l2Path, l2Computed);
-      rollupL2IntoL1(l1Data, r1, l2Computed, (col) => isCellExcluded(l1Path, r1, col));
-      l1Changed = true;
-    }
-
-    if (l1Changed) {
-      sheetDataMap.current.set(l1Path, l1Data);
-      persistSheet(revId, l1Path, l1Data);
-    }
-    const l1Computed = evaluateWithNames(l1Data, namedValues);
-    sheetComputedMap.current.set(l1Path, l1Computed);
-
-    // 3. Refresh the breadcrumb toolbars and the currently displayed sheet in place —
-    //    reloading re-registers every named expression (see loadLevelDataExcl/
-    //    refreshNamedCellsForPath), which now resolves against the fresh values and
-    //    snapshots cached above.
+  /** Rebuilds the breadcrumb ancestry rows from the engine's current evaluated values — used by
+   *  recalculate and the live breadcrumb rollup. Reads each ancestor row straight from its engine
+   *  sheet, so it always reflects the declarative formulas. */
+  function refreshBreadcrumbFromEngine(): void {
+    const hot = hotRef.current?.hotInstance;
+    const engine = getFormulasPlugin(hot)?.engine;
+    if (!engine) return;
     const stack = pathStack.current;
-    const newBreadcrumb: BreadcrumbCtx[] = [];
+    const ctxs: BreadcrumbCtx[] = [];
     for (let i = 0; i < stack.length - 1; i++) {
       const parentPath = stack[i];
-      const childPath = stack[i + 1];
-      const row = pathLastRow(childPath) ?? 0;
-      const parentComputed = parentPath === l1Path
-        ? l1Computed
-        : l2ComputedByPath.get(parentPath)
-          ?? evaluateWithNames(sheetDataMap.current.get(parentPath) ?? createEmptyData(), namedValues);
-      newBreadcrumb.push(readRowCtx(row, parentComputed));
+      const row = pathLastRow(stack[i + 1]) ?? 0;
+      const name = pathToSheetName(parentPath);
+      const val = (col: number): string => {
+        try {
+          const v = engine.getCellValue({ sheet: engine.getSheetId(name), row, col });
+          return v != null && v !== "" ? String(v) : "";
+        } catch { return ""; }
+      };
+      ctxs.push({
+        code: val(COL_CODE), description: val(COL_DESC), quantity: val(COL_QTY), unit: val(COL_UNIT),
+        rate: val(COL_RATE), subtotal: val(COL_SUBTOTAL), factor: val(COL_FACTOR), total: val(COL_TOTAL),
+      });
     }
-    setBreadcrumb(newBreadcrumb);
-
-    const displayPath = stack[stack.length - 1];
-    const hot2 = hotRef.current?.hotInstance;
-    if (hot2) {
-      loadLevelDataExcl(hot2, sheetDataMap.current.get(displayPath) ?? createEmptyData(), levelRef.current, isAutoUpdatingRef, displayPath);
-    }
+    setBreadcrumb(ctxs);
   }
 
   /**
@@ -4188,7 +4024,9 @@ export function WorkbookView() {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const hot = (hotRef.current?.hotInstance) as any;
       const val = hot?.getSourceDataAtCell(row, col);
-      setActiveCellValue(val != null ? String(val) : "");
+      // Show the CostX-clean positional form of a rollup (=XSUMRATE(2)); the stored cell keeps the
+      // child reference the engine needs. No-op for any other content.
+      setActiveCellValue(val != null ? xsumToDisplay(String(val)) : "");
       setCompletions([]);
       syncFormatSnapshot();
 
@@ -4265,6 +4103,22 @@ export function WorkbookView() {
       }
     },
 
+    // Expand a positional rollup typed directly into a cell (=XSUMRATE(2)) into the stored
+    // child-reference form before it reaches the engine. `source` "edit" = a human keystroke;
+    // programmatic writes (our own guarded setDataAtCell) already store the reference form, and
+    // toStored is a no-op on them anyway. No-op for every non-rollup value.
+    beforeChange(changes: Array<[number, number, unknown, unknown]> | null, source?: string) {
+      if (!changes || source === "loadData") return;
+      const path = curSheetPath();
+      for (const ch of changes) {
+        const next = ch?.[3];
+        if (typeof next === "string" && next.charAt(0) === "=") {
+          const expanded = xsumToStored(next, path, ch[0]);
+          if (expanded !== next) ch[3] = expanded;
+        }
+      }
+    },
+
     afterChange(changes: Handsontable.CellChange[] | null) {
       if (!changes) return;
       const hot = hotRef.current?.hotInstance as Handsontable | undefined;
@@ -4273,7 +4127,7 @@ export function WorkbookView() {
       if (sel) {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const val = (hot as any).getSourceDataAtCell(sel.highlight.row, sel.highlight.col);
-        setActiveCellValue(val != null ? String(val) : "");
+        setActiveCellValue(val != null ? xsumToDisplay(String(val)) : "");
       }
       // Debounced auto-save to SQLite
       scheduleSaveRef.current();
@@ -4548,13 +4402,21 @@ export function WorkbookView() {
     // textarea synchronously as part of opening the editor, but a tick's delay
     // (requestAnimationFrame) keeps this robust against any editor-positioning
     // work Handsontable itself still has queued.
-    afterBeginEditing() {
+    afterBeginEditing(row: number, col: number) {
       requestAnimationFrame(() => {
         const hot = hotRef.current?.hotInstance;
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const editor = (hot as any)?.getActiveEditor?.();
         const textarea: HTMLTextAreaElement | undefined = editor?.TEXTAREA;
         if (!textarea) return;
+        // If editing began on a stored rollup, swap the editor text to the clean positional form
+        // (=XSUMRATE(2)); beforeChange expands it back to the stored reference on commit.
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const src = (hot as any)?.getSourceDataAtCell?.(row, col);
+        if (typeof src === "string") {
+          const disp = xsumToDisplay(src);
+          if (disp !== src && typeof editor.setValue === "function") editor.setValue(disp);
+        }
         cellEditorTextareaRef.current = textarea;
         textarea.addEventListener("input", handleCellEditorInput);
         textarea.addEventListener("blur", handleCellEditorBlur);
@@ -4702,7 +4564,9 @@ export function WorkbookView() {
       const hot = hotRef.current?.hotInstance as Handsontable | undefined;
       const cell = resolveCell();
       if (hot && cell) {
-        hot.setDataAtCell(cell.row, cell.col, activeCellValue);
+        // Expand a typed positional rollup (=XSUMRATE(2)) into the stored child-reference form the
+        // engine needs, using this cell's own position. No-op for any other input.
+        hot.setDataAtCell(cell.row, cell.col, xsumToStored(activeCellValue, curSheetPath(), cell.row));
         // Return keyboard focus to the grid so arrow keys work immediately
         requestAnimationFrame(() => (hot.rootElement as HTMLElement)?.focus());
       }

@@ -24,15 +24,15 @@ import { pathToSheetName } from "./workbookSheetNames";
 // Upper bound of rows summed from a child column (sheets grow in 50-row chunks).
 const CHILD_ROWS = 1000;
 
-/** An explicit-range SUM over one column of a child sheet, e.g. `=SUM(L1_sR3!H1:H1000)`.
- *  The upgrade emits these (rather than the volatile XSUM* functions) because an explicit range
- *  creates a real HyperFormula dependency edge child→parent, so a multi-level rollup chain
- *  converges in a single recalc. Volatile XSUM* has no edge and can read a stale child mid-cycle
- *  (see the convergence note in the roadmap); it stays for hand-typed CostX-syntax cells. */
-function childColSum(childPath: string, col: number): string {
+/** A CostX-named XSUM over one column of a child sheet, e.g. `=XSUMRATE(L1_sR3!H1:H1000)`. The
+ *  child range is an explicit argument, so HyperFormula builds a real dependency edge child→parent
+ *  and a multi-level rollup chain converges in one recalc (a volatile function deriving its child
+ *  implicitly does not — see the roadmap). `fn` is the CostX function whose name documents intent
+ *  (XSUMTOT/XSUMRATE/XSUMQTY/XSUMUSER/XSUMRATEUSER); all are ROUND(SUM(range), dp). */
+function childColSum(fn: string, childPath: string, col: number): string {
   const name = pathToSheetName(childPath);
   const c = legacyColLetter(col);
-  return `=SUM(${name}!${c}1:${c}${CHILD_ROWS})`;
+  return `=${fn}(${name}!${c}1:${c}${CHILD_ROWS})`;
 }
 
 /** User-column *totals* rolled from a child COST sheet at L1 (J,L,N,P → user 2,4,6,8). */
@@ -92,20 +92,21 @@ export function transformSheetsToV2(
       const qtyChild = `${path}/Q${r}`;
 
       if (depth === 1) {
-        // Cost / trade-summary sheet: F:Subtotal + the J/L/N/P totals roll from the L2 child's
-        // corresponding columns (its H, and its user 2/4/6/8 columns).
+        // Cost / trade-summary sheet: F:Subtotal (XSUMTOT) + the J/L/N/P totals (XSUMUSER) roll
+        // from the L2 child's H and user 2/4/6/8 columns.
         if (hasRateChild) {
-          setCell(path, r, COL_SUBTOTAL, childColSum(rateChild, COL_TOTAL));
-          for (const n of COST_TOTAL_USER_NS) setCell(path, r, userCol(n), childColSum(rateChild, userCol(n)));
+          setCell(path, r, COL_SUBTOTAL, childColSum("XSUMTOT", rateChild, COL_TOTAL));
+          for (const n of COST_TOTAL_USER_NS) setCell(path, r, userCol(n), childColSum("XSUMUSER", rateChild, userCol(n)));
         }
       } else {
-        // Takeoff sheet: E:Rate + I/K/M/O from the rate build-up; C:Quantity from the qty build-up.
+        // Takeoff sheet: E:Rate (XSUMRATE) + I/K/M/O (XSUMRATEUSER) from the rate build-up;
+        // C:Quantity (XSUMQTY) from the qty build-up.
         if (hasRateChild) {
-          setCell(path, r, COL_RATE, childColSum(rateChild, COL_TOTAL));
-          for (const n of RATE_USER_NS) setCell(path, r, userCol(n), childColSum(rateChild, userCol(n)));
+          setCell(path, r, COL_RATE, childColSum("XSUMRATE", rateChild, COL_TOTAL));
+          for (const n of RATE_USER_NS) setCell(path, r, userCol(n), childColSum("XSUMRATEUSER", rateChild, userCol(n)));
         }
         if (hasQtyChild) {
-          setCell(path, r, COL_QTY, childColSum(qtyChild, COL_TOTAL));
+          setCell(path, r, COL_QTY, childColSum("XSUMQTY", qtyChild, COL_TOTAL));
         }
       }
     }

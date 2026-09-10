@@ -67,14 +67,14 @@ describe("transformSheetsToV2", () => {
     const t = transformed.get("L1/R0")!;
 
     // L1 summary: F and J(Lab-Total) → explicit-range SUM of the L2 child's H and J columns.
-    expect(l1[0][COL_SUBTOTAL]).toBe("=SUM(L1_sR0!H1:H1000)");
-    expect(l1[0][COL_LAB_TOTAL]).toBe("=SUM(L1_sR0!J1:J1000)"); // J = user col 2
+    expect(l1[0][COL_SUBTOTAL]).toBe("=XSUMTOT(L1_sR0!H1:H1000)");
+    expect(l1[0][COL_LAB_TOTAL]).toBe("=XSUMUSER(L1_sR0!J1:J1000)"); // J = user col 2
     expect(l1[0][COL_TOTAL]).toBe("=F1*G1");                     // H formula untouched
 
     // Takeoff slab row (has both children): C from the qty child, E + I from the rate child.
-    expect(t[0][COL_QTY]).toBe("=SUM(L1_sR0_sQ0!H1:H1000)");
-    expect(t[0][COL_RATE]).toBe("=SUM(L1_sR0_sR0!H1:H1000)");
-    expect(t[0][COL_LAB]).toBe("=SUM(L1_sR0_sR0!I1:I1000)"); // I = user col 1
+    expect(t[0][COL_QTY]).toBe("=XSUMQTY(L1_sR0_sQ0!H1:H1000)");
+    expect(t[0][COL_RATE]).toBe("=XSUMRATE(L1_sR0_sR0!H1:H1000)");
+    expect(t[0][COL_LAB]).toBe("=XSUMRATEUSER(L1_sR0_sR0!I1:I1000)"); // I = user col 1
     expect(t[0][COL_SUBTOTAL]).toBe("=E1*C1");               // F formula untouched
     expect(t[0][COL_LAB_TOTAL]).toBe("=I1*C1");              // J formula untouched
 
@@ -94,7 +94,7 @@ describe("transformSheetsToV2", () => {
     });
     expect(transformed.get("L1")![0][COL_SUBTOTAL]).toBe("6000");   // excluded: literal kept
     expect(transformed.get("L1/R0")![0][COL_QTY]).toBe("25");        // linked: literal kept
-    expect(transformed.get("L1/R0")![0][COL_RATE]).toBe("=SUM(L1_sR0_sR0!H1:H1000)"); // others still upgraded
+    expect(transformed.get("L1/R0")![0][COL_RATE]).toBe("=XSUMRATE(L1_sR0_sR0!H1:H1000)"); // others still upgraded
   });
 });
 
