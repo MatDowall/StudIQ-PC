@@ -10,6 +10,7 @@ export function WorkbookMenu() {
   const activeTab = useAppStore((state) => state.activeTab);
   const openTemplateManager = useAppStore((state) => state.openTemplateManager);
   const openNamedCellsManager = useAppStore((state) => state.openNamedCellsManager);
+  const openColumnLayoutManager = useAppStore((state) => state.openColumnLayoutManager);
   const setWorkbookConfirmAction = useAppStore((state) => state.setWorkbookConfirmAction);
 
   const isWorkbookTabActive = activeTab === "workbook";
@@ -17,6 +18,7 @@ export function WorkbookMenu() {
   const items: MenuItem[] = [
     { label: "Template Manager", icon: "dashboard_customize", enabled: isWorkbookTabActive, onClick: () => openTemplateManager() },
     { label: "Named Cells", icon: "sell", enabled: isWorkbookTabActive, onClick: () => openNamedCellsManager() },
+    { label: "Column Layout", icon: "view_column", enabled: isWorkbookTabActive, onClick: () => openColumnLayoutManager() },
     { label: "Rate Library", icon: "price_change", enabled: isWorkbookTabActive && !!activeProject, onClick: () => setShowRateLibrary(true) },
     { divider: true, label: "", enabled: false },
     { label: "Clean orphaned sheets", icon: "cleaning_services", enabled: isWorkbookTabActive, onClick: () => setWorkbookConfirmAction("clean") },

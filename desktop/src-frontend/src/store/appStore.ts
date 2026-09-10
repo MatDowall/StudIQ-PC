@@ -508,6 +508,7 @@ interface AppStore {
   templateManagerOpen: boolean;
   templateEditMode: TemplateEditMode | null;
   namedCellsManagerOpen: boolean;
+  columnLayoutManagerOpen: boolean;
   workbookConfirmAction: "clean" | "clear" | null;
   preTemplateRevisionId: number | null;
 
@@ -612,6 +613,8 @@ interface AppStore {
   /** Persist a revision's column layout (M2). `layoutJson` is null to reset to the default. */
   saveWorkbookLayout: (revisionId: number, layoutJson: string | null) => Promise<void>;
 
+  openColumnLayoutManager: () => void;
+  closeColumnLayoutManager: () => void;
   openNamedCellsManager: () => void;
   closeNamedCellsManager: () => void;
   setWorkbookConfirmAction: (action: "clean" | "clear" | null) => void;
@@ -1000,6 +1003,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
   templateManagerOpen: false,
   templateEditMode: null,
   namedCellsManagerOpen: false,
+  columnLayoutManagerOpen: false,
   workbookConfirmAction: null,
   preTemplateRevisionId: null,
 
@@ -2313,6 +2317,8 @@ export const useAppStore = create<AppStore>((set, get) => ({
     set({ templates });
   },
 
+  openColumnLayoutManager: () => set({ columnLayoutManagerOpen: true }),
+  closeColumnLayoutManager: () => set({ columnLayoutManagerOpen: false }),
   openNamedCellsManager: () => set({ namedCellsManagerOpen: true }),
   closeNamedCellsManager: () => set({ namedCellsManagerOpen: false }),
   setWorkbookConfirmAction: (action) => set({ workbookConfirmAction: action }),

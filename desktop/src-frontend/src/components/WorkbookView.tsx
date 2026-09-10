@@ -18,6 +18,7 @@ import { TemplateManagerDialog } from "./TemplateManagerDialog";
 import { ContextMenu, type ContextMenuEntry } from "./ContextMenu";
 import { TextInputDialog } from "./TextInputDialog";
 import { NamedCellsManagerDialog, type NamedCellEntry } from "./NamedCellsManagerDialog";
+import { ColumnLayoutDialog } from "./ColumnLayoutDialog";
 import { ImportDimensionDialog, type ImportDisplayOption } from "./ImportDimensionDialog";
 import { quantityValueText, type Quantity } from "../lib/quantity";
 import type { ArrayGroupBreakdown, FramingGroupBreakdown } from "../lib/framing";
@@ -36,7 +37,8 @@ import {
 } from "../lib/workbookCalc";
 import { WorkbookEngine } from "../lib/workbookEngine";
 import {
-  DEFAULT_WORKBOOK_LAYOUT, standardColumns, qtyColumns,
+  DEFAULT_WORKBOOK_LAYOUT, standardColumns, qtyColumns, parseLayout, serializeLayout,
+  isDefaultLayout, FIRST_USER_COL, type WorkbookLayout,
 } from "../lib/workbookLayout";
 
 registerAllModules();
@@ -76,6 +78,18 @@ const COL_GROWTH_THRESHOLD = 2;  // grow once an edit lands within this many col
 // never truncates real saved data). `NUM_ROWS` is the single shared bound every
 // sheet's array is padded/iterated to — it only ever grows, never shrinks.
 let NUM_ROWS = 100;
+
+// Active column layout (M2), shared like NUM_ROWS across the single WorkbookView instance so the
+// module-scope `loadLevelData` / `growColsTo` can read it without threading a param through every
+// caller. Set from the active revision's `layout_json` whenever the revision changes (see the
+// effect in the component). A–H are fixed; only the user columns (I onward) vary.
+let activeLayout: WorkbookLayout = DEFAULT_WORKBOOK_LAYOUT;
+/** Columns for a sheet kind under the active layout — replaces the module-const COLUMNS/QTY_COLUMNS
+ *  in the display paths (headers/widths), so a renamed user column shows through. */
+function layoutColumnsFor(kind: SheetKind) {
+  return kind === "qty" ? qtyColumns(activeLayout) : standardColumns(activeLayout);
+}
+
 const ROW_GROWTH_CHUNK     = 50;
 const ROW_GROWTH_THRESHOLD = 5;  // grow once an edit lands within this many rows of the bottom
 // Column indices (COL_*), the pure rollup arithmetic, and the numeric-coercion helpers all
@@ -653,7 +667,7 @@ function loadLevelData(
   reRegisterNamed?: () => void,
 ): void {
   const kind = sheetKindForPath(path);
-  const base = kind === "qty" ? QTY_COLUMNS : COLUMNS;
+  const base = layoutColumnsFor(kind);
   const cols = Math.max(BASE_NUM_COLS, data.reduce((m, row) => Math.max(m, row?.length ?? 0), 0));
   hot.updateSettings({
     colHeaders: buildColHeaders(base, cols),
@@ -1295,6 +1309,9 @@ export function WorkbookView() {
   const [namedCellDialog, setNamedCellDialog] = useState<{ row: number; col: number } | null>(null);
   const namedCellsManagerOpen    = useAppStore(s => s.namedCellsManagerOpen);
   const closeNamedCellsManager   = useAppStore(s => s.closeNamedCellsManager);
+  const columnLayoutManagerOpen  = useAppStore(s => s.columnLayoutManagerOpen);
+  const closeColumnLayoutManager = useAppStore(s => s.closeColumnLayoutManager);
+  const saveWorkbookLayout       = useAppStore(s => s.saveWorkbookLayout);
 
   // Drag-and-drop import dialog (shown when more than one derived display is possible)
   // and the "Show dimension group" context menu for already-linked cells.
@@ -2536,7 +2553,7 @@ export function WorkbookView() {
     hot.alter("insert_col_end", insertAfter, targetCols - curCols);
     const path = curSheetPath();
     const kind = sheetKindForPath(path);
-    const base = kind === "qty" ? QTY_COLUMNS : COLUMNS;
+    const base = layoutColumnsFor(kind);
     hot.updateSettings({
       colHeaders: buildColHeaders(base, targetCols),
       colWidths:  buildColWidths(base, targetCols),
@@ -3109,6 +3126,12 @@ export function WorkbookView() {
   useEffect(() => {
     const revId = activeRevisionId;
     if (revId == null) return;
+
+    // Resolve this revision's column layout (M2) BEFORE any sheet loads, so loadLevelData's
+    // headers/widths reflect it. Read via getState() (not the `workbooks` closure) so this
+    // stays keyed on activeRevisionId alone. NULL layout_json ⇒ the shipped default.
+    const rev = useAppStore.getState().workbooks.flatMap(wb => wb.revisions).find(r => r.id === revId);
+    activeLayout = parseLayout(rev?.layout_json ?? null);
 
     // Reset navigation state
     pathStack.current = ["L1"];
@@ -5175,6 +5198,32 @@ export function WorkbookView() {
           onGoTo={goToNamedCell}
           onRename={(oldName, newName) => void renameNamedCell(oldName, newName)}
           onDelete={(name) => void removeNamedCell(name)}
+        />
+      )}
+
+      {columnLayoutManagerOpen && (
+        <ColumnLayoutDialog
+          layout={activeLayout}
+          onClose={closeColumnLayoutManager}
+          onSave={(next) => {
+            // Update the shared active layout, persist (NULL when it's the default), then
+            // re-apply headers/widths to the sheet on screen so the rename shows immediately.
+            activeLayout = next;
+            const revId = revIdRef.current;
+            if (revId != null) {
+              void saveWorkbookLayout(revId, isDefaultLayout(next) ? null : serializeLayout(next));
+            }
+            const hot = hotRef.current?.hotInstance;
+            if (hot) {
+              const base = layoutColumnsFor(sheetKindForPath(curSheetPath()));
+              const numCols = hot.countCols();
+              hot.updateSettings({
+                colHeaders: buildColHeaders(base, numCols),
+                colWidths:  buildColWidths(base, numCols),
+              });
+              hot.render();
+            }
+          }}
         />
       )}
     </div>
