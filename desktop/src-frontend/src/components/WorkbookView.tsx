@@ -35,6 +35,9 @@ import {
   rollupRateIntoL2, rollupQtyIntoL2, rollupL2IntoL1, deriveFactorTotal,
 } from "../lib/workbookCalc";
 import { WorkbookEngine } from "../lib/workbookEngine";
+import {
+  DEFAULT_WORKBOOK_LAYOUT, standardColumns, qtyColumns,
+} from "../lib/workbookLayout";
 
 registerAllModules();
 
@@ -44,52 +47,15 @@ registerAllModules();
 // AB, …) exactly as rows grow past the bottom — see `growColsTo` / `colLetterForIndex`.
 
 const EXTRA_COLUMN_WIDTH = 90;
-const EXTRA_COLUMN_LETTERS = ["Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"] as const;
 
-const COLUMNS = [
-  { letter: "A", label: "Code",         width: 80  },
-  { letter: "B", label: "Description",  width: 220 },
-  { letter: "C", label: "Quantity",     width: 90  },
-  { letter: "D", label: "Unit",         width: 65  },
-  { letter: "E", label: "Rate",         width: 85  },
-  { letter: "F", label: "Subtotal",     width: 95  },
-  { letter: "G", label: "Factor",       width: 75  },
-  { letter: "H", label: "Total",        width: 95  },
-  { letter: "I", label: "Lab",          width: 75  },
-  { letter: "J", label: "Lab - Total",  width: 95  },
-  { letter: "K", label: "Mat",          width: 75  },
-  { letter: "L", label: "Mat - Total",  width: 95  },
-  { letter: "M", label: "Sub",          width: 75  },
-  { letter: "N", label: "Sub - Total",  width: 95  },
-  { letter: "O", label: "Sum",          width: 75  },
-  { letter: "P", label: "Sum - Total",  width: 95  },
-  ...EXTRA_COLUMN_LETTERS.map(letter => ({ letter, label: "", width: EXTRA_COLUMN_WIDTH })),
-] as const;
-
-// Column layout for "Quantity Build-up" sub-sheets (drilled into from a Level 2
-// takeoff row's C:Quantity). A–H differ from the standard layout (Count/Length/
-// Width/Height/Factor/Quantity, with H = product of C×D×E×F×G); I–P (Lab/Mat/Sub/Sum
-// and their totals) are unchanged so the same pull-through machinery applies. Q–Z
-// are the same blank freeform columns as the standard layout.
-const QTY_COLUMNS = [
-  { letter: "A", label: "Code",         width: 80  },
-  { letter: "B", label: "Description",  width: 220 },
-  { letter: "C", label: "Count",        width: 80  },
-  { letter: "D", label: "Length",       width: 80  },
-  { letter: "E", label: "Width",        width: 80  },
-  { letter: "F", label: "Height",       width: 80  },
-  { letter: "G", label: "Factor",       width: 75  },
-  { letter: "H", label: "Quantity",     width: 95  },
-  { letter: "I", label: "Lab",          width: 75  },
-  { letter: "J", label: "Lab - Total",  width: 95  },
-  { letter: "K", label: "Mat",          width: 75  },
-  { letter: "L", label: "Mat - Total",  width: 95  },
-  { letter: "M", label: "Sub",          width: 75  },
-  { letter: "N", label: "Sub - Total",  width: 95  },
-  { letter: "O", label: "Sum",          width: 75  },
-  { letter: "P", label: "Sum - Total",  width: 95  },
-  ...EXTRA_COLUMN_LETTERS.map(letter => ({ letter, label: "", width: EXTRA_COLUMN_WIDTH })),
-] as const;
+// The column layouts are now sourced from the layout model (lib/workbookLayout.ts) rather than
+// hardcoded literals, so the same shape drives both the grid and a future per-workbook custom
+// layout. These two module-scope constants are the DEFAULT layout (byte-identical to the arrays
+// StudIQ shipped with — pinned by workbookLayout.test.ts). Per-revision custom layouts are
+// resolved from the active revision's layout_json inside the component; A–H stay fixed by role,
+// only columns I onward vary. `role` rides along on each entry (ignored by existing consumers).
+const COLUMNS = standardColumns(DEFAULT_WORKBOOK_LAYOUT);
+const QTY_COLUMNS = qtyColumns(DEFAULT_WORKBOOK_LAYOUT);
 
 // Number of columns is dynamic *per sheet* — every sheet starts with columns A–Z
 // (26) and grows into double-letter columns (AA, AB, …) independently, as the user
@@ -644,8 +610,9 @@ function deriveLevelFormulas(
           if (isExcluded(r, total)) continue;
           const srcVal = hot.getDataAtCell(r, src);
           if ((srcVal != null && srcVal !== "") || (cVal != null && cVal !== "")) {
-            const colLetter = COLUMNS[src].letter;
-            pass3.push([r, total, `=${colLetter}${r + 1}*C${r + 1}`]);
+            // Positional letter — formula generation must not depend on the (possibly
+            // customized) COLUMNS labels, only on the fixed column position.
+            pass3.push([r, total, `=${colLetter(src)}${r + 1}*C${r + 1}`]);
           }
         }
       }
@@ -3983,7 +3950,7 @@ export function WorkbookView() {
         const s = sumComputedCol(computedRows, src);
         if (!isCellExcluded(parentPath, rowInParent, src)) pass.push([rowInParent, src, s !== null ? String(s) : null]);
         if (!isCellExcluded(parentPath, rowInParent, total)) {
-          pass.push([rowInParent, total, s !== null ? `=${COLUMNS[src].letter}${rowInParent + 1}*C${rowInParent + 1}` : null]);
+          pass.push([rowInParent, total, s !== null ? `=${colLetter(src)}${rowInParent + 1}*C${rowInParent + 1}` : null]);
         }
       }
       if (pass.length) {
@@ -4481,13 +4448,13 @@ export function WorkbookView() {
                   if (col === COL_QTY) {
                     for (const [src, total] of pullThroughCols) {
                       if (isExcluded(row, total)) continue;
-                      pass3.push([row, total, `=${COLUMNS[src].letter}${row + 1}*C${row + 1}`]);
+                      pass3.push([row, total, `=${colLetter(src)}${row + 1}*C${row + 1}`]);
                     }
                   } else {
                     const match = pullThroughCols.find(([src]) => src === col);
                     if (match) {
                       const [src, total] = match;
-                      if (!isExcluded(row, total)) pass3.push([row, total, `=${COLUMNS[src].letter}${row + 1}*C${row + 1}`]);
+                      if (!isExcluded(row, total)) pass3.push([row, total, `=${colLetter(src)}${row + 1}*C${row + 1}`]);
                     }
                   }
                 }

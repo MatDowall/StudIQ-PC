@@ -250,6 +250,8 @@ export interface WorkbookRevisionDto {
   created_at: string;
   sort_order: number;
   project_total: number | null;
+  /** Per-workbook column layout (M2) as JSON, or null for the shipped default layout. */
+  layout_json: string | null;
 }
 
 export interface WorkbookDto {
@@ -607,6 +609,8 @@ interface AppStore {
   deleteWorkbookRevision: (revisionId: number) => Promise<void>;
   renameWorkbookRevision: (revisionId: number, name: string) => Promise<void>;
   setWorkbookRevisionProjectTotal: (revisionId: number, total: number | null) => Promise<void>;
+  /** Persist a revision's column layout (M2). `layoutJson` is null to reset to the default. */
+  saveWorkbookLayout: (revisionId: number, layoutJson: string | null) => Promise<void>;
 
   openNamedCellsManager: () => void;
   closeNamedCellsManager: () => void;
@@ -2290,6 +2294,18 @@ export const useAppStore = create<AppStore>((set, get) => ({
     try {
       await invoke("save_workbook_project_total", { revisionId, value: total });
     } catch { /* non-fatal — local value still reflects the latest edit */ }
+  },
+
+  saveWorkbookLayout: async (revisionId, layoutJson) => {
+    set((state) => ({
+      workbooks: state.workbooks.map((wb) => ({
+        ...wb,
+        revisions: wb.revisions.map((rev) =>
+          rev.id === revisionId ? { ...rev, layout_json: layoutJson } : rev,
+        ),
+      })),
+    }));
+    await invoke("save_workbook_layout", { revisionId, layoutJson });
   },
 
   loadTemplates: async () => {

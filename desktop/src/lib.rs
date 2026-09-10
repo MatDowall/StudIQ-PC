@@ -518,6 +518,8 @@ pub struct WorkbookRevisionDto {
     pub created_at: String,
     pub sort_order: i64,
     pub project_total: Option<f64>,
+    /// Per-workbook column layout (M2) as JSON, or NULL for the shipped default layout.
+    pub layout_json: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -2758,6 +2760,24 @@ async fn save_workbook_project_total(
     Ok(())
 }
 
+/// Persist a revision's column layout (M2). `layout_json` is `None` to clear it back to the
+/// shipped default (NULL in the DB), or a serialized WorkbookLayout for a customized layout.
+#[tauri::command]
+async fn save_workbook_layout(
+    state: State<'_, AppState>,
+    revision_id: i64,
+    layout_json: Option<String>,
+) -> Result<(), String> {
+    let db = active_project_db(state.inner())?;
+    sqlx::query("UPDATE workbook_revisions SET layout_json = ? WHERE id = ?")
+        .bind(layout_json)
+        .bind(revision_id)
+        .execute(&db)
+        .await
+        .map_err(|e| format!("Failed to save workbook layout: {e}"))?;
+    Ok(())
+}
+
 /// Create or update a named cell — a workbook-wide name bound to a single cell
 /// (identified by sheet path + row/col) that can be referenced from formulas at
 /// any level. Names are unique per revision; saving an existing name moves it.
@@ -2929,7 +2949,7 @@ async fn list_workbooks(state: State<'_, AppState>) -> Result<Vec<WorkbookDto>, 
         let wb_name: String = wb_row.try_get("name").map_err(|e| e.to_string())?;
 
         let rev_rows = sqlx::query(
-            "SELECT id, workbook_id, name, created_at, sort_order, project_total \
+            "SELECT id, workbook_id, name, created_at, sort_order, project_total, layout_json \
              FROM workbook_revisions WHERE workbook_id = ? ORDER BY sort_order, id",
         )
         .bind(wb_id)
@@ -2954,6 +2974,9 @@ async fn list_workbooks(state: State<'_, AppState>) -> Result<Vec<WorkbookDto>, 
                         .map_err(|e: sqlx::Error| e.to_string())?,
                     project_total: row
                         .try_get("project_total")
+                        .map_err(|e: sqlx::Error| e.to_string())?,
+                    layout_json: row
+                        .try_get("layout_json")
                         .map_err(|e: sqlx::Error| e.to_string())?,
                 })
             })
@@ -3025,6 +3048,7 @@ async fn create_workbook_revision(
         created_at,
         sort_order,
         project_total: None,
+        layout_json: None,
     })
 }
 
@@ -3217,6 +3241,7 @@ async fn create_workbook_revision_from_template(
         created_at,
         sort_order,
         project_total: None,
+        layout_json: None,
     })
 }
 
@@ -3421,6 +3446,7 @@ async fn copy_workbook_revision(
         created_at,
         sort_order,
         project_total: None,
+        layout_json: None,
     })
 }
 
@@ -4663,6 +4689,12 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), String> {
     // cell (L1/H:Total), refreshed by the frontend whenever it changes. Lets the
     // workbook sidebar show a project total without re-evaluating formulas.
     let _ = sqlx::query("ALTER TABLE workbook_revisions ADD COLUMN project_total REAL")
+        .execute(pool)
+        .await;
+
+    // Additive: per-workbook column layout (M2) as JSON. NULL = the shipped default layout,
+    // so every pre-existing revision is already correct with no backfill.
+    let _ = sqlx::query("ALTER TABLE workbook_revisions ADD COLUMN layout_json TEXT")
         .execute(pool)
         .await;
 
@@ -6058,6 +6090,7 @@ pub fn run() {
             delete_workbook_named_cell,
             load_workbook_named_cells,
             save_workbook_project_total,
+            save_workbook_layout,
             delete_workbook_sheet_subtree,
             clear_workbook_revision_data,
             list_workbooks,
