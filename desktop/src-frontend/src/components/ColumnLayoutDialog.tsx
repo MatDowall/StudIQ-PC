@@ -23,9 +23,15 @@ const FIXED_QTY = ["Code", "Description", "Count", "Length", "Width", "Height", 
  *  resized by dragging in the grid); this dialog is about names. */
 export function ColumnLayoutDialog({ layout, onClose, onSave }: ColumnLayoutDialogProps) {
   const [labels, setLabels] = useState<string[]>(layout.userColumns.map((c) => c.label));
+  const [formulas, setFormulas] = useState<string[]>(layout.userColumns.map((c) => c.rowFormula ?? ""));
 
   const commit = () => {
-    const userColumns = layout.userColumns.map((c, i) => ({ ...c, label: labels[i] ?? c.label }));
+    const userColumns = layout.userColumns.map((c, i) => {
+      const rowFormula = (formulas[i] ?? "").trim();
+      const next: typeof c = { ...c, label: labels[i] ?? c.label };
+      if (rowFormula) next.rowFormula = rowFormula; else delete next.rowFormula;
+      return next;
+    });
     onSave({ userColumns });
     onClose();
   };
@@ -35,17 +41,21 @@ export function ColumnLayoutDialog({ layout, onClose, onSave }: ColumnLayoutDial
     onClose();
   };
 
-  const edited = labels.some((l, i) => l !== (layout.userColumns[i]?.label ?? ""));
+  const edited =
+    labels.some((l, i) => l !== (layout.userColumns[i]?.label ?? "")) ||
+    formulas.some((f, i) => f.trim() !== (layout.userColumns[i]?.rowFormula ?? ""));
   const rowStyle: React.CSSProperties = { display: "flex", alignItems: "center", gap: 8, height: 26 };
   const letterCell: React.CSSProperties = { width: 28, textAlign: "center", color: theme.text.muted, fontVariantNumeric: "tabular-nums" };
 
   return (
-    <DialogShell title="Column Layout" width={460} zIndex={1240} onClose={onClose}>
+    <DialogShell title="Column Layout" width={620} zIndex={1240} onClose={onClose}>
       <div style={{ padding: 14, display: "flex", flexDirection: "column", gap: 12 }}>
         <div style={{ fontSize: 12, color: theme.text.secondary, lineHeight: 1.5 }}>
           Columns <strong>A–H are fixed</strong> by role. Everything from column <strong>I</strong> onward
-          is yours to name — rename the built-in Lab/Mat/Sub/Sum split or repurpose the blank
-          columns. Names apply to every sheet in this workbook.
+          is yours: set each column's <strong>name</strong> and the <strong>formula</strong> it computes on
+          every line. Use <code>{"{r}"}</code> for the row (e.g. <code>=I{"{r}"}*C{"{r}"}</code>) or a
+          positional rollup (e.g. <code>=XSUMRATEUSER(1)</code>). Leave the formula blank for a plain
+          input column. Applies to every sheet in this workbook.
         </div>
 
         {/* Fixed A–H, read-only */}
@@ -80,7 +90,19 @@ export function ColumnLayoutDialog({ layout, onClose, onSave }: ColumnLayoutDial
                   onChange={(e) => setLabels((prev) => prev.map((l, j) => (j === i ? e.target.value : l)))}
                   onKeyDown={(e) => { if (e.key === "Enter") commit(); }}
                   style={{
-                    flex: 1, height: 24, padding: "0 8px", fontSize: 12,
+                    width: 130, height: 24, padding: "0 8px", fontSize: 12,
+                    background: theme.bg.input, color: theme.text.primary,
+                    border: `1px solid ${theme.border.subtle}`, borderRadius: 4,
+                  }}
+                />
+                <input
+                  value={formulas[i]}
+                  placeholder="formula, e.g. =XSUMRATEUSER(1) or =I{r}*C{r}"
+                  onChange={(e) => setFormulas((prev) => prev.map((f, j) => (j === i ? e.target.value : f)))}
+                  onKeyDown={(e) => { if (e.key === "Enter") commit(); }}
+                  spellCheck={false}
+                  style={{
+                    flex: 1, height: 24, padding: "0 8px", fontSize: 12, fontFamily: "monospace",
                     background: theme.bg.input, color: theme.text.primary,
                     border: `1px solid ${theme.border.subtle}`, borderRadius: 4,
                   }}

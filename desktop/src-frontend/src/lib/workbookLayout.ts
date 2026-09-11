@@ -28,6 +28,12 @@ export interface ColumnDef {
 export interface UserColumn {
   label: string;       // "" for a blank freeform column (renders as just the letter)
   width: number;
+  /** Per-row formula the template assigns to this column, with an `{r}` placeholder for the
+   *  1-based row (e.g. `=I{r}*C{r}`, or the positional `=XSUMRATEUSER(1)`). The app applies it
+   *  generically to each line row of a cost sheet — it never hardcodes what a user column does.
+   *  Empty/undefined = a plain input column. Positional XSUM* forms are expanded to the stored
+   *  child reference when applied. */
+  rowFormula?: string;
 }
 
 export interface WorkbookLayout {
@@ -65,15 +71,18 @@ const QTY_FIXED: ReadonlyArray<Omit<ColumnDef, "letter">> = [
 
 // The shipped user columns: the Lab/Mat/Sub/Sum pull-through block (I–P) plus ten blank
 // freeform columns (Q–Z). This is what a NULL layout_json resolves to.
+// The shipped LPMS split, now expressed as template-owned formulae: each per-unit column pulls
+// its component from the rate build-up (=XSUMRATEUSER(n)), each "- Total" is per-unit × Quantity.
+// The app applies these generically per row — nothing about Lab/Mat/Sub/Sum is hardcoded.
 const DEFAULT_USER_COLUMNS: ReadonlyArray<UserColumn> = [
-  { label: "Lab",         width: 75 },
-  { label: "Lab - Total", width: 95 },
-  { label: "Mat",         width: 75 },
-  { label: "Mat - Total", width: 95 },
-  { label: "Sub",         width: 75 },
-  { label: "Sub - Total", width: 95 },
-  { label: "Sum",         width: 75 },
-  { label: "Sum - Total", width: 95 },
+  { label: "Lab",         width: 75, rowFormula: "=XSUMRATEUSER(1)" },
+  { label: "Lab - Total", width: 95, rowFormula: "=I{r}*C{r}" },
+  { label: "Mat",         width: 75, rowFormula: "=XSUMRATEUSER(3)" },
+  { label: "Mat - Total", width: 95, rowFormula: "=K{r}*C{r}" },
+  { label: "Sub",         width: 75, rowFormula: "=XSUMRATEUSER(5)" },
+  { label: "Sub - Total", width: 95, rowFormula: "=M{r}*C{r}" },
+  { label: "Sum",         width: 75, rowFormula: "=XSUMRATEUSER(7)" },
+  { label: "Sum - Total", width: 95, rowFormula: "=O{r}*C{r}" },
   ...Array.from({ length: NUM_BLANK_TRAILING }, () => ({ label: "", width: EXTRA_COLUMN_WIDTH })),
 ];
 
@@ -124,6 +133,7 @@ export function parseLayout(json: string | null | undefined): WorkbookLayout {
     const userColumns: UserColumn[] = raw.userColumns.map((c) => ({
       label: typeof c?.label === "string" ? c.label : "",
       width: typeof c?.width === "number" && isFinite(c.width) && c.width > 0 ? c.width : EXTRA_COLUMN_WIDTH,
+      ...(typeof c?.rowFormula === "string" && c.rowFormula.trim() !== "" ? { rowFormula: c.rowFormula } : {}),
     }));
     return { userColumns };
   } catch {
@@ -139,5 +149,6 @@ export function serializeLayout(layout: WorkbookLayout): string {
 export function isDefaultLayout(layout: WorkbookLayout): boolean {
   const d = DEFAULT_WORKBOOK_LAYOUT.userColumns;
   if (layout.userColumns.length !== d.length) return false;
-  return layout.userColumns.every((c, i) => c.label === d[i].label && c.width === d[i].width);
+  return layout.userColumns.every((c, i) =>
+    c.label === d[i].label && c.width === d[i].width && (c.rowFormula ?? "") === (d[i].rowFormula ?? ""));
 }

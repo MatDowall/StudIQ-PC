@@ -55,6 +55,15 @@ describe("default layout is byte-identical to the shipped columns", () => {
   it("every user column has role 'user'", () => {
     expect(standardColumns(DEFAULT_WORKBOOK_LAYOUT).slice(FIRST_USER_COL).every((c) => c.role === "user")).toBe(true);
   });
+
+  it("default user columns carry the LPMS pull-through as template formulae", () => {
+    const u = DEFAULT_WORKBOOK_LAYOUT.userColumns;
+    expect(u[0].rowFormula).toBe("=XSUMRATEUSER(1)"); // I: Lab pulled from the rate build-up
+    expect(u[1].rowFormula).toBe("=I{r}*C{r}");        // J: Lab-Total = Lab × Qty
+    expect(u[6].rowFormula).toBe("=XSUMRATEUSER(7)");  // O: Sum
+    expect(u[7].rowFormula).toBe("=O{r}*C{r}");        // P: Sum-Total
+    expect(u[8].rowFormula).toBeUndefined();           // Q: blank freeform, no formula
+  });
 });
 
 describe("columnLetterForIndex", () => {
@@ -76,17 +85,23 @@ describe("parse / serialize round-trip and legacy default", () => {
     expect(isDefaultLayout(parseLayout("not json"))).toBe(true);
     expect(isDefaultLayout(parseLayout("{}"))).toBe(true);
   });
-  it("round-trips a custom layout", () => {
+  it("round-trips a custom layout, including rowFormula", () => {
     const custom: WorkbookLayout = {
       userColumns: [
-        { label: "Hours", width: 70 },
-        { label: "Hours - Total", width: 90 },
+        { label: "Hours", width: 70, rowFormula: "=XSUMRATEUSER(1)/40" },
+        { label: "Hours - Total", width: 90, rowFormula: "=I{r}*C{r}" },
         { label: "", width: 90 },
       ],
     };
     const back = parseLayout(serializeLayout(custom));
     expect(back.userColumns).toEqual(custom.userColumns);
     expect(isDefaultLayout(back)).toBe(false);
+  });
+
+  it("a changed rowFormula alone makes a layout non-default", () => {
+    const layout = parseLayout(null);
+    layout.userColumns[0].rowFormula = "=XSUMRATEUSER(2)"; // was =XSUMRATEUSER(1)
+    expect(isDefaultLayout(layout)).toBe(false);
   });
   it("a renamed user column reaches the built columns while A–H stay fixed", () => {
     const custom = parseLayout(serializeLayout({

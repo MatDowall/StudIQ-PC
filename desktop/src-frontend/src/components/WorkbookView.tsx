@@ -563,6 +563,7 @@ function deriveLevelFormulas(
   level: Level,
   guardRef: React.MutableRefObject<boolean>,
   kind: SheetKind = "standard",
+  path = "",
   excluded?: Set<string>,
 ): void {
   if (guardRef.current) return;
@@ -636,26 +637,35 @@ function deriveLevelFormulas(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     if (pass2.length) hot.setDataAtCell(pass2 as any);
 
-    // Pass 3: J/L/N/P = Lab/Mat/Sub/Sum (I/K/M/O) × Quantity (C) on every cost sheet at any depth.
-    // Skips a total that is a drilled =XSUMUSER rollup (it comes from the child cost sheet's own
-    // totals, not from this row's rate×qty).
-    {
+    // Pass 3 — USER COLUMNS (I onward) are TEMPLATE-OWNED (M6): apply each user column's own
+    // `rowFormula` from the active layout, generically, with no hardcoded knowledge of what any
+    // column means. A `{r}` placeholder becomes the 1-based row; a positional XSUM* form is
+    // expanded to its stored child reference for this cell (via xsumToStored). Only on cost sheets
+    // (rate/qty leaves are where the estimator types the component values). A cell is filled only
+    // when it is empty or already holds a formula — a hand-typed literal is preserved (the manual
+    // override), and an excluded cell is left alone.
+    if (isCostSheetPath(path)) {
       const pass3: Array<[number, number, string]> = [];
-      const pullThroughCols: Array<[number, number]> = [
-        [COL_LAB, COL_LAB_TOTAL],
-        [COL_MAT, COL_MAT_TOTAL],
-        [COL_SUB, COL_SUB_TOTAL],
-        [COL_SUM, COL_SUM_TOTAL],
-      ];
+      const userCols = activeLayout.userColumns;
+      const has = (r: number, c: number) => { const v = hot.getDataAtCell(r, c); return v != null && v !== ""; };
       for (let r = 0; r < NUM_ROWS; r++) {
-        const cVal = hot.getDataAtCell(r, COL_QTY);
-        for (const [src, total] of pullThroughCols) {
-          if (isExcluded(r, total) || isXsum(r, total)) continue;
-          const srcVal = hot.getDataAtCell(r, src);
-          if ((srcVal != null && srcVal !== "") || (cVal != null && cVal !== "")) {
-            // Positional letter — formula generation must not depend on the (possibly
-            // customized) COLUMNS labels, only on the fixed column position.
-            pass3.push([r, total, `=${colLetter(src)}${r + 1}*C${r + 1}`]);
+        // A row is "active" (gets its template formulae) once it has any Code/Description/Qty/Rate.
+        if (!(has(r, COL_CODE) || has(r, COL_DESC) || has(r, COL_QTY) || has(r, COL_RATE))) continue;
+        for (let u = 0; u < userCols.length; u++) {
+          const col = FIRST_USER_COL + u;
+          if (isExcluded(r, col)) continue;
+          const tmpl = userCols[u].rowFormula;
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const src = (hot as any).getSourceDataAtCell(r, col);
+          const hasLiteral = typeof src === "string" && src !== "" && !src.startsWith("=");
+          if (hasLiteral) continue; // preserve a manual override (a typed value)
+          if (tmpl) {
+            const formula = xsumToStored(tmpl.replace(/\{r\}/g, String(r + 1)), path, r);
+            if (String(src ?? "") !== formula) pass3.push([r, col, formula]);
+          } else if (typeof src === "string" && src.startsWith("=")) {
+            // No template formula for this column: clear any lingering formula so the column
+            // truly reverts to a plain input — the template is authoritative.
+            pass3.push([r, col, ""]);
           }
         }
       }
@@ -722,7 +732,7 @@ function loadLevelData(
   } else {
     hot.loadData(dataForHot(data));
   }
-  deriveLevelFormulas(hot, level, guardRef, kind, excluded);
+  deriveLevelFormulas(hot, level, guardRef, kind, path, excluded);
 }
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -1463,7 +1473,7 @@ export function WorkbookView() {
       setCellExcluded(path, row, col, exclude);
     }
     hot.render();
-    deriveLevelFormulas(hot, levelRef.current, isAutoUpdatingRef, sheetKindForPath(path), cellExclusionMap.current.get(path));
+    deriveLevelFormulas(hot, levelRef.current, isAutoUpdatingRef, sheetKindForPath(path), path, cellExclusionMap.current.get(path));
   }
 
   // ── Named cells ─────────────────────────────────────────────────────────
@@ -2075,7 +2085,7 @@ export function WorkbookView() {
 
     // Regenerate F/H/J/L/N/P for every row (cheap, idempotent) now that the moved
     // rows' inputs sit at their new positions.
-    deriveLevelFormulas(hot, levelRef.current, isAutoUpdatingRef, "standard", cellExclusionMap.current.get(path));
+    deriveLevelFormulas(hot, levelRef.current, isAutoUpdatingRef, "standard", path, cellExclusionMap.current.get(path));
   }
 
   /** Inserts plain `Description`/`Quantity`/`Unit` line items directly below `afterRow` on the
@@ -2771,7 +2781,7 @@ export function WorkbookView() {
     }
 
     // Regenerate row-relative formula cells at their new positions.
-    deriveLevelFormulas(hot, levelRef.current, isAutoUpdatingRef, sheetKindForPath(path), cellExclusionMap.current.get(path));
+    deriveLevelFormulas(hot, levelRef.current, isAutoUpdatingRef, sheetKindForPath(path), path, cellExclusionMap.current.get(path));
   }
 
   /**
@@ -2897,7 +2907,7 @@ export function WorkbookView() {
       }
     }
 
-    deriveLevelFormulas(hot, levelRef.current, isAutoUpdatingRef, sheetKindForPath(path), cellExclusionMap.current.get(path));
+    deriveLevelFormulas(hot, levelRef.current, isAutoUpdatingRef, sheetKindForPath(path), path, cellExclusionMap.current.get(path));
   }
 
   /**
@@ -3302,14 +3312,15 @@ export function WorkbookView() {
     // HyperFormula orders the child's own formulas (F=E*C, H=F*G) BEFORE this rollup — required
     // for correctness. All XSUM* are ROUND(SUM(range), dp); the name documents intent.
     const xsum = (fn: string, c: number) => `=${fn}(${childName}!${legacyColLetter(c)}1:${legacyColLetter(c)}${XSUM_ROW_BOUND})`;
+    // Write ONLY the drilled A–H cell (fixed by role). The user columns' pull-through (I/K/M/O =
+    // XSUMRATEUSER, etc.) is NOT injected here — it comes from each column's template rowFormula,
+    // applied generically by deriveLevelFormulas. The app no longer hardcodes what a user column does.
     const writes: Array<[number, number, string]> = [];
     const put = (c: number, formula: string) => { if (!isCellExcluded(parentPath, row, c)) writes.push([row, c, formula]); };
     if (col === COL_SUBTOTAL) {
       put(COL_SUBTOTAL, xsum("XSUMTOT", COL_TOTAL));
-      for (const n of [2, 4, 6, 8]) put(FIRST_USER_COL + n - 1, xsum("XSUMUSER", FIRST_USER_COL + n - 1));
     } else if (col === COL_RATE) {
       put(COL_RATE, xsum("XSUMRATE", COL_TOTAL));
-      for (const n of [1, 3, 5, 7]) put(FIRST_USER_COL + n - 1, xsum("XSUMRATEUSER", FIRST_USER_COL + n - 1));
     } else if (col === COL_QTY) {
       if (getCellLink(parentPath, row, COL_QTY)) return; // dimension-linked: keep the live import
       put(COL_QTY, xsum("XSUMQTY", COL_TOTAL));
@@ -4200,124 +4211,18 @@ export function WorkbookView() {
         }
 
         const kind = sheetKindForPath(curSheetPath());
-        const excludedSet = cellExclusionMap.current.get(curSheetPath());
-        const isExcluded = (r: number, c: number) => excludedSet != null && excludedSet.has(styleKey(r, c));
 
-        if (kind === "qty") {
-          // ── Quantity Build-up auto-derivation: H = C×D×E×F×G, G auto-populate=1 ──
-          const rowsToProcess = new Set<number>();
-          for (const ch of changes) {
-            const row = ch[0];
-            const col = typeof ch[1] === "number" ? ch[1] : -1;
-            if (row < 0 || col < 0) continue;
-            if (col === COL_COUNT || col === COL_LENGTH || col === COL_WIDTH
-              || col === COL_HEIGHT || col === COL_FACTOR) rowsToProcess.add(row);
-          }
-          if (rowsToProcess.size > 0) {
-            isAutoUpdatingRef.current = true;
-            try {
-              const pass: Array<[number, number, string]> = [];
-              for (const r of rowsToProcess) {
-                const vals = [COL_COUNT, COL_LENGTH, COL_WIDTH, COL_HEIGHT].map(c => hot.getDataAtCell(r, c));
-                if (!vals.some(v => v != null && v !== "")) continue;
-
-                if (!isExcluded(r, COL_FACTOR)) {
-                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                  const gSrc = (hot as any).getSourceDataAtCell(r, COL_FACTOR);
-                  if (gSrc == null || String(gSrc) === "") {
-                    pass.push([r, COL_FACTOR, "1"]);
-                  }
-                }
-                if (!isExcluded(r, COL_TOTAL)) pass.push([r, COL_TOTAL, qtyTotalFormula(r)]);
-              }
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              if (pass.length) hot.setDataAtCell(pass as any);
-            } finally {
-              isAutoUpdatingRef.current = false;
-            }
-          }
-        } else {
-          // Collect rows where C/E changed (need F rewrite) and rows where F/G
-          // changed (need G auto-populate check + H rewrite).
-          const cOrERows = new Set<number>();
-          const fOrGRows = new Set<number>();
-          for (const ch of changes) {
-            const row = ch[0];
-            const col = typeof ch[1] === "number" ? ch[1] : -1;
-            if (row < 0 || col < 0) continue;
-            if (col === COL_QTY || col === COL_RATE)          cOrERows.add(row);
-            if (col === COL_SUBTOTAL || col === COL_FACTOR)   fOrGRows.add(row);
-          }
-          const rowsToProcess = new Set([...cOrERows, ...fOrGRows]);
-
-          if (rowsToProcess.size > 0) {
-            isAutoUpdatingRef.current = true;
-            try {
-              // Pass 1: write F = E×C for rows where C or E changed (levels 2 & 3 only —
-              // at level 1, F is populated by the level-2 drill-up rollup, not from C×E).
-              const pass1: Array<[number, number, string]> = [];
-              if (levelRef.current >= 2) {
-                for (const r of cOrERows) {
-                  if (isExcluded(r, COL_SUBTOTAL)) continue;
-                  pass1.push([r, COL_SUBTOTAL, `=E${r + 1}*C${r + 1}`]);
-                }
-              }
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              if (pass1.length) hot.setDataAtCell(pass1 as any);
-
-              // Pass 2: for every affected row, conditionally set G=1 and write H=F×G.
-              const pass2: Array<[number, number, string]> = [];
-              for (const r of rowsToProcess) {
-                const fRaw = hot.getDataAtCell(r, COL_SUBTOTAL);
-                const f = typeof fRaw === "number" ? fRaw : parseFloat(String(fRaw ?? "")) || 0;
-
-                if (!isExcluded(r, COL_FACTOR)) {
-                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                  const gSrc = (hot as any).getSourceDataAtCell(r, COL_FACTOR);
-                  if (f > 0 && (gSrc == null || String(gSrc) === "")) {
-                    pass2.push([r, COL_FACTOR, "1"]);
-                  }
-                }
-
-                if (!isExcluded(r, COL_TOTAL)) pass2.push([r, COL_TOTAL, `=F${r + 1}*G${r + 1}`]);
-              }
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              if (pass2.length) hot.setDataAtCell(pass2 as any);
-
-              // Pass 3 (Level 2 only): J/L/N/P = (I/K/M/O) × C — rewrite the formula for any
-              // row where the pulled-through Lab/Mat/Sub/Sum value or the Quantity changed.
-              if (levelRef.current === 2) {
-                const pullThroughCols: Array<[number, number]> = [
-                  [COL_LAB, COL_LAB_TOTAL],
-                  [COL_MAT, COL_MAT_TOTAL],
-                  [COL_SUB, COL_SUB_TOTAL],
-                  [COL_SUM, COL_SUM_TOTAL],
-                ];
-                const pass3: Array<[number, number, string]> = [];
-                for (const ch of changes) {
-                  const row = ch[0];
-                  const col = typeof ch[1] === "number" ? ch[1] : -1;
-                  if (row < 0 || col < 0) continue;
-                  if (col === COL_QTY) {
-                    for (const [src, total] of pullThroughCols) {
-                      if (isExcluded(row, total)) continue;
-                      pass3.push([row, total, `=${colLetter(src)}${row + 1}*C${row + 1}`]);
-                    }
-                  } else {
-                    const match = pullThroughCols.find(([src]) => src === col);
-                    if (match) {
-                      const [src, total] = match;
-                      if (!isExcluded(row, total)) pass3.push([row, total, `=${colLetter(src)}${row + 1}*C${row + 1}`]);
-                    }
-                  }
-                }
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                if (pass3.length) hot.setDataAtCell(pass3 as any);
-              }
-            } finally {
-              isAutoUpdatingRef.current = false;
-            }
-          }
+        // Re-derive through the single, template-driven engine: A–H fixed roles (F=E*C, G=1,
+        // H=F*G, or the qty PRODUCT) plus each user column's OWN template formula. No hardcoded
+        // user-column behaviour lives here — only runs when a derivation-relevant input changed.
+        let derivationRelevant = false;
+        for (const ch of changes) {
+          const col = typeof ch[1] === "number" ? ch[1] : -1;
+          if ((col >= COL_QTY && col <= COL_FACTOR) || col >= FIRST_USER_COL) { derivationRelevant = true; break; }
+        }
+        if (derivationRelevant) {
+          const dpath = curSheetPath();
+          deriveLevelFormulas(hot, levelRef.current, isAutoUpdatingRef, kind, dpath, cellExclusionMap.current.get(dpath));
         }
 
         // ── Live breadcrumb rollup ──────────────────────────────────────
@@ -5052,12 +4957,15 @@ export function WorkbookView() {
             }
             const hot = hotRef.current?.hotInstance;
             if (hot) {
-              const base = layoutColumnsFor(sheetKindForPath(curSheetPath()));
+              const path = curSheetPath();
+              const base = layoutColumnsFor(sheetKindForPath(path));
               const numCols = hot.countCols();
               hot.updateSettings({
                 colHeaders: buildColHeaders(base, numCols),
                 colWidths:  buildColWidths(base, numCols),
               });
+              // Re-derive so the new user-column formulae apply to the current sheet immediately.
+              deriveLevelFormulas(hot, levelRef.current, isAutoUpdatingRef, sheetKindForPath(path), path, cellExclusionMap.current.get(path));
               hot.render();
             }
           }}
