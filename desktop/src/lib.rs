@@ -2951,6 +2951,12 @@ async fn clear_workbook_revision_data(
         .bind(revision_id)
         .execute(&db)
         .await;
+    // Named cells are revision-scoped and reference sheet cells by path/row/col; clearing the
+    // revision's sheet data without clearing them leaves every name dangling at a deleted cell.
+    let _ = sqlx::query("DELETE FROM workbook_named_cells WHERE revision_id = ?")
+        .bind(revision_id)
+        .execute(&db)
+        .await;
     Ok(rows_affected as i64)
 }
 
@@ -3076,6 +3082,51 @@ async fn create_workbook_revision(
     })
 }
 
+/// Copies every per-sheet blob (data, styles, exclusions, links) and the revision-scoped
+/// named cells from one revision to another, on an open transaction. Shared by the two
+/// DB-to-DB revision copies (`create_workbook_revision_from_template` and
+/// `copy_workbook_revision`) so they can never drift — historically they were near-duplicate
+/// hand-rolled loops and the two had already diverged. Uses set-based `INSERT ... SELECT` so
+/// each table is one statement rather than one INSERT per row. The caller owns the transaction
+/// and the destination `workbook_revisions` row (including its own `layout_json`/
+/// `engine_version` columns); this copies only the child blobs.
+async fn copy_revision_sheets(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    src_revision_id: i64,
+    dst_revision_id: i64,
+) -> Result<(), String> {
+    for (table, col) in &[
+        ("workbook_sheet_data", "data_json"),
+        ("workbook_sheet_styles", "styles_json"),
+        ("workbook_sheet_exclusions", "exclusions_json"),
+        ("workbook_sheet_links", "links_json"),
+    ] {
+        let sql = format!(
+            "INSERT INTO {table} (revision_id, sheet_path, {col}) \
+             SELECT ?, sheet_path, {col} FROM {table} WHERE revision_id = ?"
+        );
+        sqlx::query(&sql)
+            .bind(dst_revision_id)
+            .bind(src_revision_id)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| format!("Failed to copy {table}: {e}"))?;
+    }
+    // Named cells are revision-scoped (not per-sheet); copy them too so formulas in the copied
+    // sheets that reference a name still resolve (otherwise the new revision opens with an empty
+    // Name Manager and #NAME? in the grid until a same-session reload masks it).
+    sqlx::query(
+        "INSERT INTO workbook_named_cells (revision_id, name, sheet_path, row, col) \
+         SELECT ?, name, sheet_path, row, col FROM workbook_named_cells WHERE revision_id = ?",
+    )
+    .bind(dst_revision_id)
+    .bind(src_revision_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| format!("Failed to copy named cells: {e}"))?;
+    Ok(())
+}
+
 #[tauri::command]
 async fn create_workbook_revision_from_template(
     workbook_id: i64,
@@ -3117,139 +3168,34 @@ async fn create_workbook_revision_from_template(
     .await
     .map_err(|e| format!("Failed to get next sort order: {e}"))?;
 
+    // Create the revision row and copy every child blob from the template revision in one
+    // transaction, via the shared `copy_revision_sheets` helper (sheet data + styles +
+    // exclusions + links + revision-scoped named cells). The template can carry real
+    // drill-down sheets (e.g. a Level 2 build-up under a specific P&G row) at ordinary paths
+    // like "L1/R2" as well as the TEMPLATE_MASTER_* seed sheets — the helper copies whatever
+    // paths exist, so both travel along; the master seeds go on to seed any fresh Level 2/3/
+    // Quantity sheet created in the new revision (see WorkbookView's drillDown /
+    // TEMPLATE_MASTER_* constants).
+    let mut tx = db
+        .begin()
+        .await
+        .map_err(|e| format!("Failed to begin transaction: {e}"))?;
     let result = sqlx::query(
         "INSERT INTO workbook_revisions (workbook_id, name, sort_order) VALUES (?, ?, ?)",
     )
     .bind(workbook_id)
     .bind(&name)
     .bind(sort_order)
-    .execute(&db)
+    .execute(&mut *tx)
     .await
     .map_err(|e| format!("Failed to create workbook revision: {e}"))?;
     let revision_id = result.last_insert_rowid();
 
-    // Copy every sheet in the template (not just the master seed set) — a template
-    // can accumulate real drill-down sheets (e.g. a Level 2 build-up filled in under
-    // a specific Preliminary & General row) whenever the template author drills into
-    // a row while editing it, and those live at ordinary paths like "L1/R2", not at
-    // the TEMPLATE_MASTER_* paths. TEMPLATE_MASTER_L2 / TEMPLATE_MASTER_L3 /
-    // TEMPLATE_MASTER_LQ are included in this same sweep (data_json rows for those
-    // paths still exist if the author edited them), and continue to travel along as
-    // the seeds for any future Level 2 / Level 3 / Quantity Build-up sheet created
-    // fresh in the new revision (see WorkbookView's drillDown / TEMPLATE_MASTER_L2_PATH
-    // / TEMPLATE_MASTER_L3_PATH / TEMPLATE_MASTER_LQ_PATH constants).
-    let sheet_data: Vec<(String, String)> = sqlx::query_as(
-        "SELECT sheet_path, data_json FROM workbook_sheet_data WHERE revision_id = ?",
-    )
-    .bind(template_revision_id)
-    .fetch_all(&db)
-    .await
-    .map_err(|e| format!("Failed to read template sheet data: {e}"))?;
-    for (sheet_path, data_json) in sheet_data {
-        sqlx::query(
-            "INSERT INTO workbook_sheet_data (revision_id, sheet_path, data_json) VALUES (?, ?, ?)",
-        )
-        .bind(revision_id)
-        .bind(&sheet_path)
-        .bind(&data_json)
-        .execute(&db)
-        .await
-        .map_err(|e| format!("Failed to seed sheet '{sheet_path}': {e}"))?;
-    }
+    copy_revision_sheets(&mut tx, template_revision_id, revision_id).await?;
 
-    // Carry the template's per-cell text formatting along with its data —
-    // otherwise bold/italic/underline applied in the template is lost on import.
-    let sheet_styles: Vec<(String, String)> = sqlx::query_as(
-        "SELECT sheet_path, styles_json FROM workbook_sheet_styles WHERE revision_id = ?",
-    )
-    .bind(template_revision_id)
-    .fetch_all(&db)
-    .await
-    .map_err(|e| format!("Failed to read template sheet styles: {e}"))?;
-    for (sheet_path, styles_json) in sheet_styles {
-        sqlx::query(
-            "INSERT INTO workbook_sheet_styles (revision_id, sheet_path, styles_json) VALUES (?, ?, ?)",
-        )
-        .bind(revision_id)
-        .bind(&sheet_path)
-        .bind(&styles_json)
-        .execute(&db)
+    tx.commit()
         .await
-        .map_err(|e| format!("Failed to seed sheet styles '{sheet_path}': {e}"))?;
-    }
-
-    // Carry the template's auto-calc exclusions along too — e.g. a summary
-    // block whose F/G/H cells are hand-built must stay excluded in every
-    // project created from this template.
-    let sheet_exclusions: Vec<(String, String)> = sqlx::query_as(
-        "SELECT sheet_path, exclusions_json FROM workbook_sheet_exclusions WHERE revision_id = ?",
-    )
-    .bind(template_revision_id)
-    .fetch_all(&db)
-    .await
-    .map_err(|e| format!("Failed to read template sheet exclusions: {e}"))?;
-    for (sheet_path, exclusions_json) in sheet_exclusions {
-        sqlx::query(
-            "INSERT INTO workbook_sheet_exclusions (revision_id, sheet_path, exclusions_json) VALUES (?, ?, ?)",
-        )
-        .bind(revision_id)
-        .bind(&sheet_path)
-        .bind(&exclusions_json)
-        .execute(&db)
-        .await
-        .map_err(|e| format!("Failed to seed sheet exclusions '{sheet_path}': {e}"))?;
-    }
-
-    // Carry sheet-to-sheet cell links too, for parity with copy_workbook_revision —
-    // a template's drilled-in sheets can carry live C:Quantity links same as any
-    // ordinary workbook.
-    let sheet_links: Vec<(String, String)> = sqlx::query_as(
-        "SELECT sheet_path, links_json FROM workbook_sheet_links WHERE revision_id = ?",
-    )
-    .bind(template_revision_id)
-    .fetch_all(&db)
-    .await
-    .map_err(|e| format!("Failed to read template sheet links: {e}"))?;
-    for (sheet_path, links_json) in sheet_links {
-        sqlx::query(
-            "INSERT INTO workbook_sheet_links (revision_id, sheet_path, links_json) VALUES (?, ?, ?)",
-        )
-        .bind(revision_id)
-        .bind(&sheet_path)
-        .bind(&links_json)
-        .execute(&db)
-        .await
-        .map_err(|e| format!("Failed to seed sheet links '{sheet_path}': {e}"))?;
-    }
-
-    // Carry the template's named cells along too — they're revision-scoped (not
-    // per-sheet, so outside the loop above), and formulas in the copied sheets may
-    // reference them by name. Without this, the new revision starts with an empty
-    // `workbook_named_cells` set: the names resolve to nothing (#NAME? in the grid,
-    // empty Name Manager) until the template happens to be reloaded in the same
-    // session and re-registers them in HyperFormula's *shared* named-expression
-    // registry — which only masks the missing copy until the app restarts.
-    let named_cells: Vec<(String, String, i64, i64)> = sqlx::query_as(
-        "SELECT name, sheet_path, row, col FROM workbook_named_cells WHERE revision_id = ?",
-    )
-    .bind(template_revision_id)
-    .fetch_all(&db)
-    .await
-    .map_err(|e| format!("Failed to read template named cells: {e}"))?;
-
-    for (nc_name, nc_path, nc_row, nc_col) in named_cells {
-        sqlx::query(
-            "INSERT INTO workbook_named_cells (revision_id, name, sheet_path, row, col) VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(revision_id)
-        .bind(&nc_name)
-        .bind(&nc_path)
-        .bind(nc_row)
-        .bind(nc_col)
-        .execute(&db)
-        .await
-        .map_err(|e| format!("Failed to seed named cell '{nc_name}': {e}"))?;
-    }
+        .map_err(|e| format!("Failed to commit new revision: {e}"))?;
 
     let created_at: String =
         sqlx::query_scalar("SELECT created_at FROM workbook_revisions WHERE id = ?")
@@ -3347,115 +3293,30 @@ async fn copy_workbook_revision(
     .await
     .map_err(|e| format!("Failed to get next sort order: {e}"))?;
 
+    // Create the copy's revision row and duplicate every child blob (data + styles +
+    // exclusions + links + named cells) in one transaction via `copy_revision_sheets`. A
+    // workbook copy must reproduce the source's full state, including any per-drawing
+    // drill-down sheets.
+    let mut tx = db
+        .begin()
+        .await
+        .map_err(|e| format!("Failed to begin transaction: {e}"))?;
     let result = sqlx::query(
         "INSERT INTO workbook_revisions (workbook_id, name, sort_order) VALUES (?, ?, ?)",
     )
     .bind(workbook_id)
     .bind(&name)
     .bind(sort_order)
-    .execute(&db)
+    .execute(&mut *tx)
     .await
     .map_err(|e| format!("Failed to create workbook: {e}"))?;
     let new_revision_id = result.last_insert_rowid();
 
-    // Copy every sheet (not just the template-master set) — a workbook copy must
-    // reproduce the source's full state, including any per-drawing drill-down sheets.
-    let sheet_data: Vec<(String, String)> = sqlx::query_as(
-        "SELECT sheet_path, data_json FROM workbook_sheet_data WHERE revision_id = ?",
-    )
-    .bind(source_revision_id)
-    .fetch_all(&db)
-    .await
-    .map_err(|e| format!("Failed to read source sheet data: {e}"))?;
-    for (sheet_path, data_json) in sheet_data {
-        sqlx::query(
-            "INSERT INTO workbook_sheet_data (revision_id, sheet_path, data_json) VALUES (?, ?, ?)",
-        )
-        .bind(new_revision_id)
-        .bind(&sheet_path)
-        .bind(&data_json)
-        .execute(&db)
-        .await
-        .map_err(|e| format!("Failed to copy sheet data '{sheet_path}': {e}"))?;
-    }
+    copy_revision_sheets(&mut tx, source_revision_id, new_revision_id).await?;
 
-    let sheet_links: Vec<(String, String)> = sqlx::query_as(
-        "SELECT sheet_path, links_json FROM workbook_sheet_links WHERE revision_id = ?",
-    )
-    .bind(source_revision_id)
-    .fetch_all(&db)
-    .await
-    .map_err(|e| format!("Failed to read source sheet links: {e}"))?;
-    for (sheet_path, links_json) in sheet_links {
-        sqlx::query(
-            "INSERT INTO workbook_sheet_links (revision_id, sheet_path, links_json) VALUES (?, ?, ?)",
-        )
-        .bind(new_revision_id)
-        .bind(&sheet_path)
-        .bind(&links_json)
-        .execute(&db)
+    tx.commit()
         .await
-        .map_err(|e| format!("Failed to copy sheet links '{sheet_path}': {e}"))?;
-    }
-
-    let sheet_styles: Vec<(String, String)> = sqlx::query_as(
-        "SELECT sheet_path, styles_json FROM workbook_sheet_styles WHERE revision_id = ?",
-    )
-    .bind(source_revision_id)
-    .fetch_all(&db)
-    .await
-    .map_err(|e| format!("Failed to read source sheet styles: {e}"))?;
-    for (sheet_path, styles_json) in sheet_styles {
-        sqlx::query(
-            "INSERT INTO workbook_sheet_styles (revision_id, sheet_path, styles_json) VALUES (?, ?, ?)",
-        )
-        .bind(new_revision_id)
-        .bind(&sheet_path)
-        .bind(&styles_json)
-        .execute(&db)
-        .await
-        .map_err(|e| format!("Failed to copy sheet styles '{sheet_path}': {e}"))?;
-    }
-
-    let sheet_exclusions: Vec<(String, String)> = sqlx::query_as(
-        "SELECT sheet_path, exclusions_json FROM workbook_sheet_exclusions WHERE revision_id = ?",
-    )
-    .bind(source_revision_id)
-    .fetch_all(&db)
-    .await
-    .map_err(|e| format!("Failed to read source sheet exclusions: {e}"))?;
-    for (sheet_path, exclusions_json) in sheet_exclusions {
-        sqlx::query(
-            "INSERT INTO workbook_sheet_exclusions (revision_id, sheet_path, exclusions_json) VALUES (?, ?, ?)",
-        )
-        .bind(new_revision_id)
-        .bind(&sheet_path)
-        .bind(&exclusions_json)
-        .execute(&db)
-        .await
-        .map_err(|e| format!("Failed to copy sheet exclusions '{sheet_path}': {e}"))?;
-    }
-
-    let named_cells: Vec<(String, String, i64, i64)> = sqlx::query_as(
-        "SELECT name, sheet_path, row, col FROM workbook_named_cells WHERE revision_id = ?",
-    )
-    .bind(source_revision_id)
-    .fetch_all(&db)
-    .await
-    .map_err(|e| format!("Failed to read source named cells: {e}"))?;
-    for (nc_name, nc_path, nc_row, nc_col) in named_cells {
-        sqlx::query(
-            "INSERT INTO workbook_named_cells (revision_id, name, sheet_path, row, col) VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(new_revision_id)
-        .bind(&nc_name)
-        .bind(&nc_path)
-        .bind(nc_row)
-        .bind(nc_col)
-        .execute(&db)
-        .await
-        .map_err(|e| format!("Failed to copy named cell '{nc_name}': {e}"))?;
-    }
+        .map_err(|e| format!("Failed to commit copied revision: {e}"))?;
 
     let created_at: String =
         sqlx::query_scalar("SELECT created_at FROM workbook_revisions WHERE id = ?")
@@ -3978,11 +3839,15 @@ async fn rename_workbook_sheet_subtree(
     let db = active_project_db(state.inner())?;
     let like_pattern = format!("{old_path}/%");
     let prefix_len = (old_path.len() as i64) + 1; // +1 to skip the trailing char before substr
+    // `workbook_named_cells` carries a `sheet_path` too, so a subtree rename must rewrite it
+    // alongside the per-sheet blob tables — otherwise a row insert/move that renames child
+    // sheets leaves every named cell in the moved subtree pointing at a now-nonexistent path.
     for table in &[
         "workbook_sheet_data",
         "workbook_sheet_links",
         "workbook_sheet_styles",
         "workbook_sheet_exclusions",
+        "workbook_named_cells",
     ] {
         let sql = format!(
             "UPDATE {table} \
