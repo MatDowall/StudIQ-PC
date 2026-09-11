@@ -171,9 +171,10 @@ const DRILL_FONT_COLOUR = "#0400ff";
 // (see cellExclusionMap) — a visual cue that its content is hand-built and won't
 // be overwritten by the drill-down rollup, factor default, or total formula.
 const EXCLUDED_BORDER_COLOUR = "#c08a00";
-function isDrillColumn(level: Level, col: number): boolean {
-  return (level === 1 && col === COL_SUBTOTAL)
-      || (level === 2 && (col === COL_RATE || col === COL_QTY));
+// A drill column is drillable only ON A COST SHEET (M5): F:Subtotal (→ recursive cost sheet),
+// E:Rate (→ rate build-up leaf), C:Quantity (→ qty build-up leaf). Rate/qty leaves don't drill.
+function isDrillColumn(path: string, col: number): boolean {
+  return isCostSheetPath(path) && (col === COL_SUBTOTAL || col === COL_RATE || col === COL_QTY);
 }
 
 // Pale-yellow highlight applied to the "result" columns of a sheet — the figures
@@ -318,16 +319,23 @@ const FUNCTION_NAMES = Object.keys(FORMULA_FUNCTIONS);
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
-type Level = 1 | 2 | 3;
+// A sheet's drill depth — now unbounded (M5): 1 for "L1", 2 for "L1/S3", 3 for "L1/S3/R2", …
+type Level = number;
 
-// A sheet's "kind" determines its A–H column meaning and derivation/rollup formulas —
-// orthogonal to its depth (`Level`). "qty" sheets are Quantity Build-up sheets (drilled
-// into from a Level 2 row's C:Quantity); everything else ("standard") uses the existing
-// Code/Description/Quantity/Unit/Rate/Subtotal/Factor/Total layout. Derived purely from
-// the sheet's path via `isQtyBuildupPath` — see that helper's comment.
+// A sheet's "kind" determines its A–H column meaning and derivation/rollup formulas. "qty" sheets
+// are Quantity Build-up sheets (/Q); everything else ("standard") uses the Code/Description/
+// Quantity/Unit/Rate/Subtotal/Factor/Total layout — that covers both recursive COST sheets (/S)
+// and RATE build-ups (/R). Derived purely from the sheet's path.
 type SheetKind = "standard" | "qty";
 function sheetKindForPath(path: string): SheetKind {
   return isQtyBuildupPath(path) ? "qty" : "standard";
+}
+
+// M5 drill model: a COST sheet (the top "L1" and every "/S<row>" descendant) is where you drill —
+// F:Subtotal → a deeper cost sheet (/S, recursive), E:Rate → a rate build-up leaf (/R), C:Quantity
+// → a qty build-up leaf (/Q). Rate and qty build-ups are LEAVES: nothing drills inside them.
+function isCostSheetPath(path: string): boolean {
+  return path === "L1" || /\/S\d+$/.test(path) || path === TEMPLATE_MASTER_L2_PATH;
 }
 
 // Reserved sheet paths (never reachable via drill-down — real paths look like
@@ -354,8 +362,7 @@ function isQtyBuildupPath(path: string): boolean {
  *  "L1/R3" is level 2, "L1/R3/R2" or "L1/R3/Q5" is level 3. Used by the Named
  *  Cells manager's "Go to" action, which only has the bound cell's path to work from. */
 function levelForPath(path: string): Level {
-  const depth = path.split("/").length;
-  return Math.min(3, Math.max(1, depth)) as Level;
+  return Math.max(1, path.split("/").length); // uncapped depth (M5)
 }
 
 interface BreadcrumbCtx {
@@ -562,6 +569,13 @@ function deriveLevelFormulas(
   guardRef.current = true;
   try {
     const isExcluded = (r: number, c: number) => excluded != null && excluded.has(styleKey(r, c));
+    // A drilled rollup cell (=XSUMTOT/=XSUMUSER…) is authoritative — the auto F=E*C / J=I*C
+    // derivation must never overwrite it (M5: F/E/C are all drillable on a cost sheet).
+    const isXsum = (r: number, c: number) => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const s = (hot as any).getSourceDataAtCell(r, c);
+      return typeof s === "string" && s.toUpperCase().startsWith("=XSUM");
+    };
 
     if (kind === "qty") {
       // Quantity Build-up sheets: H = C×D×E×F×G (Count×Length×Width×Height×Factor).
@@ -588,17 +602,16 @@ function deriveLevelFormulas(
       return;
     }
 
-    // Pass 1: F = E×C for every row with a Quantity or Rate value (levels 2 & 3 only —
-    // at level 1, F comes from the level-2 drill-up rollup, not from C×E).
+    // Pass 1: F = E×C for every row with a Quantity or Rate value — at ANY depth now (M5: every
+    // cost sheet, including L1, computes its own subtotals). Skips a row whose F is a drilled
+    // =XSUMTOT rollup (that subtotal comes from the child cost sheet, not from rate×qty).
     const pass1: Array<[number, number, string]> = [];
-    if (level >= 2) {
-      for (let r = 0; r < NUM_ROWS; r++) {
-        if (isExcluded(r, COL_SUBTOTAL)) continue;
-        const cVal = hot.getDataAtCell(r, COL_QTY);
-        const eVal = hot.getDataAtCell(r, COL_RATE);
-        if ((cVal != null && cVal !== "") || (eVal != null && eVal !== "")) {
-          pass1.push([r, COL_SUBTOTAL, `=E${r + 1}*C${r + 1}`]);
-        }
+    for (let r = 0; r < NUM_ROWS; r++) {
+      if (isExcluded(r, COL_SUBTOTAL) || isXsum(r, COL_SUBTOTAL)) continue;
+      const cVal = hot.getDataAtCell(r, COL_QTY);
+      const eVal = hot.getDataAtCell(r, COL_RATE);
+      if ((cVal != null && cVal !== "") || (eVal != null && eVal !== "")) {
+        pass1.push([r, COL_SUBTOTAL, `=E${r + 1}*C${r + 1}`]);
       }
     }
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -623,9 +636,10 @@ function deriveLevelFormulas(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     if (pass2.length) hot.setDataAtCell(pass2 as any);
 
-    // Pass 3 (Level 2 only): J/L/N/P = Lab/Mat/Sub/Sum (I/K/M/O, pulled through from
-    // the rate build-up) × Quantity (C) — the "rate × quantity" theory for these columns.
-    if (level === 2) {
+    // Pass 3: J/L/N/P = Lab/Mat/Sub/Sum (I/K/M/O) × Quantity (C) on every cost sheet at any depth.
+    // Skips a total that is a drilled =XSUMUSER rollup (it comes from the child cost sheet's own
+    // totals, not from this row's rate×qty).
+    {
       const pass3: Array<[number, number, string]> = [];
       const pullThroughCols: Array<[number, number]> = [
         [COL_LAB, COL_LAB_TOTAL],
@@ -636,7 +650,7 @@ function deriveLevelFormulas(
       for (let r = 0; r < NUM_ROWS; r++) {
         const cVal = hot.getDataAtCell(r, COL_QTY);
         for (const [src, total] of pullThroughCols) {
-          if (isExcluded(r, total)) continue;
+          if (isExcluded(r, total) || isXsum(r, total)) continue;
           const srcVal = hot.getDataAtCell(r, src);
           if ((srcVal != null && srcVal !== "") || (cVal != null && cVal !== "")) {
             // Positional letter — formula generation must not depend on the (possibly
@@ -1228,6 +1242,7 @@ export function WorkbookView() {
   const hotRef         = useRef<HotTableRef>(null);
   const gridWrapperRef = useRef<HTMLDivElement>(null);
   const formulaBarRef  = useRef<HTMLInputElement>(null);
+  const breadcrumbTrailRef = useRef<HTMLDivElement>(null);
   const [gridHeight, setGridHeight] = useState(400);
 
   // Active revision from store (drives data load/save)
@@ -2465,7 +2480,7 @@ export function WorkbookView() {
       return;
     }
     const style = getCellStyle(cell.row, cell.col);
-    const drill = isDrillColumn(levelRef.current, cell.col);
+    const drill = isDrillColumn(curSheetPath(), cell.col);
     setWorkbookFormat({
       enabled: true,
       fontFamily: style.fontFamily ?? DEFAULT_WORKBOOK_FORMAT.fontFamily,
@@ -2706,7 +2721,7 @@ export function WorkbookView() {
       // Remap in-memory sub-sheet caches (bottom-up to avoid collisions).
       // At Level 1 sub-sheets are "<path>/R{r}"; at Level 2 also "<path>/Q{r}".
       const lv = levelRef.current;
-      const subPrefixes = lv === 1 ? ["R"] : lv === 2 ? ["R", "Q"] : [];
+      const subPrefixes = isCostSheetPath(path) ? ["S", "R", "Q"] : []; // M5: cost sheets carry S/R/Q children
       if (subPrefixes.length > 0) {
         for (let r = lastOccupied; r >= insertAt; r--) {
           for (const prefix of subPrefixes) {
@@ -2776,7 +2791,7 @@ export function WorkbookView() {
     }
 
     const lv = levelRef.current;
-    const subPrefixes = lv === 1 ? ["R"] : lv === 2 ? ["R", "Q"] : [];
+    const subPrefixes = isCostSheetPath(path) ? ["S", "R", "Q"] : []; // M5: cost sheets carry S/R/Q children
     const revId = revIdRef.current;
 
     // Permanently remove the deleted row's own sub-sheets before anything else
@@ -3055,7 +3070,7 @@ export function WorkbookView() {
           continue;
         }
 
-        const childPath = `L1/R${row}`;
+        const childPath = `L1/S${row}`; // M5: F:Subtotal's cost child is /S (full recursive export is M8)
         const childSource = await fetchSheetSourceData(revId, childPath);
         const childLineRows: number[] = [];
         for (let cr = 0; cr < NUM_ROWS; cr++) {
@@ -3251,6 +3266,13 @@ export function WorkbookView() {
       });
   }, [activeRevisionId]);
 
+  // Keep the breadcrumb trail scrolled to the bottom so the immediate parent (where you just
+  // drilled from) stays visible when the trail is deeper than the visible area.
+  useEffect(() => {
+    const el = breadcrumbTrailRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [breadcrumb.length]);
+
   // Track grid-container resize to drive Handsontable height
   useEffect(() => {
     const el = gridWrapperRef.current;
@@ -3311,10 +3333,13 @@ export function WorkbookView() {
     if (saveTimerRef.current) { clearTimeout(saveTimerRef.current); saveTimerRef.current = null; }
 
     const curPath = pathStack.current[pathStack.current.length - 1];
-    // C:Quantity opens a Quantity Build-up sheet ("/Q<row>"); every other drill column
-    // (F:Subtotal at L1, E:Rate at L2) opens a standard/Rate Build-up sheet ("/R<row>").
-    const isQtyDrill = levelRef.current === 2 && col === COL_QTY;
-    const newPath = `${curPath}/${isQtyDrill ? "Q" : "R"}${row}`;
+    // M5 drill suffix by column: F:Subtotal → recursive COST sheet (/S); E:Rate → RATE build-up
+    // leaf (/R); C:Quantity → QTY build-up leaf (/Q). Distinct suffixes let one cost row carry a
+    // cost child AND a rate child AND a qty child (as CostX does), and make XSUMUSER (reads /S)
+    // genuinely differ from XSUMRATEUSER (reads /R).
+    const drillSuffix = col === COL_QTY ? "Q" : col === COL_RATE ? "R" : "S";
+    const isQtyDrill = drillSuffix === "Q";
+    const newPath = `${curPath}/${drillSuffix}${row}`;
 
     // Declarative rollup: the drilled cell holds a live SUM of its child sheet's column, so the
     // parent tracks the child with no baking on drill-up. Written into the grid (guarded so the
@@ -3336,12 +3361,11 @@ export function WorkbookView() {
     const ctx = readRowCtxFromGrid(hot, row);
     pathStack.current = [...pathStack.current, newPath];
 
-    // Level we're navigating INTO — needed by loadLevelData to run the correct
-    // F/G/H derivation pass (mirrors the setLevel update below).
-    const newLevel = (levelRef.current < 3 ? levelRef.current + 1 : levelRef.current) as Level;
+    // Level we're navigating INTO — uncapped depth now (M5).
+    const newLevel = levelRef.current + 1;
 
     setBreadcrumb(prev => [...prev, ctx]);
-    setLevel(prev => (prev < 3 ? (prev + 1) as Level : prev));
+    setLevel(prev => prev + 1);
     setActiveCell("A1");
     setActiveCellValue("");
 
@@ -3359,14 +3383,14 @@ export function WorkbookView() {
       syncSheetLinks(newPath);
     };
 
-    // A genuinely new build-up sheet — seed it from the workbook's matching master
-    // sheet (copied in from a template at creation time, if any) rather than
-    // starting blank. Level 2 sheets seed from the master takeoff (L2); Level 3
-    // sheets seed from the master rate build-up (L3) or, for a Quantity Build-up
-    // sheet (drilled in via C:Quantity), the master quantity build-up (LQ).
-    const masterPath = isQtyDrill
+    // A genuinely new build-up sheet — seed it from the matching master sheet by KIND (M5): a
+    // cost child (/S) seeds from the cost/takeoff master, a rate build-up (/R) from the rate
+    // master, a quantity build-up (/Q) from the qty master. (Per-depth masters are M6.)
+    const masterPath = drillSuffix === "Q"
       ? TEMPLATE_MASTER_LQ_PATH
-      : (newLevel === 3 ? TEMPLATE_MASTER_L3_PATH : TEMPLATE_MASTER_L2_PATH);
+      : drillSuffix === "R"
+        ? TEMPLATE_MASTER_L3_PATH
+        : TEMPLATE_MASTER_L2_PATH;
     // Carries the master sheet's per-cell formatting onto the freshly-seeded sheet
     // (mirrors the data clone above) — otherwise template formatting is lost the
     // moment a new Level 2/3 sheet is created from it.
@@ -3416,47 +3440,49 @@ export function WorkbookView() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const drillUp = useCallback(() => {
+  // Navigate up to the ancestor at pathStack index `targetIndex` (the sheet that becomes current),
+  // popping every level below it. `breadcrumb[i]` corresponds to `pathStack[i]`, so a breadcrumb
+  // row's back arrow passes its own index. drillUp() is just "up one" = the immediate parent.
+  const drillUpTo = useCallback((targetIndex: number) => {
     const hot = hotRef.current?.hotInstance;
-    if (!hot || pathStack.current.length <= 1) return;
+    if (!hot) return;
+    const stack = pathStack.current;
+    if (targetIndex < 0 || targetIndex >= stack.length - 1) return; // must be an ancestor, not current
 
-    // See closeActiveEditor — prevents a stale open editor from bleeding its pending
-    // value into whichever cell of the parent sheet ends up under it after the swap.
+    // See closeActiveEditor — prevents a stale open editor bleeding into the sheet swapped in.
     closeActiveEditor(hot);
-
-    // Cancel any pending debounced save so it doesn't fire on the wrong path
     if (saveTimerRef.current) { clearTimeout(saveTimerRef.current); saveTimerRef.current = null; }
 
-    const curPath = pathStack.current[pathStack.current.length - 1];
+    const curPath = stack[stack.length - 1];
     const curData = captureSourceData(hot);
     sheetDataMap.current.set(curPath, curData);
     sheetComputedMap.current.set(curPath, getEvaluatedGridData(hot));
 
-    // Declarative engine: the parent's rollup cells are live `=SUM(child!…)` formulas written at
-    // drill-down time, so there is nothing to bake on the way up — just persist this sheet and
-    // navigate. The parent recomputes from the child automatically when it is redisplayed.
-    const newStack  = pathStack.current.slice(0, -1);
-    const parentPath = newStack[newStack.length - 1];
+    // Declarative engine: rollup cells are live formulas, so there's nothing to bake on the way up —
+    // just persist this sheet and navigate. Ancestors recompute from their children automatically.
     const revId = revIdRef.current;
     if (revId != null) persistSheet(revId, curPath, curData);
 
+    const newStack = stack.slice(0, targetIndex + 1);
+    const targetPath = newStack[newStack.length - 1];
     pathStack.current = newStack;
 
-    // Level we're navigating INTO — needed by loadLevelData to run the correct
-    // F/G/H derivation pass (mirrors the setLevel update below).
-    const newLevel = (levelRef.current > 1 ? levelRef.current - 1 : 1) as Level;
-
-    setBreadcrumb(prev => prev.slice(0, -1));
-    setLevel(prev => (prev > 1 ? (prev - 1) as Level : 1));
+    setBreadcrumb(prev => prev.slice(0, targetIndex));
+    setLevel(newStack.length);
     setActiveCell("A1");
     setActiveCellValue("");
 
     requestAnimationFrame(() => {
-      const parentData = sheetDataMap.current.get(parentPath) ?? createEmptyData();
+      const data = sheetDataMap.current.get(targetPath) ?? createEmptyData();
       const hot2 = hotRef.current?.hotInstance;
-      if (hot2) loadLevelDataExcl(hot2, parentData, newLevel, isAutoUpdatingRef, parentPath);
-      syncSheetLinks(parentPath);
+      if (hot2) loadLevelDataExcl(hot2, data, newStack.length, isAutoUpdatingRef, targetPath);
+      syncSheetLinks(targetPath);
     });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const drillUp = useCallback(() => {
+    drillUpTo(pathStack.current.length - 2); // up one level = the immediate parent
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -3631,30 +3657,21 @@ export function WorkbookView() {
   async function pruneOrphansUnder(
     revisionId: number,
     path: string,
-    level: Level,
     removed: string[],
   ): Promise<void> {
+    // Only cost sheets carry children (M5): a live row's F may hold a /S cost child (recursive),
+    // E a /R rate leaf, C a /Q qty leaf. A row that's no longer a line item has orphaned children.
     const data = await fetchSheetSourceData(revisionId, path);
     for (let r = 0; r < NUM_ROWS; r++) {
-      const childPath = `${path}/R${r}`;
-      // Level 2 rows can additionally spawn a Quantity Build-up sheet ("/Q<row>",
-      // sibling to the Rate Build-up "/R<row>") — prune it alongside the rate one.
-      const qtyChildPath = level === 2 ? `${path}/Q${r}` : null;
+      const sChild = `${path}/S${r}`;
       if (!isLineItemRow(data[r])) {
-        const rowsAffected = await invoke<number>("delete_workbook_sheet_subtree", {
-          revisionId,
-          sheetPath: childPath,
-        });
-        if (rowsAffected > 0) removed.push(childPath);
-        if (qtyChildPath != null) {
-          const qtyRowsAffected = await invoke<number>("delete_workbook_sheet_subtree", {
-            revisionId,
-            sheetPath: qtyChildPath,
-          });
-          if (qtyRowsAffected > 0) removed.push(qtyChildPath);
+        for (const child of [sChild, `${path}/R${r}`, `${path}/Q${r}`]) {
+          const n = await invoke<number>("delete_workbook_sheet_subtree", { revisionId, sheetPath: child });
+          if (n > 0) removed.push(child);
         }
-      } else if (level < 3) {
-        await pruneOrphansUnder(revisionId, childPath, (level + 1) as Level, removed);
+      } else {
+        // Live row — recurse into its cost child (a non-existent one reads empty and stops).
+        await pruneOrphansUnder(revisionId, sChild, removed);
       }
     }
   }
@@ -3880,7 +3897,7 @@ export function WorkbookView() {
       }
 
       const removed: string[] = [];
-      await pruneOrphansUnder(revId, "L1", 1, removed);
+      await pruneOrphansUnder(revId, "L1", removed);
       for (const p of removed) purgeCachedSubtree(p);
 
       // If we're currently viewing a sheet that was just removed, jump back to L1.
@@ -3968,7 +3985,7 @@ export function WorkbookView() {
     // An excluded drill column reverts from drill-blue to plain black — the visual
     // cue that exclusion has also switched off its drill-down behaviour (see
     // beforeOnCellMouseDown).
-    const isDrill = isDrillColumn(levelRef.current, col) && !excluded;
+    const isDrill = isDrillColumn(curSheetPath(), col) && !excluded;
     td.style.color = isLinked ? LINK_FONT_COLOUR : (isDrill ? DRILL_FONT_COLOUR : "");
 
     // Cells excluded from auto-calc carry a faint dashed top border so the user can
@@ -4322,10 +4339,9 @@ export function WorkbookView() {
     ) {
       if ((event as MouseEvent).detail < 2) return;
       if (coords.row < 0 || coords.col < 0) return;
-      const lv = levelRef.current;
-      const isDrill =
-        (lv === 1 && coords.col === COL_SUBTOTAL) ||
-        (lv === 2 && (coords.col === COL_RATE || coords.col === COL_QTY));
+      // M5: F/E/C all drill on a cost sheet (F → deeper cost sheet, recursively); rate/qty leaves
+      // don't drill.
+      const isDrill = isDrillColumn(curSheetPath(), coords.col);
       // A cell excluded from auto-calc has been "switched off" — including its
       // drill-down behaviour, since drilling into it would create/seed a sub-sheet
       // whose rollup the exclusion is specifically meant to suppress. The renderer
@@ -4889,22 +4905,20 @@ export function WorkbookView() {
       {/* ─────────────────────────────────────────────────────────────────
           Breadcrumb column-label header — shown once, above every pill below
       ──────────────────────────────────────────────────────────────────── */}
-      {level >= 2 && breadcrumb.length >= 1 && (
+      {breadcrumb.length >= 1 && (
         <BreadcrumbHeaderRow />
       )}
 
       {/* ─────────────────────────────────────────────────────────────────
-          Toolbar row 2 (Level 2+): Level-1 row context + back arrow
+          Breadcrumb trail (M5, unlimited depth): one row per ancestor, from L1 down to the
+          immediate parent. The back arrow steps up one level; the trail scrolls if it grows tall.
       ──────────────────────────────────────────────────────────────────── */}
-      {level >= 2 && breadcrumb.length >= 1 && (
-        <BreadcrumbRow ctx={breadcrumb[0]} onBack={drillUp} />
-      )}
-
-      {/* ─────────────────────────────────────────────────────────────────
-          Toolbar row 3 (Level 3): Level-2 row context + back arrow
-      ──────────────────────────────────────────────────────────────────── */}
-      {level >= 3 && breadcrumb.length >= 2 && (
-        <BreadcrumbRow ctx={breadcrumb[1]} onBack={drillUp} />
+      {breadcrumb.length >= 1 && (
+        <div ref={breadcrumbTrailRef} style={{ maxHeight: 132, overflowY: "auto" }}>
+          {breadcrumb.map((ctx, i) => (
+            <BreadcrumbRow key={i} ctx={ctx} onBack={() => drillUpTo(i)} />
+          ))}
+        </div>
       )}
 
       {/* ─────────────────────────────────────────────────────────────────

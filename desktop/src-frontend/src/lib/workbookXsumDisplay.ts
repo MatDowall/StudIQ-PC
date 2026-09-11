@@ -22,8 +22,15 @@ export const XSUM_ROW_BOUND = 1000;
 const XSUM_FNS = new Set(["XSUMTOT", "XSUMTOTQTY", "XSUMUSER", "XSUMRATE", "XSUMRATEUSER", "XSUMQTY", "XSUMQTYUSER"]);
 
 function isUserFn(fn: string): boolean { return /USER$/.test(fn); }
-/** Child suffix: the QTY family drills to a /Q sheet, everything else to /R. */
-function childSuffix(fn: string): "R" | "Q" { return fn === "XSUMQTY" || fn === "XSUMQTYUSER" ? "Q" : "R"; }
+/** Child suffix by function family (M5 unlimited depth): the Sub-Total/cost family drills to a
+ *  recursive cost sheet (/S), the Rate family to a rate build-up leaf (/R), the Qty family to a
+ *  quantity build-up leaf (/Q). This is what makes XSUMUSER (cost child) and XSUMRATEUSER (rate
+ *  child) target genuinely different sheets. */
+function childSuffix(fn: string): "S" | "R" | "Q" {
+  if (fn === "XSUMQTY" || fn === "XSUMQTYUSER") return "Q";
+  if (fn === "XSUMRATE" || fn === "XSUMRATEUSER") return "R";
+  return "S"; // XSUMTOT, XSUMTOTQTY, XSUMUSER
+}
 /** 0-based column a non-USER function reads (Quantity for XSUMTOTQTY, Total otherwise). */
 function baseCol(fn: string): number { return fn === "XSUMTOTQTY" ? COL_QTY : COL_TOTAL; }
 
