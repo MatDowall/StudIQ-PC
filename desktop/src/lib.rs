@@ -3168,6 +3168,17 @@ async fn create_workbook_revision_from_template(
     .await
     .map_err(|e| format!("Failed to get next sort order: {e}"))?;
 
+    // A template owns its column layout and engine version (both columns on its revision row) —
+    // carry them into the new workbook so a custom-column / v2 template produces a workbook of
+    // that same shape rather than defaulting back to the shipped layout / v1 engine (M6).
+    let (layout_json, engine_version): (Option<String>, i64) = sqlx::query_as(
+        "SELECT layout_json, engine_version FROM workbook_revisions WHERE id = ?",
+    )
+    .bind(template_revision_id)
+    .fetch_one(&db)
+    .await
+    .map_err(|e| format!("Failed to read template revision shape: {e}"))?;
+
     // Create the revision row and copy every child blob from the template revision in one
     // transaction, via the shared `copy_revision_sheets` helper (sheet data + styles +
     // exclusions + links + revision-scoped named cells). The template can carry real
@@ -3181,11 +3192,13 @@ async fn create_workbook_revision_from_template(
         .await
         .map_err(|e| format!("Failed to begin transaction: {e}"))?;
     let result = sqlx::query(
-        "INSERT INTO workbook_revisions (workbook_id, name, sort_order) VALUES (?, ?, ?)",
+        "INSERT INTO workbook_revisions (workbook_id, name, sort_order, layout_json, engine_version) VALUES (?, ?, ?, ?, ?)",
     )
     .bind(workbook_id)
     .bind(&name)
     .bind(sort_order)
+    .bind(&layout_json)
+    .bind(engine_version)
     .execute(&mut *tx)
     .await
     .map_err(|e| format!("Failed to create workbook revision: {e}"))?;
@@ -3211,8 +3224,8 @@ async fn create_workbook_revision_from_template(
         created_at,
         sort_order,
         project_total: None,
-        layout_json: None,
-        engine_version: 1,
+        layout_json,
+        engine_version,
     })
 }
 
@@ -3276,8 +3289,8 @@ async fn copy_workbook_revision(
         return Err("Workbook name cannot be empty".to_string());
     }
 
-    let workbook_id: i64 = sqlx::query_scalar(
-        "SELECT workbook_id FROM workbook_revisions WHERE id = ?",
+    let (workbook_id, layout_json, engine_version): (i64, Option<String>, i64) = sqlx::query_as(
+        "SELECT workbook_id, layout_json, engine_version FROM workbook_revisions WHERE id = ?",
     )
     .bind(source_revision_id)
     .fetch_optional(&db)
@@ -3296,17 +3309,20 @@ async fn copy_workbook_revision(
     // Create the copy's revision row and duplicate every child blob (data + styles +
     // exclusions + links + named cells) in one transaction via `copy_revision_sheets`. A
     // workbook copy must reproduce the source's full state, including any per-drawing
-    // drill-down sheets.
+    // drill-down sheets — and its column layout + engine version (columns on the revision
+    // row), so copying a v2 custom-layout workbook can't silently downgrade it (M6).
     let mut tx = db
         .begin()
         .await
         .map_err(|e| format!("Failed to begin transaction: {e}"))?;
     let result = sqlx::query(
-        "INSERT INTO workbook_revisions (workbook_id, name, sort_order) VALUES (?, ?, ?)",
+        "INSERT INTO workbook_revisions (workbook_id, name, sort_order, layout_json, engine_version) VALUES (?, ?, ?, ?, ?)",
     )
     .bind(workbook_id)
     .bind(&name)
     .bind(sort_order)
+    .bind(&layout_json)
+    .bind(engine_version)
     .execute(&mut *tx)
     .await
     .map_err(|e| format!("Failed to create workbook: {e}"))?;
@@ -3332,8 +3348,8 @@ async fn copy_workbook_revision(
         created_at,
         sort_order,
         project_total: None,
-        layout_json: None,
-        engine_version: 1,
+        layout_json,
+        engine_version,
     })
 }
 
@@ -3551,6 +3567,10 @@ struct TemplateSheetExport {
     data_json: Option<String>,
     styles_json: Option<String>,
     exclusions_json: Option<String>,
+    // Sheet-to-sheet cell links (M6 / export format v2). `#[serde(default)]` so a v1 template
+    // file that predates this field still parses (links come back empty for it).
+    #[serde(default)]
+    links_json: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -3567,12 +3587,18 @@ struct TemplateExportFile {
     version: u32,
     name: String,
     description: Option<String>,
+    // The template's column layout (M6 / export format v2). `#[serde(default)]` so a v1 file
+    // parses with None ⇒ the importing project's shipped-default layout.
+    #[serde(default)]
+    layout_json: Option<String>,
     sheets: std::collections::HashMap<String, TemplateSheetExport>,
     named_cells: Vec<TemplateNamedCellExport>,
 }
 
 const TEMPLATE_EXPORT_FORMAT: &str = "studiq-workbook-template";
-const TEMPLATE_EXPORT_VERSION: u32 = 1;
+// v2 adds `layout_json` (whole-file) and per-sheet `links_json`. v1 files still import (the new
+// fields default to None); a v2 file opened by a pre-M6 build ignores the unknown fields.
+const TEMPLATE_EXPORT_VERSION: u32 = 2;
 
 #[tauri::command]
 async fn export_template(
@@ -3624,6 +3650,14 @@ async fn export_template(
     .await
     .map_err(|e| format!("Failed to list sheet exclusion paths: {e}"))?;
     sheet_paths.extend(exclusion_paths);
+    let link_paths: Vec<String> = sqlx::query_scalar(
+        "SELECT sheet_path FROM workbook_sheet_links WHERE revision_id = ?",
+    )
+    .bind(revision_id)
+    .fetch_all(&db)
+    .await
+    .map_err(|e| format!("Failed to list sheet link paths: {e}"))?;
+    sheet_paths.extend(link_paths);
 
     let mut sheets = std::collections::HashMap::new();
     for sheet_path in sheet_paths {
@@ -3654,10 +3688,19 @@ async fn export_template(
         .await
         .map_err(|e| format!("Failed to read sheet exclusions '{sheet_path}': {e}"))?;
 
-        if data_json.is_some() || styles_json.is_some() || exclusions_json.is_some() {
+        let links_json: Option<String> = sqlx::query_scalar(
+            "SELECT links_json FROM workbook_sheet_links WHERE revision_id = ? AND sheet_path = ?",
+        )
+        .bind(revision_id)
+        .bind(&sheet_path)
+        .fetch_optional(&db)
+        .await
+        .map_err(|e| format!("Failed to read sheet links '{sheet_path}': {e}"))?;
+
+        if data_json.is_some() || styles_json.is_some() || exclusions_json.is_some() || links_json.is_some() {
             sheets.insert(
                 sheet_path,
-                TemplateSheetExport { data_json, styles_json, exclusions_json },
+                TemplateSheetExport { data_json, styles_json, exclusions_json, links_json },
             );
         }
     }
@@ -3675,11 +3718,22 @@ async fn export_template(
         .map(|(name, sheet_path, row, col)| TemplateNamedCellExport { name, sheet_path, row, col })
         .collect();
 
+    // The template's column layout travels with it (v2) so an imported template keeps its
+    // shape rather than falling back to the importing project's shipped default.
+    let layout_json: Option<String> = sqlx::query_scalar(
+        "SELECT layout_json FROM workbook_revisions WHERE id = ?",
+    )
+    .bind(revision_id)
+    .fetch_one(&db)
+    .await
+    .map_err(|e| format!("Failed to read template layout: {e}"))?;
+
     let export = TemplateExportFile {
         format: TEMPLATE_EXPORT_FORMAT.to_string(),
         version: TEMPLATE_EXPORT_VERSION,
         name,
         description,
+        layout_json,
         sheets,
         named_cells,
     };
@@ -3734,12 +3788,14 @@ async fn import_template(src_path: String, state: State<'_, AppState>) -> Result
     .await
     .map_err(|e| format!("Failed to get next sort order: {e}"))?;
 
+    // Carry the template's column layout (v2 field; None for a v1 file ⇒ shipped default).
     let rev_result = sqlx::query(
-        "INSERT INTO workbook_revisions (workbook_id, name, sort_order) VALUES (?, ?, ?)",
+        "INSERT INTO workbook_revisions (workbook_id, name, sort_order, layout_json) VALUES (?, ?, ?, ?)",
     )
     .bind(workbook_id)
     .bind(&final_name)
     .bind(sort_order)
+    .bind(&import.layout_json)
     .execute(&db)
     .await
     .map_err(|e| format!("Failed to create template revision: {e}"))?;
@@ -3782,6 +3838,19 @@ async fn import_template(src_path: String, state: State<'_, AppState>) -> Result
             .execute(&db)
             .await
             .map_err(|e| format!("Failed to import sheet exclusions '{sheet_path}': {e}"))?;
+        }
+
+        // Sheet-to-sheet cell links (v2 field; absent in a v1 file).
+        if let Some(links_json) = &sheet.links_json {
+            sqlx::query(
+                "INSERT INTO workbook_sheet_links (revision_id, sheet_path, links_json) VALUES (?, ?, ?)",
+            )
+            .bind(revision_id)
+            .bind(sheet_path)
+            .bind(links_json)
+            .execute(&db)
+            .await
+            .map_err(|e| format!("Failed to import sheet links '{sheet_path}': {e}"))?;
         }
     }
 
