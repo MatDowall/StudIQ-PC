@@ -2,7 +2,7 @@ import React, { useRef, useState, useCallback, useMemo, useEffect } from "react"
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
-import { readText as readClipboardText } from "@tauri-apps/plugin-clipboard-manager";
+import { readText as readClipboardText, writeText as writeClipboardText } from "@tauri-apps/plugin-clipboard-manager";
 import { HotTable } from "@handsontable/react-wrapper";
 import type { HotTableRef } from "@handsontable/react-wrapper";
 import { registerAllModules } from "handsontable/registry";
@@ -637,13 +637,15 @@ function deriveLevelFormulas(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     if (pass2.length) hot.setDataAtCell(pass2 as any);
 
-    // Pass 3 — USER COLUMNS (I onward) are TEMPLATE-OWNED (M6): apply each user column's own
-    // `rowFormula` from the active layout, generically, with no hardcoded knowledge of what any
-    // column means. A `{r}` placeholder becomes the 1-based row; a positional XSUM* form is
-    // expanded to its stored child reference for this cell (via xsumToStored). Only on cost sheets
-    // (rate/qty leaves are where the estimator types the component values). A cell is filled only
-    // when it is empty or already holds a formula — a hand-typed literal is preserved (the manual
-    // override), and an excluded cell is left alone.
+    // Pass 3 — USER COLUMNS (I onward) are TEMPLATE-OWNED (M6) and the app NEVER overrides them.
+    // It only FILLS an EMPTY cell on an active row with that column's DETAIL `rowFormula` (a
+    // convenience so a fresh priced row gets its Lab/Mat/Sub/Sum), and never touches a cell that
+    // already holds a formula or a value. That means:
+    //   • a SUMMARY row's cells (stamped with the column's rollupFormula at F:Subtotal drill time
+    //     by writeRollupFormulasIntoGrid — the CostX pattern, exactly like F=XSUMTOT) are left
+    //     alone here, so they roll the child up and stay freely editable; and
+    //   • any user edit wins and is never re-derived away.
+    // Only cost sheets participate (rate/qty leaves are where the estimator types the components).
     if (isCostSheetPath(path)) {
       const pass3: Array<[number, number, string]> = [];
       const userCols = activeLayout.userColumns;
@@ -655,18 +657,11 @@ function deriveLevelFormulas(
           const col = FIRST_USER_COL + u;
           if (isExcluded(r, col)) continue;
           const tmpl = userCols[u].rowFormula;
+          if (!tmpl) continue; // no detail formula → a plain input column, never auto-filled
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           const src = (hot as any).getSourceDataAtCell(r, col);
-          const hasLiteral = typeof src === "string" && src !== "" && !src.startsWith("=");
-          if (hasLiteral) continue; // preserve a manual override (a typed value)
-          if (tmpl) {
-            const formula = xsumToStored(tmpl.replace(/\{r\}/g, String(r + 1)), path, r);
-            if (String(src ?? "") !== formula) pass3.push([r, col, formula]);
-          } else if (typeof src === "string" && src.startsWith("=")) {
-            // No template formula for this column: clear any lingering formula so the column
-            // truly reverts to a plain input — the template is authoritative.
-            pass3.push([r, col, ""]);
-          }
+          if (src != null && src !== "") continue; // fill ONLY an empty cell; never override
+          pass3.push([r, col, xsumToStored(tmpl.replace(/\{r\}/g, String(r + 1)), path, r)]);
         }
       }
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -875,6 +870,49 @@ async function readClipboardWithRetry(attempts = 6, delayMs = 40): Promise<strin
     if (i < attempts - 1) await new Promise(resolve => setTimeout(resolve, delayMs));
   }
   return "";
+}
+
+/**
+ * Copies the SOURCE (formula) text of the current selection to the system clipboard
+ * as a TSV block — the counterpart to Handsontable's default value-copy. For a formula
+ * cell `getSourceDataAtCell` returns its "=…" string; for a plain cell it returns the
+ * stored value, so mixed selections copy sensibly. Spans every selected range's
+ * bounding box, blanking cells outside the actual ranges (matching how Handsontable
+ * lays out a multi-range copy). Written via the Tauri clipboard plugin so it crosses
+ * the WebView2 → host boundary and pastes cleanly into Excel and back into the grid.
+ */
+async function copySelectionFormulas(hot: Handsontable): Promise<void> {
+  const ranges = hot.getSelectedRange();
+  if (!ranges || ranges.length === 0) return;
+  let fromRow = Infinity, toRow = -Infinity, fromCol = Infinity, toCol = -Infinity;
+  for (const r of ranges) {
+    fromRow = Math.min(fromRow, r.from.row, r.to.row);
+    toRow   = Math.max(toRow,   r.from.row, r.to.row);
+    fromCol = Math.min(fromCol, r.from.col, r.to.col);
+    toCol   = Math.max(toCol,   r.from.col, r.to.col);
+  }
+  const inRange = (row: number, col: number) => ranges.some(r => {
+    const rt = Math.min(r.from.row, r.to.row), rb = Math.max(r.from.row, r.to.row);
+    const cl = Math.min(r.from.col, r.to.col), cr = Math.max(r.from.col, r.to.col);
+    return row >= rt && row <= rb && col >= cl && col <= cr;
+  });
+  const lines: string[] = [];
+  for (let row = fromRow; row <= toRow; row++) {
+    const cells: string[] = [];
+    for (let col = fromCol; col <= toCol; col++) {
+      const raw = inRange(row, col) ? (hot as unknown as {
+        getSourceDataAtCell: (r: number, c: number) => unknown;
+      }).getSourceDataAtCell(row, col) : null;
+      cells.push(raw == null ? "" : String(raw));
+    }
+    lines.push(cells.join("\t"));
+  }
+  try {
+    await writeClipboardText(lines.join("\n"));
+  } catch {
+    // Fall back to the WebView renderer clipboard if the host write is unavailable.
+    try { await navigator.clipboard.writeText(lines.join("\n")); } catch { /* give up quietly */ }
+  }
 }
 
 /**
@@ -2349,7 +2387,15 @@ export function WorkbookView() {
       void readClipboardWithRetry().then(text => { pendingPasteTextRef.current = text; });
 
       items.push({ label: "Cut", action: () => (hot.getPlugin("copyPaste") as unknown as { cut: () => void }).cut() });
-      items.push({ label: "Copy", action: () => (hot.getPlugin("copyPaste") as unknown as { copy: () => void }).copy() });
+      // "Copy Values" is Handsontable's default copy — it copies the COMPUTED cell
+      // values (getData, resolved through the formulas plugin). "Copy Formula" copies
+      // the underlying SOURCE (getSourceDataAtCell), so a formula cell yields its
+      // "=…" text rather than the number it currently evaluates to — the estimator can
+      // paste a live formula elsewhere instead of a frozen result. Written straight to
+      // the OS clipboard as a TSV block via the Tauri clipboard plugin (same cross-
+      // process path readClipboardWithRetry reads back), so it round-trips into Excel.
+      items.push({ label: "Copy Values", action: () => (hot.getPlugin("copyPaste") as unknown as { copy: () => void }).copy() });
+      items.push({ label: "Copy Formula", action: () => { void copySelectionFormulas(hot); } });
       items.push({
         label: "Paste",
         action: () => {
@@ -3300,10 +3346,13 @@ export function WorkbookView() {
   // ── drill-down navigation ──────────────────────────────────────────────
 
   /** Writes the declarative rollup formula(s) for a drilled cell into the parent grid: the drilled
-   *  column becomes `=SUM(child!<col>1:<col>1000)`, plus the pull-through user columns (I/K/M/O for
-   *  a rate drill, J/L/N/P for a subtotal drill). Explicit ranges (not volatile XSUM*) so a
-   *  multi-level chain converges in one recalc. Skips excluded cells and dimension-linked C cells.
-   *  Guarded by isAutoUpdatingRef so the afterChange derivation doesn't fight these writes. */
+   *  A–H cell becomes `=XSUM…(child!<col>…)`, and a F:Subtotal drill (which makes the row a SUMMARY
+   *  row over a /S cost child) also STAMPS each user column's template `rollupFormula` into that
+   *  row. This is the CostX pattern — the template's rollup is written once, at the drill, and is
+   *  thereafter an ordinary editable cell; the app never re-derives or overrides it (see
+   *  deriveLevelFormulas pass 3). Explicit ranges (not volatile XSUM*) so a multi-level chain
+   *  converges in one recalc. Skips excluded cells and dimension-linked C cells. Guarded by
+   *  isAutoUpdatingRef so the afterChange derivation doesn't fight these writes. */
   function writeRollupFormulasIntoGrid(hot: Handsontable, row: number, col: number, childPath: string, parentPath: string) {
     // Ensure the child sheet exists so the reference resolves immediately (no #REF flash).
     ensureEngineSheet(hot, childPath);
@@ -3312,13 +3361,19 @@ export function WorkbookView() {
     // HyperFormula orders the child's own formulas (F=E*C, H=F*G) BEFORE this rollup — required
     // for correctness. All XSUM* are ROUND(SUM(range), dp); the name documents intent.
     const xsum = (fn: string, c: number) => `=${fn}(${childName}!${legacyColLetter(c)}1:${legacyColLetter(c)}${XSUM_ROW_BOUND})`;
-    // Write ONLY the drilled A–H cell (fixed by role). The user columns' pull-through (I/K/M/O =
-    // XSUMRATEUSER, etc.) is NOT injected here — it comes from each column's template rowFormula,
-    // applied generically by deriveLevelFormulas. The app no longer hardcodes what a user column does.
     const writes: Array<[number, number, string]> = [];
     const put = (c: number, formula: string) => { if (!isCellExcluded(parentPath, row, c)) writes.push([row, c, formula]); };
     if (col === COL_SUBTOTAL) {
       put(COL_SUBTOTAL, xsum("XSUMTOT", COL_TOTAL));
+      // Summary row: stamp each user column's TEMPLATE rollup formula (e.g. =XSUMUSER(2)),
+      // expanded to reference this new /S cost child. The template owns the formula — the app
+      // injects nothing of its own — and it becomes an editable cell that pass 3 leaves alone.
+      const userCols = activeLayout.userColumns;
+      for (let u = 0; u < userCols.length; u++) {
+        const roll = userCols[u].rollupFormula;
+        if (!roll) continue;
+        put(FIRST_USER_COL + u, xsumToStored(roll, parentPath, row));
+      }
     } else if (col === COL_RATE) {
       put(COL_RATE, xsum("XSUMRATE", COL_TOTAL));
     } else if (col === COL_QTY) {

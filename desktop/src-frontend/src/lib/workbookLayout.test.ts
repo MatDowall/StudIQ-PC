@@ -56,13 +56,19 @@ describe("default layout is byte-identical to the shipped columns", () => {
     expect(standardColumns(DEFAULT_WORKBOOK_LAYOUT).slice(FIRST_USER_COL).every((c) => c.role === "user")).toBe(true);
   });
 
-  it("default user columns carry the LPMS pull-through as template formulae", () => {
+  it("default user columns carry the LPMS split as detail + rollup template formulae", () => {
     const u = DEFAULT_WORKBOOK_LAYOUT.userColumns;
-    expect(u[0].rowFormula).toBe("=XSUMRATEUSER(1)"); // I: Lab pulled from the rate build-up
-    expect(u[1].rowFormula).toBe("=I{r}*C{r}");        // J: Lab-Total = Lab × Qty
-    expect(u[6].rowFormula).toBe("=XSUMRATEUSER(7)");  // O: Sum
-    expect(u[7].rowFormula).toBe("=O{r}*C{r}");        // P: Sum-Total
-    expect(u[8].rowFormula).toBeUndefined();           // Q: blank freeform, no formula
+    // Detail formulae: per-unit pulls from the rate build-up, totals are per-unit × Qty.
+    expect(u[0].rowFormula).toBe("=XSUMRATEUSER(1)"); // I: Lab (detail)
+    expect(u[1].rowFormula).toBe("=I{r}*C{r}");       // J: Lab-Total (detail)
+    expect(u[6].rowFormula).toBe("=XSUMRATEUSER(7)"); // O: Sum (detail)
+    expect(u[7].rowFormula).toBe("=O{r}*C{r}");       // P: Sum-Total (detail)
+    expect(u[8].rowFormula).toBeUndefined();          // Q: blank freeform, no formula
+    // Rollup formulae: every computed column sums its cost child's own same column.
+    expect(u[0].rollupFormula).toBe("=XSUMUSER(1)"); // I rolls up child I
+    expect(u[1].rollupFormula).toBe("=XSUMUSER(2)"); // J rolls up child J (the reported fix)
+    expect(u[7].rollupFormula).toBe("=XSUMUSER(8)"); // P rolls up child P
+    expect(u[8].rollupFormula).toBeUndefined();      // Q: blank freeform, no rollup
   });
 });
 
@@ -100,7 +106,7 @@ describe("parse / serialize round-trip and legacy default", () => {
 
   it("a changed rowFormula alone makes a layout non-default", () => {
     const layout = parseLayout(null);
-    layout.userColumns[0].rowFormula = "=XSUMRATEUSER(2)"; // was =XSUMRATEUSER(1)
+    layout.userColumns[0].rowFormula = "=XSUMRATEUSER(2)"; // was the default =XSUMRATEUSER(1)
     expect(isDefaultLayout(layout)).toBe(false);
   });
   it("a renamed user column reaches the built columns while A–H stay fixed", () => {

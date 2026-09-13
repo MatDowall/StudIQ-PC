@@ -28,12 +28,19 @@ export interface ColumnDef {
 export interface UserColumn {
   label: string;       // "" for a blank freeform column (renders as just the letter)
   width: number;
-  /** Per-row formula the template assigns to this column, with an `{r}` placeholder for the
-   *  1-based row (e.g. `=I{r}*C{r}`, or the positional `=XSUMRATEUSER(1)`). The app applies it
-   *  generically to each line row of a cost sheet — it never hardcodes what a user column does.
-   *  Empty/undefined = a plain input column. Positional XSUM* forms are expanded to the stored
-   *  child reference when applied. */
+  /** DETAIL formula — what a priced/leaf row computes. Per-row, with an `{r}` placeholder for the
+   *  1-based row (e.g. `=I{r}*C{r}`, or the positional `=XSUMRATEUSER(1)` pulling from the row's
+   *  rate build-up). `deriveLevelFormulas` fills an EMPTY cell on an active row with this; it never
+   *  overwrites a cell that already holds a formula or a value, so a user edit (or a stamped
+   *  rollup) always wins. Empty/undefined = a plain input column. */
   rowFormula?: string;
+  /** ROLLUP (subtotal) formula — what to STAMP into this column when the row gains a `/S` cost
+   *  child (a drill on F:Subtotal makes it a summary row), e.g. the positional `=XSUMUSER(2)`
+   *  summing the cost child's own column 2. Stamped once at drill time (exactly as `F=XSUMTOT`
+   *  is), then it's an ordinary editable cell — the app never re-derives or overrides it. This is
+   *  the CostX model: the template, not the app, decides how a summary row rolls up its child.
+   *  Empty/undefined = nothing is stamped for this column on drill. */
+  rollupFormula?: string;
 }
 
 export interface WorkbookLayout {
@@ -70,19 +77,22 @@ const QTY_FIXED: ReadonlyArray<Omit<ColumnDef, "letter">> = [
 ];
 
 // The shipped user columns: the Lab/Mat/Sub/Sum pull-through block (I–P) plus ten blank
-// freeform columns (Q–Z). This is what a NULL layout_json resolves to.
-// The shipped LPMS split, now expressed as template-owned formulae: each per-unit column pulls
-// its component from the rate build-up (=XSUMRATEUSER(n)), each "- Total" is per-unit × Quantity.
-// The app applies these generically per row — nothing about Lab/Mat/Sub/Sum is hardcoded.
+// freeform columns (Q–Z). This is what a NULL layout_json resolves to. Each column owns TWO
+// template formulae (nothing about Lab/Mat/Sub/Sum is hardcoded in the app):
+//   • rowFormula (DETAIL): a priced row's value — per-unit columns pull from the row's rate
+//     build-up (=XSUMRATEUSER(n)); each "- Total" is per-unit × Quantity (=I{r}*C{r}).
+//   • rollupFormula (SUMMARY): stamped when the row drills a /S cost child — every computed column
+//     sums the cost child's OWN same column (=XSUMUSER(n)). Both per-unit and total roll up this
+//     way, so a summary row reports the child's totals rather than re-multiplying by its own Qty.
 const DEFAULT_USER_COLUMNS: ReadonlyArray<UserColumn> = [
-  { label: "Lab",         width: 75, rowFormula: "=XSUMRATEUSER(1)" },
-  { label: "Lab - Total", width: 95, rowFormula: "=I{r}*C{r}" },
-  { label: "Mat",         width: 75, rowFormula: "=XSUMRATEUSER(3)" },
-  { label: "Mat - Total", width: 95, rowFormula: "=K{r}*C{r}" },
-  { label: "Sub",         width: 75, rowFormula: "=XSUMRATEUSER(5)" },
-  { label: "Sub - Total", width: 95, rowFormula: "=M{r}*C{r}" },
-  { label: "Sum",         width: 75, rowFormula: "=XSUMRATEUSER(7)" },
-  { label: "Sum - Total", width: 95, rowFormula: "=O{r}*C{r}" },
+  { label: "Lab",         width: 75, rowFormula: "=XSUMRATEUSER(1)", rollupFormula: "=XSUMUSER(1)" },
+  { label: "Lab - Total", width: 95, rowFormula: "=I{r}*C{r}",       rollupFormula: "=XSUMUSER(2)" },
+  { label: "Mat",         width: 75, rowFormula: "=XSUMRATEUSER(3)", rollupFormula: "=XSUMUSER(3)" },
+  { label: "Mat - Total", width: 95, rowFormula: "=K{r}*C{r}",       rollupFormula: "=XSUMUSER(4)" },
+  { label: "Sub",         width: 75, rowFormula: "=XSUMRATEUSER(5)", rollupFormula: "=XSUMUSER(5)" },
+  { label: "Sub - Total", width: 95, rowFormula: "=M{r}*C{r}",       rollupFormula: "=XSUMUSER(6)" },
+  { label: "Sum",         width: 75, rowFormula: "=XSUMRATEUSER(7)", rollupFormula: "=XSUMUSER(7)" },
+  { label: "Sum - Total", width: 95, rowFormula: "=O{r}*C{r}",       rollupFormula: "=XSUMUSER(8)" },
   ...Array.from({ length: NUM_BLANK_TRAILING }, () => ({ label: "", width: EXTRA_COLUMN_WIDTH })),
 ];
 
@@ -134,6 +144,7 @@ export function parseLayout(json: string | null | undefined): WorkbookLayout {
       label: typeof c?.label === "string" ? c.label : "",
       width: typeof c?.width === "number" && isFinite(c.width) && c.width > 0 ? c.width : EXTRA_COLUMN_WIDTH,
       ...(typeof c?.rowFormula === "string" && c.rowFormula.trim() !== "" ? { rowFormula: c.rowFormula } : {}),
+      ...(typeof c?.rollupFormula === "string" && c.rollupFormula.trim() !== "" ? { rollupFormula: c.rollupFormula } : {}),
     }));
     return { userColumns };
   } catch {
@@ -150,5 +161,7 @@ export function isDefaultLayout(layout: WorkbookLayout): boolean {
   const d = DEFAULT_WORKBOOK_LAYOUT.userColumns;
   if (layout.userColumns.length !== d.length) return false;
   return layout.userColumns.every((c, i) =>
-    c.label === d[i].label && c.width === d[i].width && (c.rowFormula ?? "") === (d[i].rowFormula ?? ""));
+    c.label === d[i].label && c.width === d[i].width
+    && (c.rowFormula ?? "") === (d[i].rowFormula ?? "")
+    && (c.rollupFormula ?? "") === (d[i].rollupFormula ?? ""));
 }
