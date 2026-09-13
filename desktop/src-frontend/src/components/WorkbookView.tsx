@@ -4186,17 +4186,21 @@ export function WorkbookView() {
       }
     },
 
-    // Expand a positional rollup typed directly into a cell (=XSUMRATE(2)) into the stored
-    // child-reference form before it reaches the engine. `source` "edit" = a human keystroke;
-    // programmatic writes (our own guarded setDataAtCell) already store the reference form, and
-    // toStored is a no-op on them anyway. No-op for every non-rollup value.
+    // Expand a positional rollup (=XSUMRATE(2)) into the stored child-reference form before
+    // it reaches the engine, retargeted at THIS cell's own position. Always round-trips through
+    // xsumToDisplay first: a human keystroke is already positional (no-op), but a pasted cell
+    // (Copy Formula, or the grid's own Ctrl+V) carries another cell's STORED reference verbatim —
+    // toStored alone treats that as "already stored" and leaves it pointed at the source row/sheet,
+    // which is the row-doesn't-update-on-paste bug. Stripping to positional first discards that
+    // stale reference so toStored always rebuilds it fresh from (path, ch[0]). No-op for every
+    // non-rollup value, and idempotent for a programmatic write already targeting this cell.
     beforeChange(changes: Array<[number, number, unknown, unknown]> | null, source?: string) {
       if (!changes || source === "loadData") return;
       const path = curSheetPath();
       for (const ch of changes) {
         const next = ch?.[3];
         if (typeof next === "string" && next.charAt(0) === "=") {
-          const expanded = xsumToStored(next, path, ch[0]);
+          const expanded = xsumToStored(xsumToDisplay(next), path, ch[0]);
           if (expanded !== next) ch[3] = expanded;
         }
       }

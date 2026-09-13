@@ -61,6 +61,18 @@ describe("round-trip", () => {
       expect(toStored(toDisplay(stored), path, r)).toBe(stored);
     }
   });
+
+  it("retargets a pasted stored rollup to the destination cell's own row", () => {
+    // Regression for the Copy Formula / paste bug: pasting a cell's raw stored source
+    // (e.g. from row 6) into row 9 must rebuild the child reference for row 9, not keep
+    // pointing at row 6. WorkbookView's beforeChange achieves this by always routing a
+    // pasted value through toDisplay before toStored — this test asserts that composition.
+    const stored = "=XSUMRATE(L1_sS6_sR6!H1:H1000,2)";
+    expect(toStored(toDisplay(stored), "L1/S6", 9)).toBe("=XSUMRATE(L1_sS6_sR9!H1:H1000,2)");
+
+    const storedUser = `=XSUMUSER(L1_sS6!${K}1:${K}1000)`;
+    expect(toStored(toDisplay(storedUser), "L1", 12)).toBe(`=XSUMUSER(L1_sS12!${K}1:${K}1000)`);
+  });
 });
 
 describe("isStoredRollup", () => {
