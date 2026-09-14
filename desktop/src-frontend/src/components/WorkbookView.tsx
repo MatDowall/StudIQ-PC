@@ -20,6 +20,7 @@ import { TextInputDialog } from "./TextInputDialog";
 import { NamedCellsManagerDialog, type NamedCellEntry } from "./NamedCellsManagerDialog";
 import { ColumnLayoutDialog } from "./ColumnLayoutDialog";
 import { ImportDimensionDialog, type ImportDisplayOption } from "./ImportDimensionDialog";
+import { theme } from "../theme";
 import { quantityValueText, type Quantity } from "../lib/quantity";
 import type { ArrayGroupBreakdown, FramingGroupBreakdown } from "../lib/framing";
 import {
@@ -756,8 +757,23 @@ function recomputeEngine(hot: Handsontable | null | undefined): void {
 
 /** Replace the plugin engine's sheets with exactly `sheets` (the whole revision), so cross-sheet
  *  rollup formulas and named-cell references resolve. Adds/replaces every wanted sheet, binds the
- *  grid to L1, then drops any sheet left over from a previous revision. Idempotent. */
-function resetEngineSheets(hot: Handsontable, sheets: Array<{ path: string; data: (string | null)[][] }>): void {
+ *  grid to L1, then drops any sheet left over from a previous revision. Idempotent.
+ *
+ *  Yields back to the browser every `PROGRESS_CHUNK` sheets (a plain `setTimeout(0)`, not a
+ *  microtask) so the loading overlay's progress bar can actually repaint mid-loop instead of
+ *  freezing at 0% for the whole ~20s first-time load of a large revision — this is what makes a
+ *  determinate progress bar meaningfully different from the spinner it replaces. `shouldAbort` is
+ *  checked after every yield: a newer revision switch can now start while this one is mid-loop
+ *  (impossible when the loop ran fully synchronously), so without this check a superseded switch
+ *  would keep mutating the shared engine underneath the switch that replaced it — exactly the
+ *  stale-switch corruption fixed elsewhere in this file. */
+const PROGRESS_CHUNK = 3;
+async function resetEngineSheets(
+  hot: Handsontable,
+  sheets: Array<{ path: string; data: (string | null)[][] }>,
+  onProgress?: (done: number, total: number) => void,
+  shouldAbort?: () => boolean,
+): Promise<void> {
   const plugin = getFormulasPlugin(hot);
   const engine = plugin?.engine;
   if (!plugin || !engine) return;
@@ -765,10 +781,26 @@ function resetEngineSheets(hot: Handsontable, sheets: Array<{ path: string; data
   const wanted = new Map<string, (string | null)[][]>();
   for (const s of sheets) wanted.set(pathToSheetName(s.path), s.data);
   if (!wanted.has(l1Name)) wanted.set(l1Name, createEmptyData());
-  for (const [name, data] of wanted) {
+  // NOTE: `engine.batch()` was tried here to collapse the per-sheet recalculation into one pass
+  // (creating ~55 brand-new sheets is far slower than updating the same 55 existing sheet names
+  // on a later switch). It is NOT safe with this Handsontable/HyperFormula setup: the Formulas
+  // plugin ties its own UndoRedo batch tracking to the engine's suspend/resume events, and
+  // calling `engine.batch()` directly desyncs that tracking — every attempt threw "Batch mode
+  // wasn't started" from Handsontable's UndoRedo plugin, including on the trivial empty-sheet
+  // fallback path. Do not reintroduce `engine.batch`/`suspendEvaluation`/`resumeEvaluation` here
+  // without a way to test against the running desktop app first.
+  const entries = [...wanted];
+  const total = entries.length;
+  for (let i = 0; i < entries.length; i++) {
+    const [name, data] = entries[i];
     const rows = dataForHot(data);
     if (engine.doesSheetExist(name)) engine.setSheetContent(engine.getSheetId(name), rows);
     else plugin.addSheet(name, rows);
+    if ((i + 1) % PROGRESS_CHUNK === 0 || i === entries.length - 1) {
+      onProgress?.(i + 1, total);
+      await new Promise<void>(resolve => setTimeout(resolve, 0));
+      if (shouldAbort?.()) return;
+    }
   }
   plugin.switchSheet(l1Name); // bind to a kept sheet before removing any stale ones
   for (const name of engine.getSheetNames() as string[]) {
@@ -1292,6 +1324,14 @@ export function WorkbookView() {
   const formulaBarRef  = useRef<HTMLInputElement>(null);
   const breadcrumbTrailRef = useRef<HTMLDivElement>(null);
   const [gridHeight, setGridHeight] = useState(400);
+  // True while a revision switch is loading all sheets from the DB — surfaces a visible
+  // "Loading workbook…" overlay instead of a multi-second window where the grid just sits
+  // there looking frozen (this was mistaken for a crash on large, fully-measured tenders).
+  const [workbookLoading, setWorkbookLoading] = useState(false);
+  // Determinate progress through resetEngineSheets's sheet-by-sheet loop (the dominant cost on
+  // a revision's first-ever load) — null while that phase isn't running, so the overlay falls
+  // back to an indeterminate spinner for the network/JSON/named-cell phases around it.
+  const [loadProgress, setLoadProgress] = useState<{ done: number; total: number } | null>(null);
 
   // Active revision from store (drives data load/save)
   const activeRevisionId = useAppStore(s => s.activeRevisionId);
@@ -1487,18 +1527,33 @@ export function WorkbookView() {
     return cellExclusionMap.current.get(path)?.has(styleKey(row, col)) ?? false;
   }
 
-  /** Adds or removes (row,col) on `path` from the exclusion set and persists it. */
+  /** Adds or removes (row,col) on `path` from the exclusion set and persists it. Most callers
+   *  are a user-driven toggle on an already-displayed (so already-loaded) sheet, but a few
+   *  (auto-excluding a Quantity cell the instant a dimension group links into it) can fire
+   *  before this path's exclusions have finished their own initial load. Applying the toggle
+   *  straight to cellExclusionMap in that window would build a brand-new, one-entry set and
+   *  persist it — overwriting whatever was really on disk, the same shape of bug that wiped a
+   *  revision's exclusions via `persistSheet`. Deferring to `ensureSheetExclusionsLoaded` first
+   *  is a no-op when the path is already loaded (the common case) and otherwise waits for the
+   *  real set before merging the toggle into it. */
   function setCellExcluded(path: string, row: number, col: number, excluded: boolean) {
-    let set = cellExclusionMap.current.get(path);
-    if (excluded) {
-      if (!set) { set = new Set(); cellExclusionMap.current.set(path, set); }
-      set.add(styleKey(row, col));
-    } else if (set) {
-      set.delete(styleKey(row, col));
-      if (set.size === 0) cellExclusionMap.current.delete(path);
-    }
     const revId = revIdRef.current;
-    if (revId != null) persistSheetExclusions(revId, path);
+    const apply = () => {
+      let set = cellExclusionMap.current.get(path);
+      if (excluded) {
+        if (!set) { set = new Set(); cellExclusionMap.current.set(path, set); }
+        set.add(styleKey(row, col));
+      } else if (set) {
+        set.delete(styleKey(row, col));
+        if (set.size === 0) cellExclusionMap.current.delete(path);
+      }
+      if (revId != null) persistSheetExclusions(revId, path);
+    };
+    if (revId != null && !loadedExclusionPathsRef.current.has(path)) {
+      ensureSheetExclusionsLoaded(revId, path).then(apply);
+    } else {
+      apply();
+    }
   }
 
   /** Toggles auto-calc exclusion for every cell in the current selection on the
@@ -1672,28 +1727,41 @@ export function WorkbookView() {
 
   /** Loads a sheet's persisted cell-link map once (cached thereafter; lost links are
    *  re-fetched after a "Clear workbook" since the path is purged from the cache too). */
+  // NOTE: this and its two siblings below (ensureSheetStylesLoaded, ensureSheetExclusionsLoaded)
+  // mark their path "loaded" only in a `finally` AFTER the fetch settles, not before it starts.
+  // Marking it up front let a second concurrent call for the same path (React StrictMode's
+  // dev-mode double-invoke of the revision-load effect, or any other double-trigger) see
+  // "already loaded" and proceed immediately with an EMPTY map — since the first call's fetch
+  // hadn't actually populated it yet. For exclusions that let auto-derivation overwrite a
+  // protected cell's hand-built formula; for links it could do the same to a dimension-linked
+  // Quantity cell (see `getCellLink` in writeRollupFormulasIntoGrid). A concurrent duplicate
+  // fetch is now possible but harmless.
   async function ensureSheetLinksLoaded(revisionId: number, path: string): Promise<void> {
     if (loadedLinkPathsRef.current.has(path)) return;
-    loadedLinkPathsRef.current.add(path);
     try {
       const json = await invoke<string>("load_workbook_sheet_links", { revisionId, sheetPath: path });
       const obj = JSON.parse(json) as Record<string, CellLink>;
       const entries = Object.entries(obj);
       if (entries.length > 0) cellLinkMap.current.set(path, new Map(entries));
     } catch { /* non-fatal — sheet simply has no links yet */ }
+    finally {
+      loadedLinkPathsRef.current.add(path);
+    }
   }
 
   /** Loads `path`'s persisted per-cell text formatting (bold/italic/etc.) into
    *  cellStyleMap, once per path — mirrors ensureSheetLinksLoaded. */
   async function ensureSheetStylesLoaded(revisionId: number, path: string): Promise<void> {
     if (loadedStylePathsRef.current.has(path)) return;
-    loadedStylePathsRef.current.add(path);
     try {
       const json = await invoke<string>("load_workbook_sheet_styles", { revisionId, sheetPath: path });
       const obj = JSON.parse(json) as Record<string, CellStyle>;
       const entries = Object.entries(obj);
       if (entries.length > 0) cellStyleMap.current.set(path, new Map(entries));
     } catch { /* non-fatal — sheet simply has no styles yet */ }
+    finally {
+      loadedStylePathsRef.current.add(path);
+    }
   }
 
   /** Loads `path`'s persisted auto-calc exclusion set into cellExclusionMap, once
@@ -1702,13 +1770,15 @@ export function WorkbookView() {
    *  opened excluded cell never gets clobbered by an auto-derived value first. */
   async function ensureSheetExclusionsLoaded(revisionId: number, path: string): Promise<void> {
     if (loadedExclusionPathsRef.current.has(path)) return;
-    loadedExclusionPathsRef.current.add(path);
     try {
       const json = await invoke<string>("load_workbook_sheet_exclusions", { revisionId, sheetPath: path });
       const obj = JSON.parse(json) as Record<string, true>;
       const keys = Object.keys(obj);
       if (keys.length > 0) cellExclusionMap.current.set(path, new Set(keys));
     } catch { /* non-fatal — sheet simply has no exclusions yet */ }
+    finally {
+      loadedExclusionPathsRef.current.add(path);
+    }
   }
 
   /** Persists `path`'s current auto-calc exclusion set (or clears it if empty). */
@@ -2613,7 +2683,16 @@ export function WorkbookView() {
 
   // ── SQLite persistence helpers ─────────────────────────────────────────
 
-  /** Persist one sheet immediately (fire-and-forget — failures are silent). */
+  /** Persist one sheet immediately (fire-and-forget — failures are silent). Links/styles/
+   *  exclusions are each saved only if THIS path's copy has actually been loaded from the DB
+   *  (loadedLinkPathsRef/loadedStylePathsRef/loadedExclusionPathsRef) — cellLinkMap.get(path)
+   *  etc. read `undefined` for a path that simply hasn't loaded yet, indistinguishable from a
+   *  path that has genuinely no links/styles/exclusions. Saving unconditionally (as this used
+   *  to) meant a data-edit save firing before one of those three independent async loads had
+   *  finished — e.g. syncSheetLinks can itself trigger a save via refreshLinkedCells the moment
+   *  links finish loading, with no guarantee styles/exclusions are done yet — silently wrote an
+   *  empty `{}` over the real persisted value, permanently deleting it. This is what wiped a
+   *  revision's excluded-cell set on disk. */
   function persistSheet(revisionId: number, path: string, data: (string | null)[][]) {
     invoke("save_workbook_sheet", {
       revisionId,
@@ -2621,21 +2700,25 @@ export function WorkbookView() {
       dataJson: JSON.stringify(data),
     }).catch(() => {/* non-fatal */});
 
-    const links = cellLinkMap.current.get(path);
-    invoke("save_workbook_sheet_links", {
-      revisionId,
-      sheetPath: path,
-      linksJson: JSON.stringify(links ? Object.fromEntries(links) : {}),
-    }).catch(() => {/* non-fatal */});
+    if (loadedLinkPathsRef.current.has(path)) {
+      const links = cellLinkMap.current.get(path);
+      invoke("save_workbook_sheet_links", {
+        revisionId,
+        sheetPath: path,
+        linksJson: JSON.stringify(links ? Object.fromEntries(links) : {}),
+      }).catch(() => {/* non-fatal */});
+    }
 
-    const styles = cellStyleMap.current.get(path);
-    invoke("save_workbook_sheet_styles", {
-      revisionId,
-      sheetPath: path,
-      stylesJson: JSON.stringify(styles ? Object.fromEntries(styles) : {}),
-    }).catch(() => {/* non-fatal */});
+    if (loadedStylePathsRef.current.has(path)) {
+      const styles = cellStyleMap.current.get(path);
+      invoke("save_workbook_sheet_styles", {
+        revisionId,
+        sheetPath: path,
+        stylesJson: JSON.stringify(styles ? Object.fromEntries(styles) : {}),
+      }).catch(() => {/* non-fatal */});
+    }
 
-    persistSheetExclusions(revisionId, path);
+    if (loadedExclusionPathsRef.current.has(path)) persistSheetExclusions(revisionId, path);
   }
 
   /**
@@ -3260,6 +3343,30 @@ export function WorkbookView() {
     const revId = activeRevisionId;
     if (revId == null) return;
 
+    setWorkbookLoading(true);
+    setLoadProgress(null);
+
+    // ── Timing instrumentation (temporary — helps diagnose the multi-second revision-switch
+    // lag reported against real tenders). Logs each phase's wall time to the console so it can
+    // be read straight out of DevTools without attaching a profiler. Remove once the slow phase
+    // is identified and fixed.
+    const switchStartedAt = performance.now();
+    const mark = (label: string, since: number) => {
+      // eslint-disable-next-line no-console
+      console.log(`[workbook-switch] ${label}: ${(performance.now() - since).toFixed(0)}ms`);
+    };
+
+    // Guards against a stale/superseded switch: sheet names in the shared HyperFormula engine
+    // are derived from path alone (no revision qualifier), so a second run of this effect for
+    // the same or a different revision — StrictMode's intentional double-invoke in dev, or a
+    // real second switch firing before the first finishes — would otherwise let two in-flight
+    // runs interleave and overwrite each other's sheets/named-expressions, corrupting the
+    // currently-displayed revision (e.g. a PROJECT_TOTAL that changes with no edit). `cancelled`
+    // is flipped by the effect's cleanup, so a superseded run (same OR different revId) is
+    // caught — the revId-only check below couldn't tell two runs of the same revision apart.
+    let cancelled = false;
+    const isStale = () => cancelled || revIdRef.current !== revId;
+
     // Resolve this revision's column layout (M2) BEFORE any sheet loads, so loadLevelData's
     // headers/widths reflect it. Read via getState() (not the `workbooks` closure) so this
     // stays keyed on activeRevisionId alone. NULL layout_json ⇒ the shipped default.
@@ -3285,41 +3392,69 @@ export function WorkbookView() {
     // Load the WHOLE revision into the multi-sheet engine at once (one round trip), so cross-sheet
     // rollup formulas and named-cell references resolve. Then display L1. Named cells are
     // registered AFTER the sheets exist, so each binds as a live cross-sheet reference.
-    const displayL1 = (map: Map<string, (string | null)[][]>) => {
+    const displayL1 = async (map: Map<string, (string | null)[][]>) => {
+      if (isStale()) return; // a newer switch has already taken over — don't clobber it
       sheetDataMap.current = map;
       const hot = hotRef.current?.hotInstance;
       if (hot) {
-        resetEngineSheets(hot, [...map].map(([path, data]) => ({ path, data })));
+        let t = performance.now();
+        await resetEngineSheets(
+          hot,
+          [...map].map(([path, data]) => ({ path, data })),
+          (done, total) => setLoadProgress({ done, total }),
+          isStale,
+        );
+        mark(`resetEngineSheets (${map.size} sheets)`, t);
+        if (isStale()) return; // superseded mid-load — resetEngineSheets already bailed out
+        setLoadProgress(null);
+        t = performance.now();
         loadLevelDataExcl(hot, map.get("L1")!, 1, isAutoUpdatingRef, "L1");
+        mark("loadLevelDataExcl(L1)", t);
       }
       syncSheetLinks("L1");
     };
     const registerNamedCells = () => {
-      invoke<string>("load_workbook_named_cells", { revisionId: revId })
+      const t0 = performance.now();
+      return invoke<string>("load_workbook_named_cells", { revisionId: revId })
         .then(json => {
+          mark("invoke load_workbook_named_cells", t0);
+          if (isStale()) return; // a newer switch has already taken over — don't clobber it
           let entries: NamedCell[];
           try { entries = JSON.parse(json) as NamedCell[]; } catch { entries = []; }
           namedCellMap.current = new Map(entries.map(nc => [nc.name, nc]));
+          const t1 = performance.now();
           for (const nc of entries) registerNamedExpression(nc);
+          mark(`registerNamedExpression x${entries.length}`, t1);
           if (entries.length > 0) hotRef.current?.hotInstance?.render();
         })
         .catch(() => { /* non-fatal — workbook simply has no named cells yet */ });
     };
 
+    const invokeStartedAt = performance.now();
     invoke<string>("load_workbook_all_sheets", { revisionId: revId })
-      .then(json => {
+      .then(async json => {
+        mark("invoke load_workbook_all_sheets", invokeStartedAt);
+        const parseStartedAt = performance.now();
         let sheets: Array<{ path: string; data: (string | null)[][] }>;
         try { sheets = JSON.parse(json) as typeof sheets; } catch { sheets = []; }
         const map = new Map<string, (string | null)[][]>();
         for (const s of sheets) map.set(s.path, padData(Array.isArray(s.data) ? s.data : []));
         if (!map.has("L1")) map.set("L1", createEmptyData());
-        displayL1(map);
-        registerNamedCells();
+        mark(`JSON.parse + pad (${sheets.length} sheets, ${json.length} chars)`, parseStartedAt);
+        await displayL1(map);
+        return registerNamedCells();
       })
-      .catch(() => {
-        displayL1(new Map([["L1", createEmptyData()]]));
-        registerNamedCells();
+      .catch(async () => {
+        await displayL1(new Map([["L1", createEmptyData()]]));
+        return registerNamedCells();
+      })
+      .finally(() => {
+        setLoadProgress(null);
+        if (!isStale()) setWorkbookLoading(false);
+        mark("TOTAL revision switch", switchStartedAt);
       });
+
+    return () => { cancelled = true; };
   }, [activeRevisionId]);
 
   // Keep the breadcrumb trail scrolled to the bottom so the immediate parent (where you just
@@ -4890,12 +5025,66 @@ export function WorkbookView() {
       ──────────────────────────────────────────────────────────────────── */}
       <div
         ref={gridWrapperRef}
-        style={{ flex: 1, minHeight: 0, overflow: "hidden" }}
+        style={{ flex: 1, minHeight: 0, overflow: "hidden", position: "relative" }}
         onDragOver={handleGridDragOver}
         onDrop={handleGridDrop}
         onContextMenu={handleGridContextMenu}
       >
         <GridCore hotRef={hotRef} settings={hotSettings} />
+        {workbookLoading && (
+          <div
+            style={{
+              position: "absolute",
+              inset: 0,
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: 10,
+              background: theme.bg.pane,
+              zIndex: 20,
+            }}
+          >
+            {loadProgress ? (
+              <>
+                <div
+                  style={{
+                    width: 220,
+                    height: 6,
+                    borderRadius: 3,
+                    background: theme.bg.hover,
+                    overflow: "hidden",
+                  }}
+                >
+                  <div
+                    style={{
+                      width: `${Math.round((loadProgress.done / loadProgress.total) * 100)}%`,
+                      height: "100%",
+                      background: theme.iconAccent,
+                      // Sheet-by-sheet progress arrives in discrete chunks (PROGRESS_CHUNK at a
+                      // time), so ease the bar's own width change rather than snapping — reads as
+                      // smoother motion than it technically is.
+                      transition: "width 150ms ease-out",
+                    }}
+                  />
+                </div>
+                <span style={{ fontSize: 12, color: theme.text.muted }}>
+                  Loading sheets… ({loadProgress.done}/{loadProgress.total})
+                </span>
+              </>
+            ) : (
+              <>
+                <span
+                  className="material-symbols-outlined"
+                  style={{ fontSize: 32, lineHeight: 1, color: theme.iconAccent, animation: "studiq-spin 1s linear infinite" }}
+                >
+                  progress_activity
+                </span>
+                <span style={{ fontSize: 12, color: theme.text.muted }}>Loading workbook…</span>
+              </>
+            )}
+          </div>
+        )}
       </div>
 
       {/* ── Excel-style status bar ── */}
