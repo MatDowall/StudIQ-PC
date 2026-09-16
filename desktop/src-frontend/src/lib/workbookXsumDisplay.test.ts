@@ -27,6 +27,10 @@ describe("toDisplay: stored reference → clean positional", () => {
     expect(toDisplay("hello")).toBe("hello");
     expect(toDisplay("42")).toBe("42");
   });
+  it("rewrites a rollup call nested inside another formula (e.g. IF), leaving the rest alone", () => {
+    expect(toDisplay(`=IF(H5>0,XSUMRATEUSER(L1_sS6_sR6!${I}1:${I}1000,2),0)`))
+      .toBe("=IF(H5>0,XSUMRATEUSER(1,2),0)");
+  });
 });
 
 describe("toStored: clean positional → stored reference (from cell position)", () => {
@@ -45,6 +49,10 @@ describe("toStored: clean positional → stored reference (from cell position)",
     expect(toStored("=E1*C1", "L1", 0)).toBe("=E1*C1");
     expect(toStored("123", "L1", 0)).toBe("123");
     expect(toStored("=XSUMTOT(L1_sS6!H1:H1000)", "L1", 6)).toBe("=XSUMTOT(L1_sS6!H1:H1000)"); // already stored → untouched
+  });
+  it("rebuilds a rollup call nested inside another formula (e.g. IF), leaving the rest alone", () => {
+    expect(toStored("=IF(H5>0,XSUMRATEUSER(1,2),0)", "L1/S6", 6))
+      .toBe(`=IF(H5>0,XSUMRATEUSER(L1_sS6_sR6!${I}1:${I}1000,2),0)`);
   });
 });
 

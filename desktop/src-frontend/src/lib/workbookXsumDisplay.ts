@@ -41,53 +41,68 @@ function colIndexFromLetter(letters: string): number {
   return n - 1;
 }
 
-// A STORED rollup: =FN( <sheet>!<col><rows>[:<col><rows>] [, dp] )
+// A STORED rollup: FN( <sheet>!<col><rows>[:<col><rows>] [, dp] ) — anchored, whole-cell form,
+// used by isStoredRollup. toDisplay uses the unanchored STORED_CALL_RE below so a rollup can also
+// be found nested inside a larger formula (e.g. wrapped in IF(...)).
 const STORED_RE = /^=\s*(XSUM[A-Z]+)\s*\(\s*[A-Za-z0-9_]+!\$?([A-Za-z]+)\$?\d+(?::\$?[A-Za-z]+\$?\d+)?\s*(?:,\s*(-?\d+(?:\.\d+)?)\s*)?\)\s*$/i;
-// A POSITIONAL rollup (what the user sees/types): =FN( [a] [, b] )
-const POSITIONAL_RE = /^=\s*(XSUM[A-Z]+)\s*\(\s*(-?\d+(?:\.\d+)?)?\s*(?:,\s*(-?\d+(?:\.\d+)?)\s*)?\)\s*$/i;
 
-/** Stored reference form → clean positional form for display. Returns the input unchanged when it
- *  is not a stored XSUM* rollup (a hand-typed formula, plain text, a number, …). */
+// The same two call shapes, unanchored and global, so toDisplay/toStored can find and rewrite a
+// rollup call wherever it sits inside a larger formula (e.g. =IF(H5>0,XSUMRATEUSER(2),0)) rather
+// than only when it is the cell's entire content. A cell only ever drills to one child sheet, so
+// every occurrence in one formula resolves against the same (parentPath, row).
+const STORED_CALL_RE = /(XSUM[A-Z]+)\s*\(\s*[A-Za-z0-9_]+!\$?([A-Za-z]+)\$?\d+(?::\$?[A-Za-z]+\$?\d+)?\s*(?:,\s*(-?\d+(?:\.\d+)?)\s*)?\)/gi;
+const POSITIONAL_CALL_RE = /(XSUM[A-Z]+)\s*\(\s*(-?\d+(?:\.\d+)?)?\s*(?:,\s*(-?\d+(?:\.\d+)?)\s*)?\)/gi;
+
+/** Stored reference form → clean positional form for display. Rewrites every XSUM* call found
+ *  anywhere in the formula (bare, or nested inside IF/other wrappers); returns the input unchanged
+ *  when it contains no recognized stored rollup call (a hand-typed formula, plain text, a number, …). */
 export function toDisplay(source: string): string {
   if (typeof source !== "string") return source;
-  const m = STORED_RE.exec(source.trim());
-  if (!m) return source;
-  const fn = m[1].toUpperCase();
-  if (!XSUM_FNS.has(fn)) return source;
-  const colLetter = m[2];
-  const dp = m[3];
-  if (isUserFn(fn)) {
-    const n = colIndexFromLetter(colLetter) - FIRST_USER_COL + 1;
-    return dp != null ? `=${fn}(${n},${dp})` : `=${fn}(${n})`;
-  }
-  return dp != null ? `=${fn}(${dp})` : `=${fn}()`;
+  const trimmed = source.trim();
+  if (trimmed.charAt(0) !== "=" || !/XSUM/i.test(trimmed)) return source;
+  let changed = false;
+  const result = trimmed.replace(STORED_CALL_RE, (whole: string, fnRaw: string, colLetter: string, dp: string | undefined) => {
+    const fn = fnRaw.toUpperCase();
+    if (!XSUM_FNS.has(fn)) return whole;
+    changed = true;
+    if (isUserFn(fn)) {
+      const n = colIndexFromLetter(colLetter) - FIRST_USER_COL + 1;
+      return dp != null ? `${fn}(${n},${dp})` : `${fn}(${n})`;
+    }
+    return dp != null ? `${fn}(${dp})` : `${fn}()`;
+  });
+  return changed ? result : source;
 }
 
 /** Clean positional form the user typed → stored reference form, using the cell's own position to
- *  rebuild the child reference. Returns the input unchanged when it is not a positional XSUM*
- *  rollup (so ordinary formulas/values pass straight through). */
+ *  rebuild the child reference. Rewrites every XSUM* call found anywhere in the formula (bare, or
+ *  nested inside IF/other wrappers). Returns the input unchanged when it contains no recognized
+ *  positional rollup call (so ordinary formulas/values pass straight through). */
 export function toStored(input: string, parentPath: string, row: number): string {
   if (typeof input !== "string") return input;
-  const m = POSITIONAL_RE.exec(input.trim());
-  if (!m) return input;
-  const fn = m[1].toUpperCase();
-  if (!XSUM_FNS.has(fn)) return input;
-  const a = m[2];   // first numeric arg: user-col n for *USER, else dp
-  const b = m[3];   // second numeric arg: dp for *USER
-  let col: number;
-  let dp: string | undefined;
-  if (isUserFn(fn)) {
-    const n = a != null ? Math.max(1, Math.floor(Number(a))) : 1;
-    col = FIRST_USER_COL + (n - 1);
-    dp = b;
-  } else {
-    col = baseCol(fn);
-    dp = a;
-  }
-  const childName = pathToSheetName(`${parentPath}/${childSuffix(fn)}${row}`);
-  const c = legacyColLetter(col);
-  const range = `${childName}!${c}1:${c}${XSUM_ROW_BOUND}`;
-  return dp != null ? `=${fn}(${range},${dp})` : `=${fn}(${range})`;
+  const trimmed = input.trim();
+  if (trimmed.charAt(0) !== "=" || !/XSUM/i.test(trimmed)) return input;
+  let changed = false;
+  const result = trimmed.replace(POSITIONAL_CALL_RE, (whole: string, fnRaw: string, a: string | undefined, b: string | undefined) => {
+    const fn = fnRaw.toUpperCase();
+    if (!XSUM_FNS.has(fn)) return whole;
+    changed = true;
+    let col: number;
+    let dp: string | undefined;
+    if (isUserFn(fn)) {
+      const n = a != null ? Math.max(1, Math.floor(Number(a))) : 1;
+      col = FIRST_USER_COL + (n - 1);
+      dp = b;
+    } else {
+      col = baseCol(fn);
+      dp = a;
+    }
+    const childName = pathToSheetName(`${parentPath}/${childSuffix(fn)}${row}`);
+    const c = legacyColLetter(col);
+    const range = `${childName}!${c}1:${c}${XSUM_ROW_BOUND}`;
+    return dp != null ? `${fn}(${range},${dp})` : `${fn}(${range})`;
+  });
+  return changed ? result : input;
 }
 
 /** True if `source` is a stored XSUM* rollup (so the caller knows the transform applies). */

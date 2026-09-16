@@ -895,36 +895,46 @@ function applySubtreeRenamesToEngine(
  * lib/workbookLayout.ts). Without this, a hand-typed self-row formula like the shipped
  * template's `=I5*C5` would keep reading the row it moved FROM once physically relocated.
  *
- * Deliberately leaves any formula containing "XSUM" untouched — that family is retargeted
- * separately, by cell position, via `beforeChange`'s toStored round-trip (which also handles
- * a drilled F/E/C cell's own reference) — and only rewrites references whose row number
- * matches the row being moved. A genuine cross-row reference (e.g. a hand-typed running total
- * summing several OTHER rows) is left exactly as typed, the same as Excel leaves a reference
- * untouched when the row it points at is outside the moved range.
+ * Deliberately leaves any XSUM* call — whole-cell, or nested inside a wrapper like
+ * `=IF(H5>0,XSUMRATEUSER(2),0)` — untouched: that family is retargeted separately, by cell
+ * position, via `beforeChange`'s toStored round-trip (which also handles a drilled F/E/C cell's
+ * own reference). `CELL_REF_OR_XSUM_CALL_RE` matches a whole XSUM* call as one token specifically
+ * so this can skip over it while still renumbering any bare reference elsewhere in the same
+ * formula (e.g. the `H5` in that IF condition). Only rewrites references whose row number matches
+ * the row being moved. A genuine cross-row reference (e.g. a hand-typed running total summing
+ * several OTHER rows) is left exactly as typed, the same as Excel leaves a reference untouched
+ * when the row it points at is outside the moved range.
  */
+const CELL_REF_OR_XSUM_CALL_RE = /XSUM[A-Z]+\s*\([^()]*\)|(?<![!\w])([A-Za-z]{1,2})(\d+)\b/gi;
+
 function renumberRowFormula(value: string, fromRow: number, toRow: number): string {
-  if (typeof value !== "string" || value.charAt(0) !== "=" || /XSUM/i.test(value)) return value;
+  if (typeof value !== "string" || value.charAt(0) !== "=") return value;
   const fromRef = fromRow + 1;
   const toRef = toRow + 1;
   if (fromRef === toRef) return value;
-  return value.replace(/(?<![!\w])([A-Za-z]{1,2})(\d+)\b/g, (m, col: string, num: string) =>
-    Number(num) === fromRef ? `${col}${toRef}` : m);
+  return value.replace(CELL_REF_OR_XSUM_CALL_RE, (m: string, col?: string, num?: string) => {
+    if (col == null) return m; // matched a whole XSUM* call — leave untouched
+    return Number(num) === fromRef ? `${col}${toRef}` : m;
+  });
 }
 
 /**
- * Shifts EVERY bare cell reference in a plain (non-XSUM) formula by `rowDelta` rows — the
- * ordinary Excel/CostX relative-reference behaviour on a plain cell copy/paste: `=M1*C1`
- * copied from row 1 and pasted onto row 3 becomes `=M3*C3`, whether or not the reference
- * happens to match the row it was copied FROM (unlike `renumberRowFormula`, which only
- * follows a reference that matches the specific row being physically relocated — the right
- * rule for a row-insert/delete shift, but not for an arbitrary-distance copy/paste). Used by
- * afterPaste for every pasted formula cell that isn't an XSUM rollup (those are retargeted
- * separately, by cell position, via beforeChange's toStored round-trip).
+ * Shifts EVERY bare cell reference in a formula by `rowDelta` rows — the ordinary Excel/CostX
+ * relative-reference behaviour on a plain cell copy/paste: `=M1*C1` copied from row 1 and pasted
+ * onto row 3 becomes `=M3*C3`, whether or not the reference happens to match the row it was
+ * copied FROM (unlike `renumberRowFormula`, which only follows a reference that matches the
+ * specific row being physically relocated — the right rule for a row-insert/delete shift, but not
+ * for an arbitrary-distance copy/paste). Any XSUM* call, whole-cell or nested inside a wrapper
+ * (e.g. `=IF(H5>0,XSUMRATEUSER(2),0)`), is skipped as one token via `CELL_REF_OR_XSUM_CALL_RE` —
+ * that family is retargeted separately, by cell position, via beforeChange's toStored round-trip —
+ * while a bare reference elsewhere in the same formula (that IF's `H5`) still gets shifted here.
  */
 function shiftFormulaRowRefs(formula: string, rowDelta: number): string {
-  if (typeof formula !== "string" || formula.charAt(0) !== "=" || /XSUM/i.test(formula) || rowDelta === 0) return formula;
-  return formula.replace(/(?<![!\w])([A-Za-z]{1,2})(\d+)\b/g, (_m, col: string, num: string) =>
-    `${col}${Number(num) + rowDelta}`);
+  if (typeof formula !== "string" || formula.charAt(0) !== "=" || rowDelta === 0) return formula;
+  return formula.replace(CELL_REF_OR_XSUM_CALL_RE, (m: string, col?: string, num?: string) => {
+    if (col == null) return m; // matched a whole XSUM* call — leave untouched
+    return `${col}${Number(num) + rowDelta}`;
+  });
 }
 
 /** Force a full engine recompute. The XSUM* rollups reference their child as an explicit range, so
