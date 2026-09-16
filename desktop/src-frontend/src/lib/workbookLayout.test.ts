@@ -56,19 +56,10 @@ describe("default layout is byte-identical to the shipped columns", () => {
     expect(standardColumns(DEFAULT_WORKBOOK_LAYOUT).slice(FIRST_USER_COL).every((c) => c.role === "user")).toBe(true);
   });
 
-  it("default user columns carry the LPMS split as detail + rollup template formulae", () => {
+  it("user columns carry no formula of their own — label/width only", () => {
     const u = DEFAULT_WORKBOOK_LAYOUT.userColumns;
-    // Detail formulae: per-unit pulls from the rate build-up, totals are per-unit × Qty.
-    expect(u[0].rowFormula).toBe("=XSUMRATEUSER(1)"); // I: Lab (detail)
-    expect(u[1].rowFormula).toBe("=I{r}*C{r}");       // J: Lab-Total (detail)
-    expect(u[6].rowFormula).toBe("=XSUMRATEUSER(7)"); // O: Sum (detail)
-    expect(u[7].rowFormula).toBe("=O{r}*C{r}");       // P: Sum-Total (detail)
-    expect(u[8].rowFormula).toBeUndefined();          // Q: blank freeform, no formula
-    // Rollup formulae: every computed column sums its cost child's own same column.
-    expect(u[0].rollupFormula).toBe("=XSUMUSER(1)"); // I rolls up child I
-    expect(u[1].rollupFormula).toBe("=XSUMUSER(2)"); // J rolls up child J (the reported fix)
-    expect(u[7].rollupFormula).toBe("=XSUMUSER(8)"); // P rolls up child P
-    expect(u[8].rollupFormula).toBeUndefined();      // Q: blank freeform, no rollup
+    expect(Object.keys(u[0])).toEqual(["label", "width"]);
+    expect(Object.keys(u[8])).toEqual(["label", "width"]);
   });
 });
 
@@ -91,11 +82,11 @@ describe("parse / serialize round-trip and legacy default", () => {
     expect(isDefaultLayout(parseLayout("not json"))).toBe(true);
     expect(isDefaultLayout(parseLayout("{}"))).toBe(true);
   });
-  it("round-trips a custom layout, including rowFormula", () => {
+  it("round-trips a custom layout", () => {
     const custom: WorkbookLayout = {
       userColumns: [
-        { label: "Hours", width: 70, rowFormula: "=XSUMRATEUSER(1)/40" },
-        { label: "Hours - Total", width: 90, rowFormula: "=I{r}*C{r}" },
+        { label: "Hours", width: 70 },
+        { label: "Hours - Total", width: 90 },
         { label: "", width: 90 },
       ],
     };
@@ -104,10 +95,17 @@ describe("parse / serialize round-trip and legacy default", () => {
     expect(isDefaultLayout(back)).toBe(false);
   });
 
-  it("a changed rowFormula alone makes a layout non-default", () => {
+  it("a renamed label alone makes a layout non-default", () => {
     const layout = parseLayout(null);
-    layout.userColumns[0].rowFormula = "=XSUMRATEUSER(2)"; // was the default =XSUMRATEUSER(1)
+    layout.userColumns[0].label = "Hours"; // was the default "Lab"
     expect(isDefaultLayout(layout)).toBe(false);
+  });
+
+  it("a legacy blob still carrying rowFormula/rollupFormula keys parses to label/width only", () => {
+    const legacy = JSON.stringify({
+      userColumns: [{ label: "Lab", width: 75, rowFormula: "=XSUMRATEUSER(1)", rollupFormula: "=XSUMUSER(1)" }],
+    });
+    expect(parseLayout(legacy).userColumns).toEqual([{ label: "Lab", width: 75 }]);
   });
   it("a renamed user column reaches the built columns while A–H stay fixed", () => {
     const custom = parseLayout(serializeLayout({

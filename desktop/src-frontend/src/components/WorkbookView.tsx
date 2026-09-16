@@ -36,7 +36,7 @@ import {
   qtyTotalFormula, toNum, numOrUndefined, textOrBlank, sumComputedCol,
   deriveFactorTotal, legacyColLetter,
 } from "../lib/workbookCalc";
-import { pathToSheetName } from "../lib/workbookSheetNames";
+import { pathToSheetName, sheetNameToPath } from "../lib/workbookSheetNames";
 import { registerWorkbookFunctions } from "../lib/workbookFunctions";
 import { toDisplay as xsumToDisplay, toStored as xsumToStored, XSUM_ROW_BOUND } from "../lib/workbookXsumDisplay";
 import {
@@ -336,27 +336,14 @@ function sheetKindForPath(path: string): SheetKind {
 // F:Subtotal → a deeper cost sheet (/S, recursive), E:Rate → a rate build-up leaf (/R), C:Quantity
 // → a qty build-up leaf (/Q). Rate and qty build-ups are LEAVES: nothing drills inside them.
 function isCostSheetPath(path: string): boolean {
-  return path === "L1" || /\/S\d+$/.test(path) || path === TEMPLATE_MASTER_L2_PATH;
+  return path === "L1" || /\/S\d+$/.test(path);
 }
-
-// Reserved sheet paths (never reachable via drill-down — real paths look like
-// "L1/R3"). Used both as a template's master takeoff (L2) / rate build-up (L3)
-// sheets and, once a workbook is created from that template, as the seeds
-// copied into every new Level 2 / Level 3 sheet created in that workbook
-// (Level 2 sheets seed from the L2 master, Level 3 sheets from the L3 master).
-// Must match the literals used in lib.rs's create_workbook_revision_from_template.
-const TEMPLATE_MASTER_L2_PATH = "TEMPLATE_MASTER_L2";
-const TEMPLATE_MASTER_L3_PATH = "TEMPLATE_MASTER_L3";
-// Master seed for "Quantity Build-up" sheets — drilled into from a Level 2 row's
-// C:Quantity (sibling to the Rate Build-up drill from E:Rate; same depth, parent is
-// always an L2 row, but a distinct A–H column layout and rollup target).
-const TEMPLATE_MASTER_LQ_PATH = "TEMPLATE_MASTER_LQ";
 
 // Real Quantity Build-up sheet paths look like "L1/R3/Q5" — the "/Q<row>" suffix
 // (vs. "/R<row>" for Rate Build-up / standard takeoff sheets) is what identifies a
 // sheet's "kind" purely from its path, with no extra state needed alongside pathStack.
 function isQtyBuildupPath(path: string): boolean {
-  return /\/Q\d+$/.test(path) || path === TEMPLATE_MASTER_LQ_PATH;
+  return /\/Q\d+$/.test(path);
 }
 
 /** Derives a sheet's drill level purely from its path depth — "L1" is level 1,
@@ -638,36 +625,14 @@ function deriveLevelFormulas(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     if (pass2.length) hot.setDataAtCell(pass2 as any);
 
-    // Pass 3 — USER COLUMNS (I onward) are TEMPLATE-OWNED (M6) and the app NEVER overrides them.
-    // It only FILLS an EMPTY cell on an active row with that column's DETAIL `rowFormula` (a
-    // convenience so a fresh priced row gets its Lab/Mat/Sub/Sum), and never touches a cell that
-    // already holds a formula or a value. That means:
-    //   • a SUMMARY row's cells (stamped with the column's rollupFormula at F:Subtotal drill time
-    //     by writeRollupFormulasIntoGrid — the CostX pattern, exactly like F=XSUMTOT) are left
-    //     alone here, so they roll the child up and stay freely editable; and
-    //   • any user edit wins and is never re-derived away.
-    // Only cost sheets participate (rate/qty leaves are where the estimator types the components).
-    if (isCostSheetPath(path)) {
-      const pass3: Array<[number, number, string]> = [];
-      const userCols = activeLayout.userColumns;
-      const has = (r: number, c: number) => { const v = hot.getDataAtCell(r, c); return v != null && v !== ""; };
-      for (let r = 0; r < NUM_ROWS; r++) {
-        // A row is "active" (gets its template formulae) once it has any Code/Description/Qty/Rate.
-        if (!(has(r, COL_CODE) || has(r, COL_DESC) || has(r, COL_QTY) || has(r, COL_RATE))) continue;
-        for (let u = 0; u < userCols.length; u++) {
-          const col = FIRST_USER_COL + u;
-          if (isExcluded(r, col)) continue;
-          const tmpl = userCols[u].rowFormula;
-          if (!tmpl) continue; // no detail formula → a plain input column, never auto-filled
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const src = (hot as any).getSourceDataAtCell(r, col);
-          if (src != null && src !== "") continue; // fill ONLY an empty cell; never override
-          pass3.push([r, col, xsumToStored(tmpl.replace(/\{r\}/g, String(r + 1)), path, r)]);
-        }
-      }
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      if (pass3.length) hot.setDataAtCell(pass3 as any);
-    }
+    // User columns (I onward) are never auto-filled by the app — a formula only ever gets
+    // into a cell because a human typed it there, or it arrived via a row copy/paste that
+    // carries the source row's own formulas along (see afterPaste's clone-on-paste, which
+    // retargets an EXISTING formula's row reference rather than writing a new one). There
+    // used to be a "pass 3" here that filled an empty user-column cell from a per-column
+    // template whenever the row looked active — removed: it could not tell a genuinely
+    // blank cell from one the estimator had just deliberately cleared, and resurrected
+    // stale/orphaned child-sheet references on the "stacking" bug this pass 3 caused.
   } finally {
     guardRef.current = false;
   }
@@ -746,6 +711,111 @@ function ensureEngineSheet(hot: Handsontable, path: string): void {
   if (!plugin || !engine) return;
   const name = pathToSheetName(path);
   try { if (!engine.doesSheetExist(name)) plugin.addSheet(name, dataForHot(createEmptyData())); } catch { /* ignore */ }
+}
+
+/**
+ * Moves every LIVE engine sheet under `oldSub` (itself, plus any of its own drilled
+ * descendants) to sit under `newSub` instead — the live-engine counterpart of the JS-cache
+ * `remapMapKey`/`remapSetKey` renames and the `rename_workbook_sheet_subtree` DB call that
+ * already run alongside this at every insert/delete-row call site.
+ *
+ * A cost sheet's whole revision is loaded into the HyperFormula engine up front
+ * (`resetEngineSheets`), so a row that has already been drilled into (a "/S<row>" cost
+ * child, "/R<row>" rate build-up, or "/Q<row>" qty build-up) has a REAL live sheet under its
+ * OLD name at the moment its row physically shifts. `beforeChange`'s toStored round-trip
+ * rewrites the row's own drilled-reference formula (e.g. F's `=XSUMTOT(...)`) to point at the
+ * NEW name the instant the cell lands on its new row — but that only fixes the formula TEXT.
+ * Without also moving the live sheet itself, that rewritten reference either resolves against
+ * nothing (a row that had never been drilled before) or — when another row's own child
+ * already happens to sit under that target name — silently reads THAT child's numbers
+ * instead. This is the "reference to the sub sheet lost" failure: the moved row's rollup
+ * reads someone else's data (or nothing), which is exactly what changes a workbook's totals
+ * when a row is merely inserted or deleted elsewhere on the sheet.
+ *
+ * Moves by COPYING content (`getSheetSerialized`, formula strings intact) to the target name
+ * and removing the source, rather than `HyperFormula.renameSheet` — a rename updates the
+ * engine's internal id↔name mapping in place, and every OTHER cell's formula that references
+ * this sheet (by name, at parse time) is bound to it by id already, so leftover/point-in-time
+ * inconsistencies there showed up as spurious #CYCLE! errors and cross-row corruption on
+ * unrelated rows during testing. Copy-then-remove touches only the two sheets involved and
+ * matches the primitives `resetEngineSheets`/`loadLevelData` already use elsewhere.
+ *
+ * KNOWN LIMITATION: a cost sheet can itself drill further (M5: unlimited depth), so a moved
+ * sheet's OWN cells may contain an XSUM* formula referencing one of ITS OWN children by the
+ * OLD name — that inner reference is copied verbatim, not rewritten, because only a real
+ * grid edit (via `beforeChange`) retargets XSUM* text. In practice this only bites a row whose
+ * lump-sum breakdown is itself broken down further; a single level of Rate/Qty build-up (the
+ * overwhelmingly common case) has no such inner reference to go stale.
+ *
+ * Must be called in the same bottom-up (insert) / top-down (delete) row order as the cache
+ * remap it runs alongside, and BEFORE the row data itself is written (so the target sheet
+ * already holds the right content the instant the retargeted formula is parsed) — see the
+ * call sites.
+ */
+function moveLiveEngineSubtree(hot: Handsontable, oldSub: string, newSub: string): void {
+  const plugin = getFormulasPlugin(hot);
+  const engine = plugin?.engine;
+  if (!plugin || !engine) return;
+  const prefix = `${oldSub}/`;
+  let names: string[];
+  try { names = engine.getSheetNames() as string[]; } catch { return; }
+  for (const name of names) {
+    const p = sheetNameToPath(name);
+    let newPath: string | null = null;
+    if (p === oldSub) newPath = newSub;
+    else if (p.startsWith(prefix)) newPath = newSub + p.slice(oldSub.length);
+    if (newPath == null) continue;
+    try {
+      const oldId = engine.getSheetId(name);
+      if (oldId == null) continue;
+      const content = engine.getSheetSerialized(oldId);
+      const newName = pathToSheetName(newPath);
+      if (engine.doesSheetExist(newName)) engine.setSheetContent(engine.getSheetId(newName), content);
+      else plugin.addSheet(newName, content);
+      engine.removeSheet(oldId);
+    } catch { /* non-fatal — the cache/DB rename above still keeps it consistent on reload */ }
+  }
+}
+
+/**
+ * Renumbers bare same-row cell references (e.g. "I5" → "I6") when a cell's formula text is
+ * physically carried from `fromRow` to `toRow` by insertBlankRowAt/deleteRowAt's row-shift —
+ * the CostX-native "Formulas containing cell references are updated to reflect the new row
+ * numbering automatically" behaviour, applied to a formula a human actually typed (this app
+ * never writes a user-column formula itself; see UserColumn's doc comment in
+ * lib/workbookLayout.ts). Without this, a hand-typed self-row formula like the shipped
+ * template's `=I5*C5` would keep reading the row it moved FROM once physically relocated.
+ *
+ * Deliberately leaves any formula containing "XSUM" untouched — that family is retargeted
+ * separately, by cell position, via `beforeChange`'s toStored round-trip (which also handles
+ * a drilled F/E/C cell's own reference) — and only rewrites references whose row number
+ * matches the row being moved. A genuine cross-row reference (e.g. a hand-typed running total
+ * summing several OTHER rows) is left exactly as typed, the same as Excel leaves a reference
+ * untouched when the row it points at is outside the moved range.
+ */
+function renumberRowFormula(value: string, fromRow: number, toRow: number): string {
+  if (typeof value !== "string" || value.charAt(0) !== "=" || /XSUM/i.test(value)) return value;
+  const fromRef = fromRow + 1;
+  const toRef = toRow + 1;
+  if (fromRef === toRef) return value;
+  return value.replace(/(?<![!\w])([A-Za-z]{1,2})(\d+)\b/g, (m, col: string, num: string) =>
+    Number(num) === fromRef ? `${col}${toRef}` : m);
+}
+
+/**
+ * Shifts EVERY bare cell reference in a plain (non-XSUM) formula by `rowDelta` rows — the
+ * ordinary Excel/CostX relative-reference behaviour on a plain cell copy/paste: `=M1*C1`
+ * copied from row 1 and pasted onto row 3 becomes `=M3*C3`, whether or not the reference
+ * happens to match the row it was copied FROM (unlike `renumberRowFormula`, which only
+ * follows a reference that matches the specific row being physically relocated — the right
+ * rule for a row-insert/delete shift, but not for an arbitrary-distance copy/paste). Used by
+ * afterPaste for every pasted formula cell that isn't an XSUM rollup (those are retargeted
+ * separately, by cell position, via beforeChange's toStored round-trip).
+ */
+function shiftFormulaRowRefs(formula: string, rowDelta: number): string {
+  if (typeof formula !== "string" || formula.charAt(0) !== "=" || /XSUM/i.test(formula) || rowDelta === 0) return formula;
+  return formula.replace(/(?<![!\w])([A-Za-z]{1,2})(\d+)\b/g, (_m, col: string, num: string) =>
+    `${col}${Number(num) + rowDelta}`);
 }
 
 /** Force a full engine recompute. The XSUM* rollups reference their child as an explicit range, so
@@ -913,9 +983,14 @@ async function readClipboardWithRetry(attempts = 6, delayMs = 40): Promise<strin
  * lays out a multi-range copy). Written via the Tauri clipboard plugin so it crosses
  * the WebView2 → host boundary and pastes cleanly into Excel and back into the grid.
  */
-async function copySelectionFormulas(hot: Handsontable): Promise<void> {
+/** Union bounding box of every range in the current selection, or null if nothing is
+ *  selected — shared by copySelectionFormulas (what gets written to the clipboard) and
+ *  the "Copy Formula" menu action (what gets recorded as the clone-on-paste source, so
+ *  a subsequent paste's drill-column clone/reference-shift has the right row/col to
+ *  measure from — see lastRateCopyRef). */
+function selectionBoundingBox(hot: Handsontable): { fromRow: number; toRow: number; fromCol: number; toCol: number } | null {
   const ranges = hot.getSelectedRange();
-  if (!ranges || ranges.length === 0) return;
+  if (!ranges || ranges.length === 0) return null;
   let fromRow = Infinity, toRow = -Infinity, fromCol = Infinity, toCol = -Infinity;
   for (const r of ranges) {
     fromRow = Math.min(fromRow, r.from.row, r.to.row);
@@ -923,6 +998,15 @@ async function copySelectionFormulas(hot: Handsontable): Promise<void> {
     fromCol = Math.min(fromCol, r.from.col, r.to.col);
     toCol   = Math.max(toCol,   r.from.col, r.to.col);
   }
+  return { fromRow, toRow, fromCol, toCol };
+}
+
+async function copySelectionFormulas(hot: Handsontable): Promise<void> {
+  const ranges = hot.getSelectedRange();
+  if (!ranges || ranges.length === 0) return;
+  const box = selectionBoundingBox(hot);
+  if (!box) return;
+  const { fromRow, toRow, fromCol, toCol } = box;
   const inRange = (row: number, col: number) => ranges.some(r => {
     const rt = Math.min(r.from.row, r.to.row), rb = Math.max(r.from.row, r.to.row);
     const cl = Math.min(r.from.col, r.to.col), cr = Math.max(r.from.col, r.to.col);
@@ -997,10 +1081,15 @@ function describeCompletion(name: string, namedCells: Map<string, NamedCell>): {
 }
 
 /** Extract the 0-based row index from the last path segment, e.g. "L1/R3" → 3,
- *  "L1/R3/Q5" → 5. The row index is purely positional — kind-agnostic — so both
- *  "/R<n>" (standard / Rate Build-up) and "/Q<n>" (Quantity Build-up) match. */
+ *  "L1/S3" → 3, "L1/S3/Q5" → 5. The row index is purely positional — kind-agnostic —
+ *  so "/R<n>" (Rate Build-up), "/Q<n>" (Quantity Build-up), and "/S<n>" (recursive
+ *  cost sheet, M5) all match: a row drilled via its F:Subtotal column (rather than
+ *  E:Rate or C:Quantity) produces an "/S<n>" child, and a caller keying off this
+ *  purely to find "which row of the parent does this child belong to" needs that
+ *  case too — omitting it previously made `refreshBreadcrumbFromEngine` silently
+ *  fall back to row 0 (the parent's own header row) for any S-drilled ancestor. */
 function pathLastRow(path: string): number | null {
-  const m = path.match(/\/[RQ](\d+)$/);
+  const m = path.match(/\/[RQS](\d+)$/);
   return m ? parseInt(m[1], 10) : null;
 }
 
@@ -1349,22 +1438,13 @@ export function WorkbookView() {
   const setWorkbookFormatApi = useAppStore(s => s.setWorkbookFormatApi);
   const setWorkbookGridApi   = useAppStore(s => s.setWorkbookGridApi);
 
-  // Template manager / template-edit-mode (Settings → Template Manager in the ribbon)
+  // Template manager / template-edit-mode (Settings → Template Manager in the ribbon) —
+  // editing a template is just displaying its revision as an ordinary workbook (see
+  // enterTemplateEdit in appStore.ts); the banner below only needs to know whether it's
+  // active, and for whom.
   const templateManagerOpen = useAppStore(s => s.templateManagerOpen);
   const templateEditMode    = useAppStore(s => s.templateEditMode);
   const exitTemplateEdit    = useAppStore(s => s.exitTemplateEdit);
-  // Which master sheet is currently shown while editing a template — reset to the
-  // takeoff sheet whenever a (different) template is opened for editing.
-  const [masterView, setMasterView] = useState<"L1" | "L2" | "L3" | "LQ">("L1");
-  const templateIdRef = useRef<number | null>(null);
-  useEffect(() => {
-    if (templateEditMode && templateEditMode.templateId !== templateIdRef.current) {
-      templateIdRef.current = templateEditMode.templateId;
-      setMasterView("L1");
-    } else if (!templateEditMode) {
-      templateIdRef.current = null;
-    }
-  }, [templateEditMode]);
 
   // Current drill-down level and breadcrumb context stack
   const [level,      setLevel]      = useState<Level>(1);
@@ -1396,9 +1476,9 @@ export function WorkbookView() {
   // back to the cell even after focus moves to the input element.
   const lastSelectedCellRef = useRef<{ row: number; col: number } | null>(null);
 
-  // Most recent Ctrl+C/copy selection — used by afterPaste to detect "an E:Rate
-  // cell was copied" so the paste can clone that row's Rate Build-up sheet onto
-  // the destination row (see maybeCloneRateBuildupSheet).
+  // Most recent Ctrl+C/copy selection — used by afterPaste to detect "a drill column
+  // cell was copied" so the paste can clone that row's drilled child sheet onto
+  // the destination row (see maybeCloneChildSheet).
   const lastRateCopyRef = useRef<{
     path: string;
     level: Level;
@@ -2154,18 +2234,16 @@ export function WorkbookView() {
    *  what's there — used when auto-placing "<size> Lintel to last" rows directly below a
    *  dropped framing group would otherwise collide with existing takeoff rows.
    *
-   *  Formula columns (F/H/J/L/N/P) hold row-relative references (`=E{r}*C{r}`, …) — copying
-   *  their strings verbatim would leave them pointing at the old row indices, so this copies
-   *  only the input/pulled-through columns (A/B/C/D/E/G/I/K/M/O) verbatim, blanks the formula
-   *  columns at the destination, and lets `deriveLevelFormulas` regenerate them correctly for
-   *  the new row positions afterwards (mirrors how a freshly-entered row is derived). Rows
-   *  that would land past the bottom of the fixed `NUM_ROWS` grid are dropped — sheets
-   *  essentially never fill all 100 rows, and losing trailing blank rows is harmless. */
+   *  Every cell is carried verbatim to its new row, except a plain (non-XSUM) formula has
+   *  its bare same-row cell references renumbered to match (`renumberRowFormula` — the same
+   *  treatment insertBlankRowAt/deleteRowAt give a shifted row). An XSUM formula (F/H when
+   *  drilled, or a hand-typed rollup in I/K/M/O) is left untouched and retargeted separately,
+   *  by cell position, via beforeChange's toStored round-trip once the write lands. Rows that
+   *  would land past the bottom of the fixed `NUM_ROWS` grid are dropped — sheets essentially
+   *  never fill all 100 rows, and losing trailing blank rows is harmless. */
   function shiftStandardRowsDown(hot: Handsontable, path: string, fromRow: number, lastRow: number, by: number): void {
     const data = captureSourceData(hot);
     const cols = hot.countCols();
-    const verbatimCols = [COL_CODE, COL_DESC, COL_QTY, COL_UNIT, COL_RATE, COL_FACTOR, COL_LAB, COL_MAT, COL_SUB, COL_SUM];
-    const formulaCols  = [COL_SUBTOTAL, COL_TOTAL, COL_LAB_TOTAL, COL_MAT_TOTAL, COL_SUB_TOTAL, COL_SUM_TOTAL];
 
     isAutoUpdatingRef.current = true;
     try {
@@ -2173,8 +2251,10 @@ export function WorkbookView() {
       for (let r = lastRow; r >= fromRow; r--) {
         const dest = r + by;
         if (dest > NUM_ROWS - 1) continue;
-        for (const col of verbatimCols) batch.push([dest, col, data[r][col] ?? ""]);
-        for (const col of formulaCols) batch.push([dest, col, ""]);
+        for (let c = 0; c < cols; c++) {
+          const v = data[r][c] ?? "";
+          batch.push([dest, c, renumberRowFormula(v, r, dest)]);
+        }
       }
       // Clear the rows the new line items will occupy — their old contents have
       // already been copied onward to fromRow+by.. and won't be touched above.
@@ -2465,7 +2545,30 @@ export function WorkbookView() {
       // the OS clipboard as a TSV block via the Tauri clipboard plugin (same cross-
       // process path readClipboardWithRetry reads back), so it round-trips into Excel.
       items.push({ label: "Copy Values", action: () => (hot.getPlugin("copyPaste") as unknown as { copy: () => void }).copy() });
-      items.push({ label: "Copy Formula", action: () => { void copySelectionFormulas(hot); } });
+      items.push({
+        label: "Copy Formula",
+        action: () => {
+          // Copy Formula writes straight to the OS clipboard (see copySelectionFormulas)
+          // rather than going through Handsontable's own copyPaste plugin, so its
+          // *afterCopy* hook never fires — without this, a subsequent paste's
+          // drill-column clone-on-paste and formula-reference shift (afterPaste,
+          // which reads lastRateCopyRef) would have no idea what was copied from
+          // where, and silently no-op. Recorded here instead, from the same selection
+          // copySelectionFormulas itself copies.
+          const box = selectionBoundingBox(hot);
+          if (box) {
+            lastRateCopyRef.current = {
+              path: curSheetPath(),
+              level: levelRef.current,
+              startRow: box.fromRow,
+              startCol: box.fromCol,
+              rowCount: box.toRow - box.fromRow + 1,
+              colCount: box.toCol - box.fromCol + 1,
+            };
+          }
+          void copySelectionFormulas(hot);
+        },
+      });
       items.push({
         label: "Paste",
         action: () => {
@@ -2802,15 +2905,12 @@ export function WorkbookView() {
 
   /**
    * Insert a blank row at `insertAt`, shifting all occupied rows from that
-   * position downward by one.  ALL columns are copied verbatim (including
-   * F:Subtotal and the …-Total columns which at Level 1 hold plain rollup
-   * numbers, not row-relative formulas).  `deriveLevelFormulas` is called
-   * afterwards to regenerate the formula columns (F=E×C at L2+, H=F×G at
-   * all levels, J/L/N/P×C at L2) for their new row positions — it overwrites
-   * only the cells it handles, leaving plain-number cells untouched.
-   *
-   * This is intentionally NOT `shiftStandardRowsDown`, which clears the
-   * …-Total columns and is only correct at Level 2/3 (never at Level 1).
+   * position downward by one. Every cell is carried verbatim to its new row
+   * EXCEPT that a plain (non-XSUM) formula has its bare same-row cell
+   * references renumbered to match — see `renumberRowFormula`. An XSUM formula
+   * (a drilled F/E/C cell, or a hand-typed `=XSUMRATEUSER(1)` in a user column)
+   * is left untouched here and retargeted separately, by cell position, via
+   * `beforeChange`'s toStored round-trip once the write lands.
    */
   function insertBlankRowAt(hot: Handsontable, path: string, insertAt: number): void {
     const data = captureSourceData(hot);
@@ -2820,6 +2920,63 @@ export function WorkbookView() {
       if (isLineItemRow(data[r])) { lastOccupied = r; break; }
     }
 
+    // Move every shifted row's own sub-sheets — live engine, in-memory caches, and the DB —
+    // BEFORE the row data itself moves. A moved row's own drilled-reference formula (F's
+    // =XSUMTOT(...), or I/K/M/O's =XSUMRATEUSER(...)) gets retargeted at its new row the instant
+    // the batch write below lands (beforeChange's toStored round-trip), so the live sheet it
+    // will point at must already hold the right content under that new name by then.
+    // At Level 1 sub-sheets are "<path>/R{r}"; at Level 2 also "<path>/Q{r}".
+    const subPrefixes = isCostSheetPath(path) ? ["S", "R", "Q"] : []; // M5: cost sheets carry S/R/Q children
+    if (lastOccupied >= insertAt && subPrefixes.length > 0) {
+      // Bottom-up so a target name is never still occupied by an unprocessed row — see
+      // shiftRowKeyedEntries' comment on why down-shifts need descending order.
+      for (let r = lastOccupied; r >= insertAt; r--) {
+        for (const prefix of subPrefixes) {
+          const oldSub = `${path}/${prefix}${r}`;
+          const newSub = `${path}/${prefix}${r + 1}`;
+          moveLiveEngineSubtree(hot, oldSub, newSub);
+          // Rename the exact path in every Map cache.
+          function remapMapKey<V>(map: Map<string, V>) {
+            if (map.has(oldSub)) { map.set(newSub, map.get(oldSub)!); map.delete(oldSub); }
+            const subPrefix = `${oldSub}/`;
+            for (const key of Array.from(map.keys())) {
+              if (key.startsWith(subPrefix)) { map.set(newSub + key.slice(oldSub.length), map.get(key)!); map.delete(key); }
+            }
+          }
+          remapMapKey(sheetDataMap.current as Map<string, unknown>);
+          remapMapKey(sheetComputedMap.current as Map<string, unknown>);
+          remapMapKey(cellLinkMap.current);
+          remapMapKey(cellStyleMap.current);
+          remapMapKey(cellExclusionMap.current);
+          // Rename in the "loaded" Set caches.
+          function remapSetKey(set: Set<string>) {
+            if (set.has(oldSub)) { set.add(newSub); set.delete(oldSub); }
+            const subPrefix = `${oldSub}/`;
+            for (const key of Array.from(set)) {
+              if (key.startsWith(subPrefix)) { set.add(newSub + key.slice(oldSub.length)); set.delete(key); }
+            }
+          }
+          remapSetKey(loadedLinkPathsRef.current);
+          remapSetKey(loadedStylePathsRef.current);
+          remapSetKey(loadedExclusionPathsRef.current);
+        }
+      }
+
+      // Persist the path renames to SQLite (bottom-up; fire-and-forget).
+      const revId = revIdRef.current;
+      if (revId != null) {
+        for (let r = lastOccupied; r >= insertAt; r--) {
+          for (const prefix of subPrefixes) {
+            const oldSub = `${path}/${prefix}${r}`;
+            const newSub = `${path}/${prefix}${r + 1}`;
+            invoke("rename_workbook_sheet_subtree", {
+              revisionId: revId, oldPath: oldSub, newPath: newSub,
+            }).catch(() => {/* non-fatal */});
+          }
+        }
+      }
+    }
+
     isAutoUpdatingRef.current = true;
     try {
       const batch: Array<[number, number, string]> = [];
@@ -2827,7 +2984,10 @@ export function WorkbookView() {
         for (let r = lastOccupied; r >= insertAt; r--) {
           const dest = r + 1;
           if (dest > NUM_ROWS - 1) continue;
-          for (let c = 0; c < cols; c++) batch.push([dest, c, data[r][c] ?? ""]);
+          for (let c = 0; c < cols; c++) {
+            const v = data[r][c] ?? "";
+            batch.push([dest, c, renumberRowFormula(v, r, dest)]);
+          }
         }
       }
       for (let c = 0; c < cols; c++) batch.push([insertAt, c, ""]);
@@ -2856,57 +3016,6 @@ export function WorkbookView() {
       shiftRowKeyedEntries(cellLinkMap.current.get(path), insertAt, lastOccupied + 1, 1, cols);
       shiftRowKeyedEntries(cellStyleMap.current.get(path), insertAt, lastOccupied + 1, 1, cols);
       shiftRowKeyedSet(cellExclusionMap.current.get(path), insertAt, lastOccupied + 1, 1, cols);
-
-      // Remap in-memory sub-sheet caches (bottom-up to avoid collisions).
-      // At Level 1 sub-sheets are "<path>/R{r}"; at Level 2 also "<path>/Q{r}".
-      const lv = levelRef.current;
-      const subPrefixes = isCostSheetPath(path) ? ["S", "R", "Q"] : []; // M5: cost sheets carry S/R/Q children
-      if (subPrefixes.length > 0) {
-        for (let r = lastOccupied; r >= insertAt; r--) {
-          for (const prefix of subPrefixes) {
-            const oldSub = `${path}/${prefix}${r}`;
-            const newSub = `${path}/${prefix}${r + 1}`;
-            // Rename the exact path in every Map cache.
-            function remapMapKey<V>(map: Map<string, V>) {
-              if (map.has(oldSub)) { map.set(newSub, map.get(oldSub)!); map.delete(oldSub); }
-              const subPrefix = `${oldSub}/`;
-              for (const key of Array.from(map.keys())) {
-                if (key.startsWith(subPrefix)) { map.set(newSub + key.slice(oldSub.length), map.get(key)!); map.delete(key); }
-              }
-            }
-            remapMapKey(sheetDataMap.current as Map<string, unknown>);
-            remapMapKey(sheetComputedMap.current as Map<string, unknown>);
-            remapMapKey(cellLinkMap.current);
-            remapMapKey(cellStyleMap.current);
-            remapMapKey(cellExclusionMap.current);
-            // Rename in the "loaded" Set caches.
-            function remapSetKey(set: Set<string>) {
-              if (set.has(oldSub)) { set.add(newSub); set.delete(oldSub); }
-              const subPrefix = `${oldSub}/`;
-              for (const key of Array.from(set)) {
-                if (key.startsWith(subPrefix)) { set.add(newSub + key.slice(oldSub.length)); set.delete(key); }
-              }
-            }
-            remapSetKey(loadedLinkPathsRef.current);
-            remapSetKey(loadedStylePathsRef.current);
-            remapSetKey(loadedExclusionPathsRef.current);
-          }
-        }
-
-        // Persist the path renames to SQLite (bottom-up; fire-and-forget).
-        const revId = revIdRef.current;
-        if (revId != null) {
-          for (let r = lastOccupied; r >= insertAt; r--) {
-            for (const prefix of subPrefixes) {
-              const oldSub = `${path}/${prefix}${r}`;
-              const newSub = `${path}/${prefix}${r + 1}`;
-              invoke("rename_workbook_sheet_subtree", {
-                revisionId: revId, oldPath: oldSub, newPath: newSub,
-              }).catch(() => {/* non-fatal */});
-            }
-          }
-        }
-      }
     }
 
     // Regenerate row-relative formula cells at their new positions.
@@ -2929,7 +3038,6 @@ export function WorkbookView() {
       if (isLineItemRow(data[r])) { lastOccupied = r; break; }
     }
 
-    const lv = levelRef.current;
     const subPrefixes = isCostSheetPath(path) ? ["S", "R", "Q"] : []; // M5: cost sheets carry S/R/Q children
     const revId = revIdRef.current;
 
@@ -2953,13 +3061,69 @@ export function WorkbookView() {
       exclSet?.delete(styleKey(deleteAt, c));
     }
 
+    // Move every row-above's sub-sheets — live engine, in-memory caches, and the DB — BEFORE
+    // the row data itself moves. See insertBlankRowAt's matching comment: the retargeted
+    // drilled-reference formula (from beforeChange's toStored round-trip) must resolve against
+    // an already-moved live sheet the instant the batch write below lands.
+    if (lastOccupied >= deleteAt && subPrefixes.length > 0) {
+      // Top-down (ascending r) so a target name is never still occupied by an unprocessed row —
+      // see shiftRowKeyedEntries' comment on why up-shifts need ascending order.
+      for (let r = deleteAt + 1; r <= lastOccupied; r++) {
+        for (const prefix of subPrefixes) {
+          const oldSub = `${path}/${prefix}${r}`;
+          const newSub = `${path}/${prefix}${r - 1}`;
+          moveLiveEngineSubtree(hot, oldSub, newSub);
+          function remapMapKey<V>(map: Map<string, V>) {
+            if (map.has(oldSub)) { map.set(newSub, map.get(oldSub)!); map.delete(oldSub); }
+            const subPrefix = `${oldSub}/`;
+            for (const key of Array.from(map.keys())) {
+              if (key.startsWith(subPrefix)) { map.set(newSub + key.slice(oldSub.length), map.get(key)!); map.delete(key); }
+            }
+          }
+          remapMapKey(sheetDataMap.current as Map<string, unknown>);
+          remapMapKey(sheetComputedMap.current as Map<string, unknown>);
+          remapMapKey(cellLinkMap.current);
+          remapMapKey(cellStyleMap.current);
+          remapMapKey(cellExclusionMap.current);
+          function remapSetKey(set: Set<string>) {
+            if (set.has(oldSub)) { set.add(newSub); set.delete(oldSub); }
+            const subPrefix = `${oldSub}/`;
+            for (const key of Array.from(set)) {
+              if (key.startsWith(subPrefix)) { set.add(newSub + key.slice(oldSub.length)); set.delete(key); }
+            }
+          }
+          remapSetKey(loadedLinkPathsRef.current);
+          remapSetKey(loadedStylePathsRef.current);
+          remapSetKey(loadedExclusionPathsRef.current);
+        }
+      }
+
+      if (revId != null) {
+        for (let r = deleteAt + 1; r <= lastOccupied; r++) {
+          for (const prefix of subPrefixes) {
+            const oldSub = `${path}/${prefix}${r}`;
+            const newSub = `${path}/${prefix}${r - 1}`;
+            invoke("rename_workbook_sheet_subtree", {
+              revisionId: revId, oldPath: oldSub, newPath: newSub,
+            }).catch(() => {/* non-fatal */});
+          }
+        }
+      }
+    }
+
     isAutoUpdatingRef.current = true;
     try {
       const batch: Array<[number, number, string]> = [];
+      // See insertBlankRowAt's matching comment: a plain (non-XSUM) formula has its bare
+      // same-row cell references renumbered to follow the row; an XSUM formula is left
+      // untouched and retargeted separately via beforeChange.
       if (lastOccupied >= deleteAt) {
         for (let r = deleteAt + 1; r <= lastOccupied; r++) {
           const dest = r - 1;
-          for (let c = 0; c < cols; c++) batch.push([dest, c, data[r][c] ?? ""]);
+          for (let c = 0; c < cols; c++) {
+            const v = data[r][c] ?? "";
+            batch.push([dest, c, renumberRowFormula(v, r, dest)]);
+          }
         }
         for (let c = 0; c < cols; c++) batch.push([lastOccupied, c, ""]);
       } else {
@@ -2989,51 +3153,6 @@ export function WorkbookView() {
       shiftRowKeyedEntries(cellLinkMap.current.get(path), deleteAt + 1, lastOccupied + 1, -1, cols);
       shiftRowKeyedEntries(cellStyleMap.current.get(path), deleteAt + 1, lastOccupied + 1, -1, cols);
       shiftRowKeyedSet(cellExclusionMap.current.get(path), deleteAt + 1, lastOccupied + 1, -1, cols);
-
-      // Remap in-memory sub-sheet caches (top-down to avoid collisions — see
-      // shiftRowKeyedEntries' comment on why up-shifts need ascending order).
-      if (subPrefixes.length > 0) {
-        for (let r = deleteAt + 1; r <= lastOccupied; r++) {
-          for (const prefix of subPrefixes) {
-            const oldSub = `${path}/${prefix}${r}`;
-            const newSub = `${path}/${prefix}${r - 1}`;
-            function remapMapKey<V>(map: Map<string, V>) {
-              if (map.has(oldSub)) { map.set(newSub, map.get(oldSub)!); map.delete(oldSub); }
-              const subPrefix = `${oldSub}/`;
-              for (const key of Array.from(map.keys())) {
-                if (key.startsWith(subPrefix)) { map.set(newSub + key.slice(oldSub.length), map.get(key)!); map.delete(key); }
-              }
-            }
-            remapMapKey(sheetDataMap.current as Map<string, unknown>);
-            remapMapKey(sheetComputedMap.current as Map<string, unknown>);
-            remapMapKey(cellLinkMap.current);
-            remapMapKey(cellStyleMap.current);
-            remapMapKey(cellExclusionMap.current);
-            function remapSetKey(set: Set<string>) {
-              if (set.has(oldSub)) { set.add(newSub); set.delete(oldSub); }
-              const subPrefix = `${oldSub}/`;
-              for (const key of Array.from(set)) {
-                if (key.startsWith(subPrefix)) { set.add(newSub + key.slice(oldSub.length)); set.delete(key); }
-              }
-            }
-            remapSetKey(loadedLinkPathsRef.current);
-            remapSetKey(loadedStylePathsRef.current);
-            remapSetKey(loadedExclusionPathsRef.current);
-          }
-        }
-
-        if (revId != null) {
-          for (let r = deleteAt + 1; r <= lastOccupied; r++) {
-            for (const prefix of subPrefixes) {
-              const oldSub = `${path}/${prefix}${r}`;
-              const newSub = `${path}/${prefix}${r - 1}`;
-              invoke("rename_workbook_sheet_subtree", {
-                revisionId: revId, oldPath: oldSub, newPath: newSub,
-              }).catch(() => {/* non-fatal */});
-            }
-          }
-        }
-      }
     }
 
     deriveLevelFormulas(hot, levelRef.current, isAutoUpdatingRef, sheetKindForPath(path), path, cellExclusionMap.current.get(path));
@@ -3480,14 +3599,15 @@ export function WorkbookView() {
 
   // ── drill-down navigation ──────────────────────────────────────────────
 
-  /** Writes the declarative rollup formula(s) for a drilled cell into the parent grid: the drilled
-   *  A–H cell becomes `=XSUM…(child!<col>…)`, and a F:Subtotal drill (which makes the row a SUMMARY
-   *  row over a /S cost child) also STAMPS each user column's template `rollupFormula` into that
-   *  row. This is the CostX pattern — the template's rollup is written once, at the drill, and is
-   *  thereafter an ordinary editable cell; the app never re-derives or overrides it (see
-   *  deriveLevelFormulas pass 3). Explicit ranges (not volatile XSUM*) so a multi-level chain
-   *  converges in one recalc. Skips excluded cells and dimension-linked C cells. Guarded by
-   *  isAutoUpdatingRef so the afterChange derivation doesn't fight these writes. */
+  /** Writes the drilled cell's own declarative rollup formula into the parent grid: A–H's
+   *  F/E/C cell becomes `=XSUM…(child!<col>…)`, referencing the sub-sheet the drill just
+   *  created/opened. This is the drill action's own, unavoidable side effect — there is no
+   *  way to reference a child sheet before it exists — and nothing else. It does NOT touch
+   *  any user column (I onward): those are never written by the app, only by a human typing
+   *  into them or a row copy/paste carrying an existing formula along (see afterPaste).
+   *  Explicit ranges (not volatile XSUM*) so a multi-level chain converges in one recalc.
+   *  Skips excluded cells and dimension-linked C cells. Guarded by isAutoUpdatingRef so the
+   *  afterChange derivation doesn't fight this write. */
   function writeRollupFormulasIntoGrid(hot: Handsontable, row: number, col: number, childPath: string, parentPath: string) {
     // Ensure the child sheet exists so the reference resolves immediately (no #REF flash).
     ensureEngineSheet(hot, childPath);
@@ -3500,15 +3620,6 @@ export function WorkbookView() {
     const put = (c: number, formula: string) => { if (!isCellExcluded(parentPath, row, c)) writes.push([row, c, formula]); };
     if (col === COL_SUBTOTAL) {
       put(COL_SUBTOTAL, xsum("XSUMTOT", COL_TOTAL));
-      // Summary row: stamp each user column's TEMPLATE rollup formula (e.g. =XSUMUSER(2)),
-      // expanded to reference this new /S cost child. The template owns the formula — the app
-      // injects nothing of its own — and it becomes an editable cell that pass 3 leaves alone.
-      const userCols = activeLayout.userColumns;
-      for (let u = 0; u < userCols.length; u++) {
-        const roll = userCols[u].rollupFormula;
-        if (!roll) continue;
-        put(FIRST_USER_COL + u, xsumToStored(roll, parentPath, row));
-      }
     } else if (col === COL_RATE) {
       put(COL_RATE, xsum("XSUMRATE", COL_TOTAL));
     } else if (col === COL_QTY) {
@@ -3584,45 +3695,12 @@ export function WorkbookView() {
       syncSheetLinks(newPath);
     };
 
-    // A genuinely new build-up sheet — seed it from the matching master sheet by KIND (M5): a
-    // cost child (/S) seeds from the cost/takeoff master, a rate build-up (/R) from the rate
-    // master, a quantity build-up (/Q) from the qty master. (Per-depth masters are M6.)
-    const masterPath = drillSuffix === "Q"
-      ? TEMPLATE_MASTER_LQ_PATH
-      : drillSuffix === "R"
-        ? TEMPLATE_MASTER_L3_PATH
-        : TEMPLATE_MASTER_L2_PATH;
-    // Carries the master sheet's per-cell formatting onto the freshly-seeded sheet
-    // (mirrors the data clone above) — otherwise template formatting is lost the
-    // moment a new Level 2/3 sheet is created from it.
-    const seedStylesFrom = (masterStyles: Map<string, CellStyle> | undefined) => {
-      const cloned = cloneStyleMap(masterStyles);
-      if (cloned) cellStyleMap.current.set(newPath, cloned);
-    };
-    const seedNewSheet = () => {
-      if (sheetDataMap.current.has(masterPath)) {
-        seedStylesFrom(cellStyleMap.current.get(masterPath));
-        display(cloneSheetData(sheetDataMap.current.get(masterPath)!));
-        return;
-      }
-      if (revId == null) { display(createEmptyData()); return; }
-      Promise.all([
-        invoke<string>("load_workbook_sheet", { revisionId: revId, sheetPath: masterPath }),
-        ensureSheetStylesLoaded(revId, masterPath),
-      ])
-        .then(([json]) => {
-          seedStylesFrom(cellStyleMap.current.get(masterPath));
-          if (!json || json === "[]") { display(createEmptyData()); return; }
-          let seed: (string | null)[][];
-          try { seed = padData(JSON.parse(json) as (string | null)[][]); }
-          catch { display(createEmptyData()); return; }
-          sheetDataMap.current.set(masterPath, seed);
-          display(cloneSheetData(seed));
-        })
-        .catch(() => display(createEmptyData()));
-    };
+    // A genuinely new build-up sheet — the estimator sets it up from scratch (or copies an
+    // already-set-up row's own sub-sheet in, via afterPaste's clone-on-paste); there's no
+    // master template to seed it from any more.
+    const seedNewSheet = () => display(createEmptyData());
 
-    // Load new sheet: prefer in-memory cache; fall back to SQLite; else seed from master
+    // Load new sheet: prefer in-memory cache; fall back to SQLite; else genuinely blank
     if (sheetDataMap.current.has(newPath)) {
       requestAnimationFrame(() => display(sheetDataMap.current.get(newPath)!));
     } else if (revId != null) {
@@ -3907,17 +3985,30 @@ export function WorkbookView() {
   }
 
   /**
-   * Clones a row's child Rate Build-up sheet onto another row's, completely
-   * independent of the original — invoked from afterPaste when a copied E:Rate
-   * value is pasted into a different row's E:Rate cell. Rate Build-up sheets are
-   * leaves (level 3 has no drill columns — see isDrillColumn), so this is a
-   * single-level deep clone of data + styles + links + exclusions; no recursive
-   * descendant walk is needed.
+   * Clones a row's drilled child sheet (a Cost/Rate/Qty sub-sheet — "/S", "/R" or "/Q") onto
+   * another row's, completely independent of the original — invoked from afterPaste when a
+   * copied drill-column cell (F:Subtotal, E:Rate or C:Quantity) is pasted into a different
+   * row's same column. This is the reference-following half of a row copy/paste: the pasted
+   * cell already carries whatever formula the estimator typed (verbatim, retargeted to its
+   * new row by beforeChange's toStored round-trip — see afterPaste) — this function's job is
+   * only to make sure the DATA that formula reads actually exists, independently, at the
+   * destination, the same way pasting a plain range of cells duplicates their values.
    *
-   * A no-op if the source row was never drilled into — nothing exists to clone,
-   * so the plain pasted number is left to stand on its own.
+   * A no-op if the source row was never drilled into — nothing exists to clone, so the
+   * pasted formula (if any) is left to read an empty/new child on its own.
+   *
+   * RECURSIVE: a Cost sheet ("/S") can itself drill further (M5: unlimited depth) — a
+   * trade-summary row's whole Cost breakdown, full of hand-set-up line items each with their
+   * own Rate Build-up, is exactly this shape, and copying that trade row is a normal
+   * workflow, not an edge case. So once `cloned`'s own data is in hand, every one of ITS
+   * occupied rows' own S/R/Q children is cloned too (recursing into this same function), and
+   * any XSUM* reference inside `cloned`'s cells that pointed at one of those children is
+   * retargeted to the newly-cloned copy — `cloneSheetData` copies cell text verbatim, and
+   * unlike a normal grid paste, nothing here goes through beforeChange's toStored round-trip
+   * to fix that up on its own. Rate and Qty sheets are leaves (see isDrillColumn), so the
+   * recursion naturally bottoms out there.
    */
-  async function maybeCloneRateBuildupSheet(srcPath: string, dstPath: string): Promise<void> {
+  async function maybeCloneChildSheet(srcPath: string, dstPath: string): Promise<void> {
     if (srcPath === dstPath) return;
     const revId = revIdRef.current;
 
@@ -3961,42 +4052,69 @@ export function WorkbookView() {
     loadedLinkPathsRef.current.add(dstPath);
     loadedExclusionPathsRef.current.add(dstPath);
 
+    // If this sheet is itself a cost sheet, it can carry its OWN drilled S/R/Q children
+    // (M5: unlimited depth) — a trade-summary row's Cost sheet full of hand-set-up line
+    // items, each with its own Rate Build-up, is exactly this shape. Clone every one of
+    // them too, recursively, and retarget any XSUM* reference inside `cloned`'s own cells
+    // that pointed at one of THOSE children so it now points at the newly-cloned copy —
+    // `cloneSheetData` copies cell text verbatim, and (unlike a normal grid paste) nothing
+    // here goes through beforeChange's toStored round-trip to fix that up on its own.
+    if (isCostSheetPath(srcPath)) {
+      const oldPrefix = pathToSheetName(srcPath);
+      const newPrefix = pathToSheetName(dstPath);
+      const retarget = (cellText: string | null): string | null => {
+        if (typeof cellText !== "string" || cellText.charAt(0) !== "=" || !/XSUM/i.test(cellText)) return cellText;
+        return cellText.replace(new RegExp(`${oldPrefix}(?=[_!])`, "g"), newPrefix);
+      };
+      for (const row of cloned) {
+        for (let c = 0; c < row.length; c++) row[c] = retarget(row[c]);
+      }
+      // Every row, not just ones that "look like" a real line item (isLineItemRow only checks
+      // Code/Description) — a template row can be a pure formula/rate holder with neither, so
+      // gating on that silently skipped its own drilled children. Concurrent, not sequential: a
+      // Cost sheet can easily have dozens of rows, each independently checked (and, for the vast
+      // majority — rows with nothing drilled — immediately no-op'd, see the "no-op if never
+      // drilled" note above) across three suffixes. Awaiting them one at a time here made the
+      // whole clone noticeably slow and, worse, meant checking the result right after pasting
+      // could catch it still mid-flight. Each call touches only its own distinct src/dst paths,
+      // so nothing here races. A single child failing is logged, not left to silently abort the
+      // PARENT's own persist/engine-push below via an unhandled rejection.
+      const childClones: Array<Promise<void>> = [];
+      for (let r = 0; r < Math.max(srcData.length, NUM_ROWS); r++) {
+        for (const suffix of ["S", "R", "Q"] as const) {
+          childClones.push(
+            maybeCloneChildSheet(`${srcPath}/${suffix}${r}`, `${dstPath}/${suffix}${r}`)
+              .catch(err => { console.error(`clone-on-paste: failed to clone ${srcPath}/${suffix}${r}`, err); }),
+          );
+        }
+      }
+      await Promise.all(childClones);
+    }
+
     if (revId != null) persistSheet(revId, dstPath, cloned);
 
-    // Live-update the parent row's I/K/M/O (Lab/Mat/Sub/Sum) and J/L/N/P (…-Total)
-    // columns right now — the same pull-through rollup drillUp performs on leaving
-    // a Rate Build-up sheet — so the paste shows up immediately instead of only
-    // after the user manually drills into the new row and back out again.
-    const parentPath  = dstPath.slice(0, dstPath.lastIndexOf("/"));
-    const rowInParent  = pathLastRow(dstPath);
+    // Push the cloned data into the LIVE engine under the destination's own sheet name, so
+    // whatever formula the pasted parent cell holds (already retargeted to read THIS sheet
+    // by beforeChange's toStored round-trip — see afterPaste) resolves against real data
+    // immediately, instead of the app computing and writing a value into the parent row
+    // itself. The parent cell's own formula is the only thing that determines what the
+    // parent row shows; this only makes sure it has something real to read.
     const hot = hotRef.current?.hotInstance;
-    if (hot && rowInParent != null && curSheetPath() === parentPath) {
-      const computedRows = evaluateClonedRows(cloned);
-      const pullThroughCols: Array<[number, number]> = [
-        [COL_LAB, COL_LAB_TOTAL],
-        [COL_MAT, COL_MAT_TOTAL],
-        [COL_SUB, COL_SUB_TOTAL],
-        [COL_SUM, COL_SUM_TOTAL],
-      ];
-      const pass: Array<[number, number, string | null]> = [];
-      for (const [src, total] of pullThroughCols) {
-        const s = sumComputedCol(computedRows, src);
-        if (!isCellExcluded(parentPath, rowInParent, src)) pass.push([rowInParent, src, s !== null ? String(s) : null]);
-        if (!isCellExcluded(parentPath, rowInParent, total)) {
-          pass.push([rowInParent, total, s !== null ? `=${colLetter(src)}${rowInParent + 1}*C${rowInParent + 1}` : null]);
-        }
-      }
-      if (pass.length) {
-        isAutoUpdatingRef.current = true;
+    if (hot) {
+      const plugin = getFormulasPlugin(hot);
+      const engine = plugin?.engine;
+      if (plugin && engine) {
+        const name = pathToSheetName(dstPath);
+        const rows = dataForHot(cloned);
         try {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          hot.setDataAtCell(pass as any);
-        } finally {
-          isAutoUpdatingRef.current = false;
-        }
-        propagateLiveRollupRef.current();
-        refreshProjectTotal();
+          if (engine.doesSheetExist(name)) engine.setSheetContent(engine.getSheetId(name), rows);
+          else plugin.addSheet(name, rows);
+        } catch { /* non-fatal — the cache/DB clone above still keeps it consistent on reload */ }
       }
+      recomputeEngine(hot);
+      propagateLiveRollupRef.current();
+      refreshProjectTotal();
+      hot.render();
     }
   }
 
@@ -4272,8 +4390,9 @@ export function WorkbookView() {
       }
     },
 
-    // Remembers the copied selection so afterPaste can tell whether an E:Rate
-    // cell was part of it — see lastRateCopyRef / maybeCloneRateBuildupSheet.
+    // Remembers the copied selection so afterPaste can tell whether a drill column
+    // (F:Subtotal, E:Rate or C:Quantity) was part of it — see lastRateCopyRef /
+    // maybeCloneChildSheet.
     afterCopy(
       _data: unknown[][],
       coords: Array<{ startRow: number; startCol: number; endRow: number; endCol: number }>,
@@ -4290,34 +4409,82 @@ export function WorkbookView() {
       };
     },
 
-    // Pasting a copied E:Rate value into another row's E:Rate cell clones the
-    // source row's Rate Build-up sheet onto the destination row, so the rate
-    // (and its full Lab/Mat/Sub/Sum build-up) comes along independently of the
-    // original — rather than leaving the destination with just a bare number.
+    // Pasting a copied cell does two things, mirroring Excel/CostX:
+    //  1. Any plain (non-XSUM) formula has its row references shifted by the same amount the
+    //     paste moved the cell down (or up) by — `=M1*C1` copied from row 1 to row 3 becomes
+    //     `=M3*C3` — via shiftFormulaRowRefs. Handsontable pastes the source text verbatim, so
+    //     without this the pasted formula would silently keep reading the row it was copied
+    //     FROM. An XSUM formula is retargeted separately, by cell position, via beforeChange's
+    //     toStored round-trip. F:Subtotal/H:Total are skipped here entirely (unless excluded
+    //     from auto-calc) — the paste's own afterChange already ran deriveLevelFormulas' pass
+    //     1/2 by the time afterPaste fires, which unconditionally regenerates those two purely
+    //     positionally (`=E<row>*C<row>`, `=F<row>*G<row>`); shifting them AGAIN here on top of
+    //     that already-correct value double-counted the offset (row 5 pasted to row 7 read
+    //     row 9 — the same +2 shift applied twice).
+    //  2. Pasting a copied drill-column cell (F:Subtotal, E:Rate or C:Quantity) additionally
+    //     clones the source row's drilled child sheet onto the destination row, so its full
+    //     breakdown comes along independently of the original. Any drill column, any level —
+    //     the source sheet doesn't need to be a cost sheet itself for this to apply.
     afterPaste(
       _data: unknown[][],
       coords: Array<{ startRow: number; startCol: number; endRow: number; endCol: number }>,
     ) {
       const copy = lastRateCopyRef.current;
-      if (!copy || copy.level !== 2 || levelRef.current !== 2) return;
-      const srcColOffset = COL_RATE - copy.startCol;
-      if (srcColOffset < 0 || srcColOffset >= copy.colCount) return;
-
+      if (!copy) return;
       const dstPath = curSheetPath();
+      const hot = hotRef.current?.hotInstance;
+      const drillCols: Array<[number, "S" | "R" | "Q"]> = [
+        [COL_SUBTOTAL, "S"], [COL_RATE, "R"], [COL_QTY, "Q"],
+      ];
+      const kind = sheetKindForPath(dstPath);
+      const isAutoRegenerated = (row: number, col: number) => {
+        if (isCellExcluded(dstPath, row, col)) return false;
+        return kind === "qty" ? col === COL_TOTAL : (col === COL_SUBTOTAL || col === COL_TOTAL);
+      };
+      const refFix: Array<[number, number, string]> = [];
       for (const range of coords ?? []) {
         for (let r = range.startRow; r <= range.endRow; r++) {
           for (let c = range.startCol; c <= range.endCol; c++) {
-            if (c !== COL_RATE) continue;
             const colOffsetInRange = ((c - range.startCol) % copy.colCount + copy.colCount) % copy.colCount;
-            if (colOffsetInRange !== srcColOffset) continue;
             const rowOffsetInRange = ((r - range.startRow) % copy.rowCount + copy.rowCount) % copy.rowCount;
             const srcRow = copy.startRow + rowOffsetInRange;
-            const srcChildPath = `${copy.path}/R${srcRow}`;
-            const dstChildPath = `${dstPath}/R${r}`;
+            const srcCol = copy.startCol + colOffsetInRange;
+
+            if (hot && !isAutoRegenerated(r, c) && (srcRow !== r || srcCol !== c || copy.path !== dstPath)) {
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              const pasted = (hot as any).getSourceDataAtCell(r, c);
+              if (typeof pasted === "string" && pasted.charAt(0) === "=") {
+                const shifted = shiftFormulaRowRefs(pasted, r - srcRow);
+                if (shifted !== pasted) refFix.push([r, c, shifted]);
+              }
+            }
+
+            const drill = drillCols.find(([col]) => col === c);
+            if (!drill) continue;
+            const [, suffix] = drill;
+            const srcColOffset = c - copy.startCol;
+            if (srcColOffset < 0 || srcColOffset >= copy.colCount) continue;
+            if (colOffsetInRange !== srcColOffset) continue;
+            const srcChildPath = `${copy.path}/${suffix}${srcRow}`;
+            const dstChildPath = `${dstPath}/${suffix}${r}`;
             if (srcChildPath === dstChildPath) continue;
-            void maybeCloneRateBuildupSheet(srcChildPath, dstChildPath);
+            void maybeCloneChildSheet(srcChildPath, dstChildPath)
+              .catch(err => { console.error(`clone-on-paste: failed to clone ${srcChildPath}`, err); });
           }
         }
+      }
+      if (refFix.length && hot) {
+        isAutoUpdatingRef.current = true;
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          hot.setDataAtCell(refFix as any);
+        } finally {
+          isAutoUpdatingRef.current = false;
+        }
+        recomputeEngine(hot);
+        propagateLiveRollupRef.current();
+        refreshProjectTotal();
+        hot.render();
       }
     },
 
@@ -4760,61 +4927,10 @@ export function WorkbookView() {
             Editing template &ldquo;{templateEditMode.name}&rdquo;
           </span>
 
-          <div style={{ display: "flex", marginLeft: 12 }}>
-            <button
-              type="button"
-              onClick={() => { setMasterView("L1"); jumpToSheet("L1", 1); }}
-              style={{
-                height: 24, padding: "0 10px", fontSize: 12, fontWeight: masterView === "L1" ? 600 : 400,
-                background: masterView === "L1" ? "#fff" : "rgba(255,255,255,0.15)",
-                color: masterView === "L1" ? "#d32f2f" : "#fff",
-                border: "1px solid rgba(255,255,255,0.6)", borderRight: "none", cursor: "pointer",
-              }}
-            >
-              Master Takeoff (L1)
-            </button>
-            <button
-              type="button"
-              onClick={() => { setMasterView("L2"); jumpToSheet(TEMPLATE_MASTER_L2_PATH, 2); }}
-              style={{
-                height: 24, padding: "0 10px", fontSize: 12, fontWeight: masterView === "L2" ? 600 : 400,
-                background: masterView === "L2" ? "#fff" : "rgba(255,255,255,0.15)",
-                color: masterView === "L2" ? "#d32f2f" : "#fff",
-                border: "1px solid rgba(255,255,255,0.6)", borderRight: "none", cursor: "pointer",
-              }}
-            >
-              Master Takeoff (L2)
-            </button>
-            <button
-              type="button"
-              onClick={() => { setMasterView("L3"); jumpToSheet(TEMPLATE_MASTER_L3_PATH, 3); }}
-              style={{
-                height: 24, padding: "0 10px", fontSize: 12, fontWeight: masterView === "L3" ? 600 : 400,
-                background: masterView === "L3" ? "#fff" : "rgba(255,255,255,0.15)",
-                color: masterView === "L3" ? "#d32f2f" : "#fff",
-                border: "1px solid rgba(255,255,255,0.6)", borderRight: "none", cursor: "pointer",
-              }}
-            >
-              Master Rate Build-up (L3)
-            </button>
-            <button
-              type="button"
-              onClick={() => { setMasterView("LQ"); jumpToSheet(TEMPLATE_MASTER_LQ_PATH, 3); }}
-              style={{
-                height: 24, padding: "0 10px", fontSize: 12, fontWeight: masterView === "LQ" ? 600 : 400,
-                background: masterView === "LQ" ? "#fff" : "rgba(255,255,255,0.15)",
-                color: masterView === "LQ" ? "#d32f2f" : "#fff",
-                border: "1px solid rgba(255,255,255,0.6)", cursor: "pointer",
-              }}
-            >
-              Master Quantity Build-up
-            </button>
-          </div>
-
           <span style={{ flex: 1 }} />
           <button
             type="button"
-            onClick={() => { setMasterView("L1"); void handleClearWorkbook(); }}
+            onClick={() => void handleClearWorkbook()}
             disabled={cleanupBusy}
             style={{
               height: 24, padding: "0 10px", fontSize: 12, fontWeight: 400,
@@ -4827,7 +4943,7 @@ export function WorkbookView() {
           <button
             type="button"
             onClick={() => {
-              // Flush the currently displayed sheet immediately so the master
+              // Flush the currently displayed sheet immediately so the template's
               // content isn't lost if the debounced autosave hasn't fired yet.
               const hot = hotRef.current?.hotInstance;
               const revId = revIdRef.current;

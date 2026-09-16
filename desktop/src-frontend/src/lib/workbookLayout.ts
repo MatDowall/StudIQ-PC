@@ -24,23 +24,15 @@ export interface ColumnDef {
   role: ColumnRole;
 }
 
-/** One user-defined column (index ≥ 8 / column I onward). Only these are stored per workbook. */
+/** One user-defined column (index ≥ 8 / column I onward). Only these are stored per workbook.
+ *  A user column carries no formula of its own — matching CostX, a formula only ever exists in
+ *  a cell because a human typed it there (or it arrived via a row copy/paste that carries an
+ *  existing formula's data along — see afterPaste/maybeCloneChildSheet in WorkbookView.tsx). A
+ *  Lab/Mat/Sub/Sum convention (or any other) is something the estimator sets up once, in one
+ *  example row, and copies as needed — there is no separate master-template mechanism. */
 export interface UserColumn {
   label: string;       // "" for a blank freeform column (renders as just the letter)
   width: number;
-  /** DETAIL formula — what a priced/leaf row computes. Per-row, with an `{r}` placeholder for the
-   *  1-based row (e.g. `=I{r}*C{r}`, or the positional `=XSUMRATEUSER(1)` pulling from the row's
-   *  rate build-up). `deriveLevelFormulas` fills an EMPTY cell on an active row with this; it never
-   *  overwrites a cell that already holds a formula or a value, so a user edit (or a stamped
-   *  rollup) always wins. Empty/undefined = a plain input column. */
-  rowFormula?: string;
-  /** ROLLUP (subtotal) formula — what to STAMP into this column when the row gains a `/S` cost
-   *  child (a drill on F:Subtotal makes it a summary row), e.g. the positional `=XSUMUSER(2)`
-   *  summing the cost child's own column 2. Stamped once at drill time (exactly as `F=XSUMTOT`
-   *  is), then it's an ordinary editable cell — the app never re-derives or overrides it. This is
-   *  the CostX model: the template, not the app, decides how a summary row rolls up its child.
-   *  Empty/undefined = nothing is stamped for this column on drill. */
-  rollupFormula?: string;
 }
 
 export interface WorkbookLayout {
@@ -77,22 +69,19 @@ const QTY_FIXED: ReadonlyArray<Omit<ColumnDef, "letter">> = [
 ];
 
 // The shipped user columns: the Lab/Mat/Sub/Sum pull-through block (I–P) plus ten blank
-// freeform columns (Q–Z). This is what a NULL layout_json resolves to. Each column owns TWO
-// template formulae (nothing about Lab/Mat/Sub/Sum is hardcoded in the app):
-//   • rowFormula (DETAIL): a priced row's value — per-unit columns pull from the row's rate
-//     build-up (=XSUMRATEUSER(n)); each "- Total" is per-unit × Quantity (=I{r}*C{r}).
-//   • rollupFormula (SUMMARY): stamped when the row drills a /S cost child — every computed column
-//     sums the cost child's OWN same column (=XSUMUSER(n)). Both per-unit and total roll up this
-//     way, so a summary row reports the child's totals rather than re-multiplying by its own Qty.
+// freeform columns (Q–Z). This is what a NULL layout_json resolves to. Label/width only — no
+// formula lives here; an estimator sets up the actual Lab/Mat/Sub/Sum formulas
+// (=XSUMRATEUSER(n) per-unit, =I{r}*C{r} etc. for the totals, =XSUMUSER(n) once a row's
+// F:Subtotal is drilled) once, in an example row, and copies it as needed.
 const DEFAULT_USER_COLUMNS: ReadonlyArray<UserColumn> = [
-  { label: "Lab",         width: 75, rowFormula: "=XSUMRATEUSER(1)", rollupFormula: "=XSUMUSER(1)" },
-  { label: "Lab - Total", width: 95, rowFormula: "=I{r}*C{r}",       rollupFormula: "=XSUMUSER(2)" },
-  { label: "Mat",         width: 75, rowFormula: "=XSUMRATEUSER(3)", rollupFormula: "=XSUMUSER(3)" },
-  { label: "Mat - Total", width: 95, rowFormula: "=K{r}*C{r}",       rollupFormula: "=XSUMUSER(4)" },
-  { label: "Sub",         width: 75, rowFormula: "=XSUMRATEUSER(5)", rollupFormula: "=XSUMUSER(5)" },
-  { label: "Sub - Total", width: 95, rowFormula: "=M{r}*C{r}",       rollupFormula: "=XSUMUSER(6)" },
-  { label: "Sum",         width: 75, rowFormula: "=XSUMRATEUSER(7)", rollupFormula: "=XSUMUSER(7)" },
-  { label: "Sum - Total", width: 95, rowFormula: "=O{r}*C{r}",       rollupFormula: "=XSUMUSER(8)" },
+  { label: "Lab",         width: 75 },
+  { label: "Lab - Total", width: 95 },
+  { label: "Mat",         width: 75 },
+  { label: "Mat - Total", width: 95 },
+  { label: "Sub",         width: 75 },
+  { label: "Sub - Total", width: 95 },
+  { label: "Sum",         width: 75 },
+  { label: "Sum - Total", width: 95 },
   ...Array.from({ length: NUM_BLANK_TRAILING }, () => ({ label: "", width: EXTRA_COLUMN_WIDTH })),
 ];
 
@@ -140,11 +129,11 @@ export function parseLayout(json: string | null | undefined): WorkbookLayout {
   try {
     const raw = JSON.parse(json) as Partial<WorkbookLayout>;
     if (!Array.isArray(raw.userColumns)) return { userColumns: DEFAULT_WORKBOOK_LAYOUT.userColumns.map((c) => ({ ...c })) };
+    // A persisted blob from before this field existed may still carry rowFormula/
+    // rollupFormula keys — simply not read here, so they quietly drop out on next save.
     const userColumns: UserColumn[] = raw.userColumns.map((c) => ({
       label: typeof c?.label === "string" ? c.label : "",
       width: typeof c?.width === "number" && isFinite(c.width) && c.width > 0 ? c.width : EXTRA_COLUMN_WIDTH,
-      ...(typeof c?.rowFormula === "string" && c.rowFormula.trim() !== "" ? { rowFormula: c.rowFormula } : {}),
-      ...(typeof c?.rollupFormula === "string" && c.rollupFormula.trim() !== "" ? { rollupFormula: c.rollupFormula } : {}),
     }));
     return { userColumns };
   } catch {
@@ -160,8 +149,5 @@ export function serializeLayout(layout: WorkbookLayout): string {
 export function isDefaultLayout(layout: WorkbookLayout): boolean {
   const d = DEFAULT_WORKBOOK_LAYOUT.userColumns;
   if (layout.userColumns.length !== d.length) return false;
-  return layout.userColumns.every((c, i) =>
-    c.label === d[i].label && c.width === d[i].width
-    && (c.rowFormula ?? "") === (d[i].rowFormula ?? "")
-    && (c.rollupFormula ?? "") === (d[i].rollupFormula ?? ""));
+  return layout.userColumns.every((c, i) => c.label === d[i].label && c.width === d[i].width);
 }

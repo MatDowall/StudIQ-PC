@@ -2,9 +2,9 @@
 //
 // Today the workbook keeps exactly one HyperFormula sheet, always named "Sheet1",
 // cleared and reloaded on every drill. M1 loads every sheet of a revision into one
-// engine at once, so each sheet path ("L1", "L1/R3", "L1/R3/Q5", "TEMPLATE_MASTER_L2")
-// needs its own HyperFormula sheet — and HF sheet names cannot contain "/". This module
-// is the single, pure, testable translation between the two namespaces.
+// engine at once, so each sheet path ("L1", "L1/R3", "L1/R3/Q5") needs its own
+// HyperFormula sheet — and HF sheet names cannot contain "/". This module is the
+// single, pure, testable translation between the two namespaces.
 //
 // The transform is DETERMINISTIC and REVERSIBLE (not order-dependent): a given path always
 // maps to the same HF name, so a cross-sheet reference stays valid regardless of the order
@@ -14,10 +14,9 @@
 // This module intentionally does NOT import hyperformula — it is pure string logic, so its
 // tests run without touching the (GPL) engine.
 
-// Path segment grammar in use: "L1", "R3", "Q5", and the reserved template masters
-// ("TEMPLATE_MASTER_L2" / "_L3" / "_LQ"), joined by "/". Segments are [A-Za-z0-9_].
-// We escape existing underscores before using an underscore-based separator, so the
-// mapping round-trips even for the underscore-bearing TEMPLATE_MASTER_* paths:
+// Path segment grammar in use: "L1", "R3", "Q5", joined by "/". Segments are
+// [A-Za-z0-9_]. We escape existing underscores before using an underscore-based
+// separator, so the mapping round-trips even for an underscore-bearing segment:
 //   "_"  in a segment → "_u"   (escape first, so no bare "_" survives except ours)
 //   "/"  between segs  → "_s"
 // Reversal replaces "_s" → "/" then "_u" → "_". Unambiguous because, after escaping,
