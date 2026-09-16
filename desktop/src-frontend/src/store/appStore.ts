@@ -446,6 +446,12 @@ interface AppStore {
   // Footer status line: page-render progress, draw-in-progress hints, and errors from the canvas.
   viewerStatus: string;
   setViewerStatus: (status: string) => void;
+  // Footer status line for the Workbook tab (Excel-style: blank/"Ready" when idle). Set around any
+  // grid operation that does real synchronous work behind the scenes — row/column insert/delete,
+  // paste's clone-on-paste + reference-shift pass — so a multi-second UI freeze at least shows what
+  // it's doing rather than looking hung. See `withWorkbookActivity` in WorkbookView.tsx.
+  workbookActivity: string;
+  setWorkbookActivity: (status: string) => void;
   // When set, the viewer is placing a door/window opening: hovering a framing wall shows a ghost
   // that commits onto the wall on click. Overrides add/select while active.
   openingPlacement: OpeningTemplate | null;
@@ -973,6 +979,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
   viewerMode: "add",
   selectedMeasurementIds: [],
   viewerStatus: "",
+  workbookActivity: "",
   openingPlacement: null,
   arrayTrimMode: false,
   arrayTrimType: "line",
@@ -1070,6 +1077,10 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   setViewerStatus: (status) => {
     set({ viewerStatus: status });
+  },
+
+  setWorkbookActivity: (status) => {
+    set({ workbookActivity: status });
   },
 
   setOpeningPlacement: (template) => {

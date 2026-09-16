@@ -32,6 +32,8 @@ export function Footer() {
   const viewerStatus = useAppStore((state) => state.viewerStatus);
   const pageScale = useAppStore((state) => state.pageScale);
   const goToPage = useAppStore((state) => state.goToPage);
+  const activeTab = useAppStore((state) => state.activeTab);
+  const workbookActivity = useAppStore((state) => state.workbookActivity);
 
   const pageCount = currentDocument?.page_count ?? 0;
   const hasDoc = currentDocument !== null;
@@ -54,7 +56,24 @@ export function Footer() {
         fontFamily: "Segoe UI, sans-serif",
       }}
     >
-      <div />
+      <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+        {activeTab === "workbook" && (
+          <>
+            <span
+              className="material-symbols-outlined"
+              style={{
+                fontSize: 13,
+                lineHeight: 1,
+                color: workbookActivity ? theme.accent : theme.text.disabled,
+                animation: workbookActivity ? "studiq-spin 1s linear infinite" : undefined,
+              }}
+            >
+              {workbookActivity ? "progress_activity" : "check_circle"}
+            </span>
+            <span>{workbookActivity || "Ready"}</span>
+          </>
+        )}
+      </div>
       <div style={{ display: "flex", alignItems: "center", gap: 6, justifyContent: "center", minWidth: 0 }}>
         {hasDoc ? (
           <>

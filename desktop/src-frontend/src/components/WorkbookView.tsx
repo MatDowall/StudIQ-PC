@@ -825,18 +825,88 @@ function recomputeEngine(hot: Handsontable | null | undefined): void {
   try { engine?.rebuildAndRecalculate?.(); } catch { /* older API — a re-render still repaints */ }
 }
 
+/** Runs `fn` with the footer's Excel-style status line ("Ready" when idle) showing `label` —
+ *  for a grid operation that does real synchronous work behind a single click (row/column
+ *  insert/delete, paste's clone-on-paste + reference-shift pass) and can visibly freeze the UI
+ *  for a moment on a large sheet. Yields one animation frame before running `fn` so React
+ *  actually paints the label first — otherwise the label and the freeze it describes would
+ *  commit to the DOM in the same synchronous stretch and the browser would never get to show it
+ *  (the same trick `resetEngineSheets` uses for its load-progress bar). Clears the status in a
+ *  `finally` so a thrown error or early return never leaves the footer stuck mid-sentence. */
+async function withWorkbookActivity<T>(label: string, fn: () => T | Promise<T>): Promise<T> {
+  useAppStore.getState().setWorkbookActivity(label);
+  await new Promise<void>(resolve => setTimeout(resolve, 0));
+  try {
+    return await fn();
+  } finally {
+    useAppStore.getState().setWorkbookActivity("");
+  }
+}
+
+/** How many concurrent bulk sheet loads (see `resetEngineSheets`) currently have a given engine's
+ *  automatic per-sheet-add/-remove full recalculation suppressed. Depth-counted per engine, rather
+ *  than a plain boolean, because two `resetEngineSheets` runs against the SAME shared engine can
+ *  genuinely overlap in time — a newer revision switch is allowed to start (and begin suppressing)
+ *  while an older, now-superseded one is still mid-loop between its `setTimeout(0)` yields (see the
+ *  `isStale`/`cancelled` handling at this function's call site). Without depth-counting, the first
+ *  call to finish would re-enable the listener out from under the second call still mid-loop
+ *  (reintroducing the O(n²) rebuild storm for its remainder), or — if both finish — the listener
+ *  would end up attached twice, double-firing the settle-recalculation on every later single-sheet
+ *  add. */
+const bulkLoadSuppressDepth = new WeakMap<object, number>();
+
+function sheetChurnRecalc(engine: { rebuildAndRecalculate: () => void }): void {
+  engine.rebuildAndRecalculate();
+}
+
+/** Suspends the Formulas plugin's built-in "full rebuild + recalculate on every sheetAdded/
+ *  sheetRemoved" behaviour (registered by Handsontable itself when the engine is created — see
+ *  `setupEngine`/`registerEngine` in handsontable's formulas plugin). That default exists so a
+ *  one-off sheet add/remove (the normal case elsewhere in this file, e.g. `ensureEngineSheet`
+ *  drilling into a freshly-created row) settles cross-sheet references immediately. But it makes
+ *  loading N sheets in a loop cost N full-engine rebuilds — effectively O(n²) in sheet count, which
+ *  is the dominant cost of `resetEngineSheets` on a 100+-sheet workbook. Pairs with
+ *  `endBulkSheetLoad`; always call that in a `finally` so a suppressed engine is never left without
+ *  its listener (an aborted/superseded load must not leave the shared engine silently un-settling
+ *  future one-off sheet adds). Uses plain event-listener add/remove (`engine.off`/`engine.on`), NOT
+ *  `engine.batch()`/`suspendEvaluation()`/`resumeEvaluation()` — those were tried here previously
+ *  and desynced the Formulas plugin's own UndoRedo batch tracking ("Batch mode wasn't started");
+ *  toggling these two listeners doesn't touch that machinery at all. */
+function beginBulkSheetLoad(engine: { off: (e: string) => void; on: (e: string, cb: () => void) => void }): void {
+  const depth = bulkLoadSuppressDepth.get(engine) ?? 0;
+  if (depth === 0) {
+    engine.off("sheetAdded");
+    engine.off("sheetRemoved");
+  }
+  bulkLoadSuppressDepth.set(engine, depth + 1);
+}
+
+function endBulkSheetLoad(engine: { off: (e: string) => void; on: (e: string, cb: () => void) => void }): void {
+  const depth = Math.max(0, (bulkLoadSuppressDepth.get(engine) ?? 1) - 1);
+  bulkLoadSuppressDepth.set(engine, depth);
+  if (depth === 0) {
+    engine.on("sheetAdded", () => sheetChurnRecalc(engine as unknown as { rebuildAndRecalculate: () => void }));
+    engine.on("sheetRemoved", () => sheetChurnRecalc(engine as unknown as { rebuildAndRecalculate: () => void }));
+  }
+}
+
 /** Replace the plugin engine's sheets with exactly `sheets` (the whole revision), so cross-sheet
  *  rollup formulas and named-cell references resolve. Adds/replaces every wanted sheet, binds the
  *  grid to L1, then drops any sheet left over from a previous revision. Idempotent.
  *
  *  Yields back to the browser every `PROGRESS_CHUNK` sheets (a plain `setTimeout(0)`, not a
  *  microtask) so the loading overlay's progress bar can actually repaint mid-loop instead of
- *  freezing at 0% for the whole ~20s first-time load of a large revision — this is what makes a
- *  determinate progress bar meaningfully different from the spinner it replaces. `shouldAbort` is
- *  checked after every yield: a newer revision switch can now start while this one is mid-loop
- *  (impossible when the loop ran fully synchronously), so without this check a superseded switch
- *  would keep mutating the shared engine underneath the switch that replaced it — exactly the
- *  stale-switch corruption fixed elsewhere in this file. */
+ *  freezing at 0% for the whole load of a large revision — this is what makes a determinate
+ *  progress bar meaningfully different from the spinner it replaces. `shouldAbort` is checked after
+ *  every yield: a newer revision switch can now start while this one is mid-loop (impossible when
+ *  the loop ran fully synchronously), so without this check a superseded switch would keep mutating
+ *  the shared engine underneath the switch that replaced it — exactly the stale-switch corruption
+ *  fixed elsewhere in this file.
+ *
+ *  The add/remove loop runs with the engine's auto-recalculate-on-sheet-churn listener suppressed
+ *  (`beginBulkSheetLoad`/`endBulkSheetLoad`) — see that pair's doc for why. One explicit
+ *  `rebuildAndRecalculate()` after the loop (before `switchSheet`, so the grid reads settled values)
+ *  replaces what would otherwise have been one rebuild per sheet. */
 const PROGRESS_CHUNK = 3;
 async function resetEngineSheets(
   hot: Handsontable,
@@ -851,32 +921,30 @@ async function resetEngineSheets(
   const wanted = new Map<string, (string | null)[][]>();
   for (const s of sheets) wanted.set(pathToSheetName(s.path), s.data);
   if (!wanted.has(l1Name)) wanted.set(l1Name, createEmptyData());
-  // NOTE: `engine.batch()` was tried here to collapse the per-sheet recalculation into one pass
-  // (creating ~55 brand-new sheets is far slower than updating the same 55 existing sheet names
-  // on a later switch). It is NOT safe with this Handsontable/HyperFormula setup: the Formulas
-  // plugin ties its own UndoRedo batch tracking to the engine's suspend/resume events, and
-  // calling `engine.batch()` directly desyncs that tracking — every attempt threw "Batch mode
-  // wasn't started" from Handsontable's UndoRedo plugin, including on the trivial empty-sheet
-  // fallback path. Do not reintroduce `engine.batch`/`suspendEvaluation`/`resumeEvaluation` here
-  // without a way to test against the running desktop app first.
   const entries = [...wanted];
   const total = entries.length;
-  for (let i = 0; i < entries.length; i++) {
-    const [name, data] = entries[i];
-    const rows = dataForHot(data);
-    if (engine.doesSheetExist(name)) engine.setSheetContent(engine.getSheetId(name), rows);
-    else plugin.addSheet(name, rows);
-    if ((i + 1) % PROGRESS_CHUNK === 0 || i === entries.length - 1) {
-      onProgress?.(i + 1, total);
-      await new Promise<void>(resolve => setTimeout(resolve, 0));
-      if (shouldAbort?.()) return;
+  beginBulkSheetLoad(engine);
+  try {
+    for (let i = 0; i < entries.length; i++) {
+      const [name, data] = entries[i];
+      const rows = dataForHot(data);
+      if (engine.doesSheetExist(name)) engine.setSheetContent(engine.getSheetId(name), rows);
+      else plugin.addSheet(name, rows);
+      if ((i + 1) % PROGRESS_CHUNK === 0 || i === entries.length - 1) {
+        onProgress?.(i + 1, total);
+        await new Promise<void>(resolve => setTimeout(resolve, 0));
+        if (shouldAbort?.()) return;
+      }
     }
-  }
-  plugin.switchSheet(l1Name); // bind to a kept sheet before removing any stale ones
-  for (const name of engine.getSheetNames() as string[]) {
-    if (!wanted.has(name)) {
-      try { engine.removeSheet(engine.getSheetId(name)); } catch { /* ignore */ }
+    engine.rebuildAndRecalculate();
+    plugin.switchSheet(l1Name); // bind to a kept sheet before removing any stale ones
+    for (const name of engine.getSheetNames() as string[]) {
+      if (!wanted.has(name)) {
+        try { engine.removeSheet(engine.getSheetId(name)); } catch { /* ignore */ }
+      }
     }
+  } finally {
+    endBulkSheetLoad(engine);
   }
 }
 /* eslint-enable @typescript-eslint/no-explicit-any */
@@ -2469,10 +2537,12 @@ export function WorkbookView() {
     let hasContent = false;
     for (let r = from; r <= to; r++) { if (isLineItemRow(data[r])) { hasContent = true; break; } }
     if (hasContent) { setPendingDelete({ kind: "row", from, to }); return; }
-    const path = curSheetPath();
-    for (let r = to; r >= from; r--) deleteRowAt(hot, path, r);
-    scheduleSaveRef.current();
-    hot.render();
+    void withWorkbookActivity("Deleting row…", () => {
+      const path = curSheetPath();
+      for (let r = to; r >= from; r--) deleteRowAt(hot, path, r);
+      scheduleSaveRef.current();
+      hot.render();
+    });
   }
 
   /** Deletes columns `[from..to]` (inclusive; both must be >= BASE_NUMERIC_COL_COUNT),
@@ -2485,10 +2555,12 @@ export function WorkbookView() {
       for (const row of data) { if (row[c] != null && row[c] !== "") { hasContent = true; break outer; } }
     }
     if (hasContent) { setPendingDelete({ kind: "col", from, to }); return; }
-    const path = curSheetPath();
-    for (let c = to; c >= from; c--) deleteColAt(hot, path, c);
-    scheduleSaveRef.current();
-    hot.render();
+    void withWorkbookActivity("Deleting column…", () => {
+      const path = curSheetPath();
+      for (let c = to; c >= from; c--) deleteColAt(hot, path, c);
+      scheduleSaveRef.current();
+      hot.render();
+    });
   }
 
   function handleGridContextMenu(event: React.MouseEvent<HTMLDivElement>) {
@@ -2644,11 +2716,11 @@ export function WorkbookView() {
       items.push({ separator: true });
       items.push({
         label: "Insert Column Left", disabled,
-        action: () => insertBlankColAt(hot, path, col),
+        action: () => void withWorkbookActivity("Inserting column…", () => insertBlankColAt(hot, path, col)),
       });
       items.push({
         label: "Insert Column Right", disabled,
-        action: () => insertBlankColAt(hot, path, col + 1),
+        action: () => void withWorkbookActivity("Inserting column…", () => insertBlankColAt(hot, path, col + 1)),
       });
       items.push({
         label: "Delete Column", danger: !disabled, disabled,
@@ -3273,9 +3345,11 @@ export function WorkbookView() {
       if (!hot) return;
       const selected = getSelectedCells();
       if (selected.length === 0) return;
-      insertBlankRowAt(hot, curSheetPath(), Math.min(...selected.map(c => c.row)));
-      hot.selectCell(Math.min(...selected.map(c => c.row)), COL_DESC);
-      scheduleSaveRef.current();
+      void withWorkbookActivity("Inserting row…", () => {
+        insertBlankRowAt(hot, curSheetPath(), Math.min(...selected.map(c => c.row)));
+        hot.selectCell(Math.min(...selected.map(c => c.row)), COL_DESC);
+        scheduleSaveRef.current();
+      });
     },
 
     insertBelow() {
@@ -3285,9 +3359,11 @@ export function WorkbookView() {
       if (selected.length === 0) return;
       const insertAt = Math.max(...selected.map(c => c.row)) + 1;
       if (insertAt >= NUM_ROWS) growRowsTo(hot, NUM_ROWS + ROW_GROWTH_CHUNK);
-      insertBlankRowAt(hot, curSheetPath(), insertAt);
-      hot.selectCell(insertAt, COL_DESC);
-      scheduleSaveRef.current();
+      void withWorkbookActivity("Inserting row…", () => {
+        insertBlankRowAt(hot, curSheetPath(), insertAt);
+        hot.selectCell(insertAt, COL_DESC);
+        scheduleSaveRef.current();
+      });
     },
 
     async exportExcel(levels: FlattenExportLevels) {
@@ -3798,11 +3874,19 @@ export function WorkbookView() {
   // a real line item, deletes that row's persisted sub-sheet (and everything
   // beneath it) — a no-op if nothing was ever saved there.
 
+  // A row counts as a real line item if ANY of its cells holds a value — not just Code/Desc.
+  // Checking Code/Desc alone (the original test) missed two real, common cases: a Quantity
+  // Build-up ("qty" kind) row whose content is Count/Length/Width/Height with no label at all
+  // (deriveLevelFormulas' qty branch already tests those columns for exactly this reason), and a
+  // standard cost-sheet row populated purely by dragging a dimension group's Quantity onto C —
+  // handleGroupDrop only ever writes Quantity/Unit, never Code/Desc, so a linked-quantity row with
+  // no typed description was ALSO invisible to the old check. Both under-detections had the same
+  // consequence: `isLineItemRow` is what row-shift call sites (insertBlankRowAt/deleteRowAt/
+  // addRow/requestDeleteRows) use to find "the last real row", so a row it fails to recognise gets
+  // silently overwritten in place by the next insert/delete instead of being shifted or protected.
   const isLineItemRow = (row: (string | null)[] | undefined): boolean => {
     if (!row) return false;
-    const code = row[COL_CODE];
-    const desc = row[COL_DESC];
-    return (code != null && code !== "") || (desc != null && desc !== "");
+    return row.some(cell => cell != null && cell !== "");
   };
 
   /** Fetch a sheet's source data — in-memory cache first, else SQLite, else empty.
@@ -4442,6 +4526,10 @@ export function WorkbookView() {
         return kind === "qty" ? col === COL_TOTAL : (col === COL_SUBTOTAL || col === COL_TOTAL);
       };
       const refFix: Array<[number, number, string]> = [];
+      // Tracked so the footer's activity indicator (set below) clears only once every
+      // clone-on-paste has actually finished — these are fired off async (DB round-trips per
+      // child sheet), not awaited inline, so the paste's own synchronous work finishes first.
+      const clonePromises: Promise<void>[] = [];
       for (const range of coords ?? []) {
         for (let r = range.startRow; r <= range.endRow; r++) {
           for (let c = range.startCol; c <= range.endCol; c++) {
@@ -4468,8 +4556,10 @@ export function WorkbookView() {
             const srcChildPath = `${copy.path}/${suffix}${srcRow}`;
             const dstChildPath = `${dstPath}/${suffix}${r}`;
             if (srcChildPath === dstChildPath) continue;
-            void maybeCloneChildSheet(srcChildPath, dstChildPath)
-              .catch(err => { console.error(`clone-on-paste: failed to clone ${srcChildPath}`, err); });
+            clonePromises.push(
+              maybeCloneChildSheet(srcChildPath, dstChildPath)
+                .catch(err => { console.error(`clone-on-paste: failed to clone ${srcChildPath}`, err); }),
+            );
           }
         }
       }
@@ -4485,6 +4575,12 @@ export function WorkbookView() {
         propagateLiveRollupRef.current();
         refreshProjectTotal();
         hot.render();
+      }
+      if (clonePromises.length) {
+        useAppStore.getState().setWorkbookActivity("Copying build-up sheets…");
+        void Promise.allSettled(clonePromises).then(() => {
+          useAppStore.getState().setWorkbookActivity("");
+        });
       }
     },
 
@@ -5105,14 +5201,16 @@ export function WorkbookView() {
             const pd = pendingDelete;
             setPendingDelete(null);
             if (!hot || !pd) return;
-            const path = curSheetPath();
-            if (pd.kind === "row") {
-              for (let r = pd.to; r >= pd.from; r--) deleteRowAt(hot, path, r);
-            } else {
-              for (let c = pd.to; c >= pd.from; c--) deleteColAt(hot, path, c);
-            }
-            scheduleSaveRef.current();
-            hot.render();
+            void withWorkbookActivity(pd.kind === "row" ? "Deleting row…" : "Deleting column…", () => {
+              const path = curSheetPath();
+              if (pd.kind === "row") {
+                for (let r = pd.to; r >= pd.from; r--) deleteRowAt(hot, path, r);
+              } else {
+                for (let c = pd.to; c >= pd.from; c--) deleteColAt(hot, path, c);
+              }
+              scheduleSaveRef.current();
+              hot.render();
+            });
           }}
         />
       )}
