@@ -553,10 +553,18 @@ function deriveLevelFormulas(
   kind: SheetKind = "standard",
   path = "",
   excluded?: Set<string>,
+  // Inclusive row band to (re)derive; defaults to the whole sheet. Every row's F/G/H is a pure
+  // function of that row's OWN C/E (or C/D/E/F/G for a qty sheet) — no cross-row dependency — so
+  // a caller that knows only certain rows changed (insertBlankRowAt/deleteRowAt's row-shift) can
+  // narrow this instead of paying an O(NUM_ROWS) rescan on every insert/delete regardless of how
+  // small the actual shift was.
+  rowRange?: { from: number; to: number },
 ): void {
   if (guardRef.current) return;
   guardRef.current = true;
   try {
+    const rFrom = rowRange?.from ?? 0;
+    const rTo = rowRange?.to ?? NUM_ROWS - 1;
     const isExcluded = (r: number, c: number) => excluded != null && excluded.has(styleKey(r, c));
     // A drilled rollup cell (=XSUMTOT/=XSUMUSER…) is authoritative — the auto F=E*C / J=I*C
     // derivation must never overwrite it (M5: F/E/C are all drillable on a cost sheet).
@@ -572,7 +580,7 @@ function deriveLevelFormulas(
       // is blank — same threshold pattern as the standard G/H derivation. I–P are left
       // untouched: nothing pulls through into a leaf sheet that doesn't drill further.
       const pass: Array<[number, number, string]> = [];
-      for (let r = 0; r < NUM_ROWS; r++) {
+      for (let r = rFrom; r <= rTo; r++) {
         const vals = [COL_COUNT, COL_LENGTH, COL_WIDTH, COL_HEIGHT].map(c => hot.getDataAtCell(r, c));
         const hasInput = vals.some(v => v != null && v !== "");
         if (!hasInput) continue;
@@ -595,7 +603,7 @@ function deriveLevelFormulas(
     // cost sheet, including L1, computes its own subtotals). Skips a row whose F is a drilled
     // =XSUMTOT rollup (that subtotal comes from the child cost sheet, not from rate×qty).
     const pass1: Array<[number, number, string]> = [];
-    for (let r = 0; r < NUM_ROWS; r++) {
+    for (let r = rFrom; r <= rTo; r++) {
       if (isExcluded(r, COL_SUBTOTAL) || isXsum(r, COL_SUBTOTAL)) continue;
       const cVal = hot.getDataAtCell(r, COL_QTY);
       const eVal = hot.getDataAtCell(r, COL_RATE);
@@ -608,7 +616,7 @@ function deriveLevelFormulas(
 
     // Pass 2: for every row with an F value, auto-populate G=1 if blank and write H=F×G.
     const pass2: Array<[number, number, string]> = [];
-    for (let r = 0; r < NUM_ROWS; r++) {
+    for (let r = rFrom; r <= rTo; r++) {
       const fRaw = hot.getDataAtCell(r, COL_SUBTOTAL);
       if (fRaw == null || fRaw === "") continue;
       const f = typeof fRaw === "number" ? fRaw : parseFloat(String(fRaw)) || 0;
@@ -752,29 +760,130 @@ function ensureEngineSheet(hot: Handsontable, path: string): void {
  * already holds the right content the instant the retargeted formula is parsed) — see the
  * call sites.
  */
-function moveLiveEngineSubtree(hot: Handsontable, oldSub: string, newSub: string): void {
+/**
+ * Finds every entry in `names` that lives under `${ownerPath}/{prefix}{row}` for one of
+ * `prefixes`, with `row` in `[loRow, hiRow]`, and returns its rename pair shifting that row by
+ * `rowDelta` (a nested descendant, e.g. "L1/S3/R5", moves as a unit — only the outer row shifts).
+ *
+ * This is called ONCE per insert/delete over the full set of names/keys, rather than once per
+ * shifted row — insertBlankRowAt/deleteRowAt used to call a per-subtree mover inside a loop over
+ * every row being displaced, and that mover (plus the cache remaps alongside it) each did a full
+ * scan of the whole engine/map to find the one row's descendants. Shifting N rows below the edit
+ * point on a workbook with M live sheets/cache entries cost O(N × M) instead of O(M) — on a large
+ * cost sheet, inserting/deleting near the top (N close to the row count) got dramatically slower
+ * as the workbook grew, which read as "exponential" even though it's really quadratic in N.
+ */
+function planSubtreeRenames(
+  names: Iterable<string>, ownerPath: string, prefixes: string[],
+  loRow: number, hiRow: number, rowDelta: number,
+): Array<{ oldPath: string; newPath: string; row: number }> {
+  const renames: Array<{ oldPath: string; newPath: string; row: number }> = [];
+  const base = `${ownerPath}/`;
+  for (const name of names) {
+    if (!name.startsWith(base)) continue;
+    const tail = name.slice(base.length);
+    for (const prefix of prefixes) {
+      if (!tail.startsWith(prefix)) continue;
+      const m = /^(\d+)(.*)$/.exec(tail.slice(prefix.length));
+      if (!m) continue;
+      const row = Number(m[1]);
+      if (row < loRow || row > hiRow) continue;
+      renames.push({ oldPath: name, newPath: `${ownerPath}/${prefix}${row + rowDelta}${m[2]}`, row });
+      break;
+    }
+  }
+  return renames;
+}
+
+/** Applies a rename plan to a path-keyed cache map. Reads every old value before deleting any
+ *  old key, so — unlike the live engine below — this needs no particular row order: a
+ *  destination that is itself a source elsewhere in the plan is never clobbered mid-pass. */
+function applySubtreeRenamesToMap<V>(
+  map: Map<string, V> | undefined, renames: Array<{ oldPath: string; newPath: string }>,
+): void {
+  if (!map || map.size === 0 || renames.length === 0) return;
+  const moves: Array<[string, V]> = [];
+  for (const { oldPath, newPath } of renames) {
+    const v = map.get(oldPath);
+    if (v !== undefined) moves.push([newPath, v]);
+  }
+  for (const { oldPath } of renames) map.delete(oldPath);
+  for (const [newPath, v] of moves) map.set(newPath, v);
+}
+
+/**
+ * A named cell bound directly to a sub-sheet that a subtree rename just relocated (e.g. a name
+ * defined inside a Rate Build-up sheet, not the parent row that owns it) keeps its own row/col
+ * but must follow its sheet to the new path — otherwise its live HyperFormula expression keeps
+ * pointing at the sheet name that was just renamed away, breaking it for the rest of the session.
+ * The DB side of this is already handled by `rename_workbook_sheet_subtree` (it rewrites
+ * `workbook_named_cells.sheet_path` in the same transaction as the sheet-data tables), so this
+ * only needs to fix the in-memory map and re-register the live expression — no extra persist.
+ */
+function applySubtreeRenamesToNamedCells(
+  namedCellMap: Map<string, NamedCell>,
+  renames: Array<{ oldPath: string; newPath: string }>,
+  reregister: (nc: NamedCell) => void,
+): void {
+  if (namedCellMap.size === 0 || renames.length === 0) return;
+  const byOldPath = new Map(renames.map(r => [r.oldPath, r.newPath]));
+  for (const nc of namedCellMap.values()) {
+    const newPath = byOldPath.get(nc.path);
+    if (newPath == null) continue;
+    nc.path = newPath;
+    reregister(nc);
+  }
+}
+
+/** Same as `applySubtreeRenamesToMap`, for the membership-only Set caches. */
+function applySubtreeRenamesToSet(
+  set: Set<string> | undefined, renames: Array<{ oldPath: string; newPath: string }>,
+): void {
+  if (!set || set.size === 0 || renames.length === 0) return;
+  const adds: string[] = [];
+  for (const { oldPath, newPath } of renames) if (set.has(oldPath)) adds.push(newPath);
+  for (const { oldPath } of renames) set.delete(oldPath);
+  for (const p of adds) set.add(p);
+}
+
+/**
+ * Applies a rename plan to the live HyperFormula engine's sheets. Unlike the cache maps above,
+ * this mutates one shared engine sequentially, so a destination row that is ALSO a source
+ * elsewhere in the plan must not be overwritten before it's been read — callers must order
+ * `renames` by `row` descending for a down-shift (insert) and ascending for an up-shift
+ * (delete), i.e. always move into an already-vacated slot first.
+ */
+function applySubtreeRenamesToEngine(
+  hot: Handsontable, renames: Array<{ oldPath: string; newPath: string }>,
+): void {
   const plugin = getFormulasPlugin(hot);
   const engine = plugin?.engine;
-  if (!plugin || !engine) return;
-  const prefix = `${oldSub}/`;
-  let names: string[];
-  try { names = engine.getSheetNames() as string[]; } catch { return; }
-  for (const name of names) {
-    const p = sheetNameToPath(name);
-    let newPath: string | null = null;
-    if (p === oldSub) newPath = newSub;
-    else if (p.startsWith(prefix)) newPath = newSub + p.slice(oldSub.length);
-    if (newPath == null) continue;
-    try {
-      const oldId = engine.getSheetId(name);
-      if (oldId == null) continue;
-      const content = engine.getSheetSerialized(oldId);
-      const newName = pathToSheetName(newPath);
-      if (engine.doesSheetExist(newName)) engine.setSheetContent(engine.getSheetId(newName), content);
-      else plugin.addSheet(newName, content);
-      engine.removeSheet(oldId);
-    } catch { /* non-fatal — the cache/DB rename above still keeps it consistent on reload */ }
+  if (!plugin || !engine || renames.length === 0) return;
+  // Each addSheet/removeSheet below fires the Formulas plugin's own "sheetAdded"/"sheetRemoved"
+  // listener, which by default runs a FULL engine rebuild+recalculate (see beginBulkSheetLoad's
+  // doc) — exactly the O(n²)-in-sheet-count storm `resetEngineSheets` already suppresses for bulk
+  // loading. A row insert/delete that displaces K rate/qty build-up sub-sheets was paying for K
+  // full-engine recalculations here; this is what actually dominated the cost `planSubtreeRenames`
+  // above was fixing the scan side of. Suppress the same way, then settle once at the end.
+  beginBulkSheetLoad(engine);
+  try {
+    for (const { oldPath, newPath } of renames) {
+      try {
+        const oldName = pathToSheetName(oldPath);
+        if (!engine.doesSheetExist(oldName)) continue;
+        const oldId = engine.getSheetId(oldName);
+        if (oldId == null) continue;
+        const content = engine.getSheetSerialized(oldId);
+        const newName = pathToSheetName(newPath);
+        if (engine.doesSheetExist(newName)) engine.setSheetContent(engine.getSheetId(newName), content);
+        else plugin.addSheet(newName, content);
+        engine.removeSheet(oldId);
+      } catch { /* non-fatal — the cache/DB rename above still keeps it consistent on reload */ }
+    }
+  } finally {
+    endBulkSheetLoad(engine);
   }
+  engine.rebuildAndRecalculate();
 }
 
 /**
@@ -3000,41 +3109,38 @@ export function WorkbookView() {
     // At Level 1 sub-sheets are "<path>/R{r}"; at Level 2 also "<path>/Q{r}".
     const subPrefixes = isCostSheetPath(path) ? ["S", "R", "Q"] : []; // M5: cost sheets carry S/R/Q children
     if (lastOccupied >= insertAt && subPrefixes.length > 0) {
-      // Bottom-up so a target name is never still occupied by an unprocessed row — see
-      // shiftRowKeyedEntries' comment on why down-shifts need descending order.
-      for (let r = lastOccupied; r >= insertAt; r--) {
-        for (const prefix of subPrefixes) {
-          const oldSub = `${path}/${prefix}${r}`;
-          const newSub = `${path}/${prefix}${r + 1}`;
-          moveLiveEngineSubtree(hot, oldSub, newSub);
-          // Rename the exact path in every Map cache.
-          function remapMapKey<V>(map: Map<string, V>) {
-            if (map.has(oldSub)) { map.set(newSub, map.get(oldSub)!); map.delete(oldSub); }
-            const subPrefix = `${oldSub}/`;
-            for (const key of Array.from(map.keys())) {
-              if (key.startsWith(subPrefix)) { map.set(newSub + key.slice(oldSub.length), map.get(key)!); map.delete(key); }
-            }
-          }
-          remapMapKey(sheetDataMap.current as Map<string, unknown>);
-          remapMapKey(sheetComputedMap.current as Map<string, unknown>);
-          remapMapKey(cellLinkMap.current);
-          remapMapKey(cellStyleMap.current);
-          remapMapKey(cellExclusionMap.current);
-          // Rename in the "loaded" Set caches.
-          function remapSetKey(set: Set<string>) {
-            if (set.has(oldSub)) { set.add(newSub); set.delete(oldSub); }
-            const subPrefix = `${oldSub}/`;
-            for (const key of Array.from(set)) {
-              if (key.startsWith(subPrefix)) { set.add(newSub + key.slice(oldSub.length)); set.delete(key); }
-            }
-          }
-          remapSetKey(loadedLinkPathsRef.current);
-          remapSetKey(loadedStylePathsRef.current);
-          remapSetKey(loadedExclusionPathsRef.current);
-        }
-      }
+      // One scan of the engine's sheet names and each cache, not one scan per shifted row — see
+      // planSubtreeRenames' doc comment for why the old per-row version got quadratically slower.
+      let engineNames: string[] = [];
+      try { engineNames = (getFormulasPlugin(hot)?.engine?.getSheetNames() as string[]) ?? []; } catch { /* no engine yet */ }
+      const engineRenames = planSubtreeRenames(
+        engineNames.map(sheetNameToPath), path, subPrefixes, insertAt, lastOccupied, 1,
+      );
+      // Down-shift: move the highest row first so a destination is never an unprocessed source.
+      engineRenames.sort((a, b) => b.row - a.row);
+      applySubtreeRenamesToEngine(hot, engineRenames);
 
-      // Persist the path renames to SQLite (bottom-up; fire-and-forget).
+      const cacheRenames = (map: Iterable<string>) => planSubtreeRenames(map, path, subPrefixes, insertAt, lastOccupied, 1);
+      applySubtreeRenamesToMap(sheetDataMap.current, cacheRenames(sheetDataMap.current.keys()));
+      applySubtreeRenamesToMap(sheetComputedMap.current, cacheRenames(sheetComputedMap.current.keys()));
+      applySubtreeRenamesToMap(cellLinkMap.current, cacheRenames(cellLinkMap.current.keys()));
+      applySubtreeRenamesToMap(cellStyleMap.current, cacheRenames(cellStyleMap.current.keys()));
+      applySubtreeRenamesToMap(cellExclusionMap.current, cacheRenames(cellExclusionMap.current.keys()));
+      applySubtreeRenamesToSet(loadedLinkPathsRef.current, cacheRenames(loadedLinkPathsRef.current));
+      applySubtreeRenamesToSet(loadedStylePathsRef.current, cacheRenames(loadedStylePathsRef.current));
+      applySubtreeRenamesToSet(loadedExclusionPathsRef.current, cacheRenames(loadedExclusionPathsRef.current));
+      // Named cells bound directly to one of the relocated sub-sheets (not the parent row that
+      // owns it) — scanned off the named-cell map's own paths, not the live engine's sheet list,
+      // since a named cell can be bound to a sub-sheet the session hasn't drilled into yet.
+      applySubtreeRenamesToNamedCells(
+        namedCellMap.current,
+        cacheRenames(Array.from(namedCellMap.current.values(), nc => nc.path)),
+        registerNamedExpression,
+      );
+
+      // Persist the path renames to SQLite (bottom-up; fire-and-forget). Covers
+      // workbook_named_cells too (see rename_workbook_sheet_subtree), so the named-cell fix
+      // above only needs to fix the in-memory map/live registration, not re-persist.
       const revId = revIdRef.current;
       if (revId != null) {
         for (let r = lastOccupied; r >= insertAt; r--) {
@@ -3090,8 +3196,13 @@ export function WorkbookView() {
       shiftRowKeyedSet(cellExclusionMap.current.get(path), insertAt, lastOccupied + 1, 1, cols);
     }
 
-    // Regenerate row-relative formula cells at their new positions.
-    deriveLevelFormulas(hot, levelRef.current, isAutoUpdatingRef, sheetKindForPath(path), path, cellExclusionMap.current.get(path));
+    // Regenerate row-relative formula cells at their new positions — only the band that actually
+    // moved (each row's F/G/H depends solely on its own C/E, never a neighbour's), not the whole
+    // sheet: this used to rescan all NUM_ROWS on every single insert regardless of shift size.
+    deriveLevelFormulas(
+      hot, levelRef.current, isAutoUpdatingRef, sheetKindForPath(path), path, cellExclusionMap.current.get(path),
+      { from: insertAt, to: Math.min(Math.max(insertAt, lastOccupied + 1), NUM_ROWS - 1) },
+    );
   }
 
   /**
@@ -3138,37 +3249,33 @@ export function WorkbookView() {
     // drilled-reference formula (from beforeChange's toStored round-trip) must resolve against
     // an already-moved live sheet the instant the batch write below lands.
     if (lastOccupied >= deleteAt && subPrefixes.length > 0) {
-      // Top-down (ascending r) so a target name is never still occupied by an unprocessed row —
-      // see shiftRowKeyedEntries' comment on why up-shifts need ascending order.
-      for (let r = deleteAt + 1; r <= lastOccupied; r++) {
-        for (const prefix of subPrefixes) {
-          const oldSub = `${path}/${prefix}${r}`;
-          const newSub = `${path}/${prefix}${r - 1}`;
-          moveLiveEngineSubtree(hot, oldSub, newSub);
-          function remapMapKey<V>(map: Map<string, V>) {
-            if (map.has(oldSub)) { map.set(newSub, map.get(oldSub)!); map.delete(oldSub); }
-            const subPrefix = `${oldSub}/`;
-            for (const key of Array.from(map.keys())) {
-              if (key.startsWith(subPrefix)) { map.set(newSub + key.slice(oldSub.length), map.get(key)!); map.delete(key); }
-            }
-          }
-          remapMapKey(sheetDataMap.current as Map<string, unknown>);
-          remapMapKey(sheetComputedMap.current as Map<string, unknown>);
-          remapMapKey(cellLinkMap.current);
-          remapMapKey(cellStyleMap.current);
-          remapMapKey(cellExclusionMap.current);
-          function remapSetKey(set: Set<string>) {
-            if (set.has(oldSub)) { set.add(newSub); set.delete(oldSub); }
-            const subPrefix = `${oldSub}/`;
-            for (const key of Array.from(set)) {
-              if (key.startsWith(subPrefix)) { set.add(newSub + key.slice(oldSub.length)); set.delete(key); }
-            }
-          }
-          remapSetKey(loadedLinkPathsRef.current);
-          remapSetKey(loadedStylePathsRef.current);
-          remapSetKey(loadedExclusionPathsRef.current);
-        }
-      }
+      // One scan of the engine's sheet names and each cache, not one scan per shifted row — see
+      // planSubtreeRenames' doc comment for why the old per-row version got quadratically slower.
+      let engineNames: string[] = [];
+      try { engineNames = (getFormulasPlugin(hot)?.engine?.getSheetNames() as string[]) ?? []; } catch { /* no engine yet */ }
+      const engineRenames = planSubtreeRenames(
+        engineNames.map(sheetNameToPath), path, subPrefixes, deleteAt + 1, lastOccupied, -1,
+      );
+      // Up-shift: move the lowest row first so a destination is never an unprocessed source.
+      engineRenames.sort((a, b) => a.row - b.row);
+      applySubtreeRenamesToEngine(hot, engineRenames);
+
+      const cacheRenames = (map: Iterable<string>) => planSubtreeRenames(map, path, subPrefixes, deleteAt + 1, lastOccupied, -1);
+      applySubtreeRenamesToMap(sheetDataMap.current, cacheRenames(sheetDataMap.current.keys()));
+      applySubtreeRenamesToMap(sheetComputedMap.current, cacheRenames(sheetComputedMap.current.keys()));
+      applySubtreeRenamesToMap(cellLinkMap.current, cacheRenames(cellLinkMap.current.keys()));
+      applySubtreeRenamesToMap(cellStyleMap.current, cacheRenames(cellStyleMap.current.keys()));
+      applySubtreeRenamesToMap(cellExclusionMap.current, cacheRenames(cellExclusionMap.current.keys()));
+      applySubtreeRenamesToSet(loadedLinkPathsRef.current, cacheRenames(loadedLinkPathsRef.current));
+      applySubtreeRenamesToSet(loadedStylePathsRef.current, cacheRenames(loadedStylePathsRef.current));
+      applySubtreeRenamesToSet(loadedExclusionPathsRef.current, cacheRenames(loadedExclusionPathsRef.current));
+      // See insertBlankRowAt's matching comment — named cells bound to a relocated sub-sheet
+      // follow it; the DB side is already covered by rename_workbook_sheet_subtree below.
+      applySubtreeRenamesToNamedCells(
+        namedCellMap.current,
+        cacheRenames(Array.from(namedCellMap.current.values(), nc => nc.path)),
+        registerNamedExpression,
+      );
 
       if (revId != null) {
         for (let r = deleteAt + 1; r <= lastOccupied; r++) {
@@ -3227,7 +3334,11 @@ export function WorkbookView() {
       shiftRowKeyedSet(cellExclusionMap.current.get(path), deleteAt + 1, lastOccupied + 1, -1, cols);
     }
 
-    deriveLevelFormulas(hot, levelRef.current, isAutoUpdatingRef, sheetKindForPath(path), path, cellExclusionMap.current.get(path));
+    // See insertBlankRowAt's matching comment — narrow the rescan to the band that actually moved.
+    deriveLevelFormulas(
+      hot, levelRef.current, isAutoUpdatingRef, sheetKindForPath(path), path, cellExclusionMap.current.get(path),
+      { from: deleteAt, to: Math.max(deleteAt, lastOccupied) },
+    );
   }
 
   /**
@@ -4183,23 +4294,41 @@ export function WorkbookView() {
     // immediately, instead of the app computing and writing a value into the parent row
     // itself. The parent cell's own formula is the only thing that determines what the
     // parent row shows; this only makes sure it has something real to read.
+    //
+    // Deliberately does NOT settle (recompute/render) here — this function recurses into every
+    // occupied row's own S/R/Q children (M5), and a paste of a cost sheet with dozens of rows
+    // used to mean dozens of full-engine recalculations plus dozens of full grid re-renders, one
+    // per clone, each already paying for the OTHERS' now-stale-again engine state. `addSheet`/
+    // `setSheetContent` also fire the Formulas plugin's own full-rebuild "sheetAdded"/
+    // "sheetRemoved" listener (see beginBulkSheetLoad's doc) unless suppressed, so this is
+    // wrapped the same way `resetEngineSheets` wraps bulk loading. Callers settle ONCE after
+    // every clone in the paste has finished — see afterPaste.
     const hot = hotRef.current?.hotInstance;
     if (hot) {
       const plugin = getFormulasPlugin(hot);
       const engine = plugin?.engine;
       if (plugin && engine) {
-        const name = pathToSheetName(dstPath);
-        const rows = dataForHot(cloned);
+        beginBulkSheetLoad(engine);
         try {
+          const name = pathToSheetName(dstPath);
+          const rows = dataForHot(cloned);
           if (engine.doesSheetExist(name)) engine.setSheetContent(engine.getSheetId(name), rows);
           else plugin.addSheet(name, rows);
         } catch { /* non-fatal — the cache/DB clone above still keeps it consistent on reload */ }
+        finally { endBulkSheetLoad(engine); }
       }
-      recomputeEngine(hot);
-      propagateLiveRollupRef.current();
-      refreshProjectTotal();
-      hot.render();
     }
+  }
+
+  /** Settles the engine/UI once after one or more `maybeCloneChildSheet` calls — see that
+   *  function's doc comment on why it no longer does this itself per-clone. */
+  function settleAfterCloneOnPaste(): void {
+    const hot = hotRef.current?.hotInstance;
+    if (!hot) return;
+    recomputeEngine(hot);
+    propagateLiveRollupRef.current();
+    refreshProjectTotal();
+    hot.render();
   }
 
   /** Reset the whole view back to a blank Level 1 sheet (in-memory only). */
@@ -4579,6 +4708,10 @@ export function WorkbookView() {
       if (clonePromises.length) {
         useAppStore.getState().setWorkbookActivity("Copying build-up sheets…");
         void Promise.allSettled(clonePromises).then(() => {
+          // One settle for the whole paste instead of one per clone — see maybeCloneChildSheet's
+          // doc comment; this is what made pasting many drilled rows dramatically slower than
+          // pasting the same number of plain cells.
+          settleAfterCloneOnPaste();
           useAppStore.getState().setWorkbookActivity("");
         });
       }
