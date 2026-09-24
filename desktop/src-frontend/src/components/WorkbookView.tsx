@@ -1,6 +1,7 @@
-import React, { useRef, useState, useCallback, useMemo, useEffect } from "react";
+import React, { useRef, useState, useCallback, useMemo, useEffect, useLayoutEffect } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { readText as readClipboardText, writeText as writeClipboardText } from "@tauri-apps/plugin-clipboard-manager";
 import { HotTable } from "@handsontable/react-wrapper";
@@ -36,7 +37,8 @@ import {
   qtyTotalFormula, toNum, numOrUndefined, textOrBlank, sumComputedCol,
   deriveFactorTotal, legacyColLetter,
 } from "../lib/workbookCalc";
-import { pathToSheetName, sheetNameToPath } from "../lib/workbookSheetNames";
+import { pathToSheetName, sheetNameToPath, retargetSheetRefs } from "../lib/workbookSheetNames";
+import { wbInvoke, wbRead, wbWrite, flushWorkbookWrites, setWorkbookDbErrorHandler, setWorkbookFlushHook } from "../lib/workbookDb";
 import { registerWorkbookFunctions } from "../lib/workbookFunctions";
 import { toDisplay as xsumToDisplay, toStored as xsumToStored, XSUM_ROW_BOUND } from "../lib/workbookXsumDisplay";
 import {
@@ -722,45 +724,6 @@ function ensureEngineSheet(hot: Handsontable, path: string): void {
 }
 
 /**
- * Moves every LIVE engine sheet under `oldSub` (itself, plus any of its own drilled
- * descendants) to sit under `newSub` instead — the live-engine counterpart of the JS-cache
- * `remapMapKey`/`remapSetKey` renames and the `rename_workbook_sheet_subtree` DB call that
- * already run alongside this at every insert/delete-row call site.
- *
- * A cost sheet's whole revision is loaded into the HyperFormula engine up front
- * (`resetEngineSheets`), so a row that has already been drilled into (a "/S<row>" cost
- * child, "/R<row>" rate build-up, or "/Q<row>" qty build-up) has a REAL live sheet under its
- * OLD name at the moment its row physically shifts. `beforeChange`'s toStored round-trip
- * rewrites the row's own drilled-reference formula (e.g. F's `=XSUMTOT(...)`) to point at the
- * NEW name the instant the cell lands on its new row — but that only fixes the formula TEXT.
- * Without also moving the live sheet itself, that rewritten reference either resolves against
- * nothing (a row that had never been drilled before) or — when another row's own child
- * already happens to sit under that target name — silently reads THAT child's numbers
- * instead. This is the "reference to the sub sheet lost" failure: the moved row's rollup
- * reads someone else's data (or nothing), which is exactly what changes a workbook's totals
- * when a row is merely inserted or deleted elsewhere on the sheet.
- *
- * Moves by COPYING content (`getSheetSerialized`, formula strings intact) to the target name
- * and removing the source, rather than `HyperFormula.renameSheet` — a rename updates the
- * engine's internal id↔name mapping in place, and every OTHER cell's formula that references
- * this sheet (by name, at parse time) is bound to it by id already, so leftover/point-in-time
- * inconsistencies there showed up as spurious #CYCLE! errors and cross-row corruption on
- * unrelated rows during testing. Copy-then-remove touches only the two sheets involved and
- * matches the primitives `resetEngineSheets`/`loadLevelData` already use elsewhere.
- *
- * KNOWN LIMITATION: a cost sheet can itself drill further (M5: unlimited depth), so a moved
- * sheet's OWN cells may contain an XSUM* formula referencing one of ITS OWN children by the
- * OLD name — that inner reference is copied verbatim, not rewritten, because only a real
- * grid edit (via `beforeChange`) retargets XSUM* text. In practice this only bites a row whose
- * lump-sum breakdown is itself broken down further; a single level of Rate/Qty build-up (the
- * overwhelmingly common case) has no such inner reference to go stale.
- *
- * Must be called in the same bottom-up (insert) / top-down (delete) row order as the cache
- * remap it runs alongside, and BEFORE the row data itself is written (so the target sheet
- * already holds the right content the instant the retargeted formula is parsed) — see the
- * call sites.
- */
-/**
  * Finds every entry in `names` that lives under `${ownerPath}/{prefix}{row}` for one of
  * `prefixes`, with `row` in `[loRow, hiRow]`, and returns its rename pair shifting that row by
  * `rowDelta` (a nested descendant, e.g. "L1/S3/R5", moves as a unit — only the outer row shifts).
@@ -773,39 +736,59 @@ function ensureEngineSheet(hot: Handsontable, path: string): void {
  * cost sheet, inserting/deleting near the top (N close to the row count) got dramatically slower
  * as the workbook grew, which read as "exponential" even though it's really quadratic in N.
  */
+interface SubtreeRename {
+  oldPath: string;
+  newPath: string;
+  row: number;
+  /** The moved row's own sub-sheet before/after the move ("L1/S3" → "L1/S4") — `oldPath` is
+   *  either this or one of its descendants. */
+  rootOld: string;
+  rootNew: string;
+}
+
 function planSubtreeRenames(
   names: Iterable<string>, ownerPath: string, prefixes: string[],
   loRow: number, hiRow: number, rowDelta: number,
-): Array<{ oldPath: string; newPath: string; row: number }> {
-  const renames: Array<{ oldPath: string; newPath: string; row: number }> = [];
+): SubtreeRename[] {
+  const renames: SubtreeRename[] = [];
   const base = `${ownerPath}/`;
   for (const name of names) {
     if (!name.startsWith(base)) continue;
     const tail = name.slice(base.length);
     for (const prefix of prefixes) {
       if (!tail.startsWith(prefix)) continue;
-      const m = /^(\d+)(.*)$/.exec(tail.slice(prefix.length));
+      const m = /^(\d+)((?:\/.*)?)$/.exec(tail.slice(prefix.length));
       if (!m) continue;
       const row = Number(m[1]);
       if (row < loRow || row > hiRow) continue;
-      renames.push({ oldPath: name, newPath: `${ownerPath}/${prefix}${row + rowDelta}${m[2]}`, row });
+      const rootOld = `${ownerPath}/${prefix}${row}`;
+      const rootNew = `${ownerPath}/${prefix}${row + rowDelta}`;
+      renames.push({ oldPath: name, newPath: `${rootNew}${m[2]}`, row, rootOld, rootNew });
       break;
     }
   }
   return renames;
 }
 
+/** A moved sheet's cells can reference its OWN drilled children by name; re-point them at the
+ *  children's new names (which moved with it). */
+function retargetSheetData(data: (string | null)[][], rename: SubtreeRename): (string | null)[][] {
+  return data.map(row => row.map(cell => retargetSheetRefs(cell, rename.rootOld, rename.rootNew)));
+}
+
 /** Applies a rename plan to a path-keyed cache map. Reads every old value before deleting any
  *  old key, so — unlike the live engine below — this needs no particular row order: a
- *  destination that is itself a source elsewhere in the plan is never clobbered mid-pass. */
+ *  destination that is itself a source elsewhere in the plan is never clobbered mid-pass.
+ *  `transform`, if given, rewrites each moved value (used to retarget cached sheet data). */
 function applySubtreeRenamesToMap<V>(
-  map: Map<string, V> | undefined, renames: Array<{ oldPath: string; newPath: string }>,
+  map: Map<string, V> | undefined, renames: SubtreeRename[],
+  transform?: (value: V, rename: SubtreeRename) => V,
 ): void {
   if (!map || map.size === 0 || renames.length === 0) return;
   const moves: Array<[string, V]> = [];
-  for (const { oldPath, newPath } of renames) {
-    const v = map.get(oldPath);
-    if (v !== undefined) moves.push([newPath, v]);
+  for (const r of renames) {
+    const v = map.get(r.oldPath);
+    if (v !== undefined) moves.push([r.newPath, transform ? transform(v, r) : v]);
   }
   for (const { oldPath } of renames) map.delete(oldPath);
   for (const [newPath, v] of moves) map.set(newPath, v);
@@ -852,10 +835,14 @@ function applySubtreeRenamesToSet(
  * elsewhere in the plan must not be overwritten before it's been read — callers must order
  * `renames` by `row` descending for a down-shift (insert) and ascending for an up-shift
  * (delete), i.e. always move into an already-vacated slot first.
+ *
+ * Moves by COPYING content to the target name and removing the source, rather than
+ * `HyperFormula.renameSheet`: other cells' formulas are bound to a sheet by id at parse time, and
+ * renaming in place showed up as spurious #CYCLE! errors and cross-row corruption in testing. The
+ * copied content has references to the moved row's own descendants retargeted (retargetSheetRefs),
+ * so a cost sheet that drills further keeps reading its own children after the move.
  */
-function applySubtreeRenamesToEngine(
-  hot: Handsontable, renames: Array<{ oldPath: string; newPath: string }>,
-): void {
+function applySubtreeRenamesToEngine(hot: Handsontable, renames: SubtreeRename[]): void {
   const plugin = getFormulasPlugin(hot);
   const engine = plugin?.engine;
   if (!plugin || !engine || renames.length === 0) return;
@@ -867,13 +854,16 @@ function applySubtreeRenamesToEngine(
   // above was fixing the scan side of. Suppress the same way, then settle once at the end.
   beginBulkSheetLoad(engine);
   try {
-    for (const { oldPath, newPath } of renames) {
+    for (const rename of renames) {
+      const { oldPath, newPath } = rename;
       try {
         const oldName = pathToSheetName(oldPath);
         if (!engine.doesSheetExist(oldName)) continue;
         const oldId = engine.getSheetId(oldName);
         if (oldId == null) continue;
-        const content = engine.getSheetSerialized(oldId);
+        // Re-point the moved sheet's own references to its (also moving) children.
+        const content = (engine.getSheetSerialized(oldId) as unknown[][]).map(row =>
+          row.map(cell => (typeof cell === "string" ? retargetSheetRefs(cell, rename.rootOld, rename.rootNew) : cell)));
         const newName = pathToSheetName(newPath);
         if (engine.doesSheetExist(newName)) engine.setSheetContent(engine.getSheetId(newName), content);
         else plugin.addSheet(newName, content);
@@ -887,44 +877,18 @@ function applySubtreeRenamesToEngine(
 }
 
 /**
- * Renumbers bare same-row cell references (e.g. "I5" → "I6") when a cell's formula text is
- * physically carried from `fromRow` to `toRow` by insertBlankRowAt/deleteRowAt's row-shift —
- * the CostX-native "Formulas containing cell references are updated to reflect the new row
- * numbering automatically" behaviour, applied to a formula a human actually typed (this app
- * never writes a user-column formula itself; see UserColumn's doc comment in
- * lib/workbookLayout.ts). Without this, a hand-typed self-row formula like the shipped
- * template's `=I5*C5` would keep reading the row it moved FROM once physically relocated.
- *
- * Deliberately leaves any XSUM* call — whole-cell, or nested inside a wrapper like
- * `=IF(H5>0,XSUMRATEUSER(2),0)` — untouched: that family is retargeted separately, by cell
- * position, via `beforeChange`'s toStored round-trip (which also handles a drilled F/E/C cell's
- * own reference). `CELL_REF_OR_XSUM_CALL_RE` matches a whole XSUM* call as one token specifically
- * so this can skip over it while still renumbering any bare reference elsewhere in the same
- * formula (e.g. the `H5` in that IF condition). Only rewrites references whose row number matches
- * the row being moved. A genuine cross-row reference (e.g. a hand-typed running total summing
- * several OTHER rows) is left exactly as typed, the same as Excel leaves a reference untouched
- * when the row it points at is outside the moved range.
+ * A bare cell reference, or a whole XSUM* call matched as one token so `shiftFormulaRowRefs` can
+ * skip it (that family is retargeted by cell position via beforeChange's toStored round-trip)
+ * while still shifting any bare reference elsewhere in the same formula.
  */
 const CELL_REF_OR_XSUM_CALL_RE = /XSUM[A-Z]+\s*\([^()]*\)|(?<![!\w])([A-Za-z]{1,2})(\d+)\b/gi;
-
-function renumberRowFormula(value: string, fromRow: number, toRow: number): string {
-  if (typeof value !== "string" || value.charAt(0) !== "=") return value;
-  const fromRef = fromRow + 1;
-  const toRef = toRow + 1;
-  if (fromRef === toRef) return value;
-  return value.replace(CELL_REF_OR_XSUM_CALL_RE, (m: string, col?: string, num?: string) => {
-    if (col == null) return m; // matched a whole XSUM* call — leave untouched
-    return Number(num) === fromRef ? `${col}${toRef}` : m;
-  });
-}
 
 /**
  * Shifts EVERY bare cell reference in a formula by `rowDelta` rows — the ordinary Excel/CostX
  * relative-reference behaviour on a plain cell copy/paste: `=M1*C1` copied from row 1 and pasted
  * onto row 3 becomes `=M3*C3`, whether or not the reference happens to match the row it was
- * copied FROM (unlike `renumberRowFormula`, which only follows a reference that matches the
- * specific row being physically relocated — the right rule for a row-insert/delete shift, but not
- * for an arbitrary-distance copy/paste). Any XSUM* call, whole-cell or nested inside a wrapper
+ * copied FROM. (Row insert/delete doesn't use this — it is a native grid operation, so
+ * HyperFormula adjusts references itself.) Any XSUM* call, whole-cell or nested inside a wrapper
  * (e.g. `=IF(H5>0,XSUMRATEUSER(2),0)`), is skipped as one token via `CELL_REF_OR_XSUM_CALL_RE` —
  * that family is retargeted separately, by cell position, via beforeChange's toStored round-trip —
  * while a bare reference elsewhere in the same formula (that IF's `H5`) still gets shifted here.
@@ -1281,65 +1245,35 @@ function pathLastRow(path: string): number | null {
 }
 
 /**
- * Evaluates a sheet's raw source rows (formula strings and all) in a standalone,
- * throwaway HyperFormula instance — needed to roll up a freshly-cloned Rate
- * Build-up sheet's Lab/Mat/Sub/Sum columns live, right after the clone is written
- * in memory (there is no live HotTable instance for that not-yet-displayed sheet
- * to read evaluated values from). A plain `parseFloat` over the raw strings would
- * miss any cell entered as a formula (e.g. a rate looked up from the Rates list,
- * or F/H's own `=E×C`/`=F×G`) — those only resolve to a real number once evaluated,
- * exactly as they would the moment a live grid loads this sheet.
+ * Evaluated values of one sheet, read from the live engine — which holds every sheet of the
+ * revision, so cross-sheet rollups and named cells resolve exactly as they do on screen. A cell
+ * error comes back as its Excel text ("#REF!") rather than an error object. Returns [] for a sheet
+ * the engine doesn't hold.
  */
-function evaluateClonedRows(data: (string | null)[][]): unknown[][] {
-  let hf: HyperFormula | null = null;
-  try {
-    hf = HyperFormula.buildFromArray(dataForHot(data), { licenseKey: "gpl-v3" });
-    return hf.getSheetValues(0);
-  } catch {
-    return data;
-  } finally {
-    hf?.destroy();
-  }
+function engineSheetValues(hot: Handsontable, path: string): unknown[][] {
+  const engine = getFormulasPlugin(hot)?.engine;
+  const name = pathToSheetName(path);
+  if (!engine || !engine.doesSheetExist(name)) return [];
+  const values = engine.getSheetValues(engine.getSheetId(name)) as unknown[][];
+  return values.map(row => row.map(v =>
+    v != null && typeof v === "object" ? String((v as { value?: unknown }).value ?? "#ERROR!") : v));
 }
 
-/**
- * Like `evaluateClonedRows`, but also registers the given named cell values as
- * HyperFormula named expressions before evaluating — needed by `recalculateWorkbook`
- * so a formula referencing a named cell (e.g. `=NamedRate*1.1`) on a sheet that isn't
- * the live/displayed one still resolves against that name's *current* value, not
- * whatever it was worth the last time this sheet happened to be on screen.
- */
-function evaluateWithNames(data: (string | null)[][], namedValues: Map<string, unknown>): unknown[][] {
-  let hf: HyperFormula | null = null;
-  try {
-    hf = HyperFormula.buildFromArray(dataForHot(data), { licenseKey: "gpl-v3" });
-    for (const [name, value] of namedValues) {
-      try { hf.addNamedExpression(name, namedExprFromValue(value)); } catch { /* invalid/duplicate name — skip */ }
-    }
-    return hf.getSheetValues(0);
-  } catch {
-    return data;
-  } finally {
-    hf?.destroy();
-  }
-}
-
-// The three rollup helpers (rollupRateIntoL2 / rollupQtyIntoL2 / rollupL2IntoL1) and the
-// numeric-coercion helpers (toNum / numOrUndefined / textOrBlank) live in lib/workbookCalc.ts
-// — imported at the top of this file.
-
-/** Looks up a named cell's resolved value by name, case-insensitively — named cells
- *  are user-created and their casing isn't enforced, but the cost-code export's
- *  blended labour rate needs a reliable match on `lab_rate` regardless of how the
- *  estimator capitalized it when creating the named cell (the same tolerance Factor
- *  formulas get from HyperFormula's own case-insensitive name resolution). */
-function resolveNamedNumber(namedValues: Map<string, unknown>, name: string): number | undefined {
+/** A named cell's live value as a number, matching the name case-insensitively — named cells are
+ *  user-created and their casing isn't enforced, but the cost-code export's blended labour rate
+ *  needs a reliable match on `lab_rate` however the estimator capitalized it (the same tolerance
+ *  HyperFormula's own name resolution gives formulas). */
+function engineNamedNumber(hot: Handsontable, name: string): number | undefined {
+  const engine = getFormulasPlugin(hot)?.engine;
+  if (!engine) return undefined;
   const target = name.toLowerCase();
-  for (const [key, value] of namedValues) {
-    if (key.toLowerCase() === target) return numOrUndefined(value);
-  }
-  return undefined;
+  const match = (engine.listNamedExpressions?.() as string[] | undefined)?.find(n => n.toLowerCase() === target);
+  if (match == null) return undefined;
+  try { return numOrUndefined(engine.getNamedExpressionValue(match)); } catch { return undefined; }
 }
+
+// The numeric-coercion helpers (toNum / numOrUndefined / textOrBlank) live in lib/workbookCalc.ts
+// — imported at the top of this file.
 
 /** One output row of the flattened Excel export — see WorkbookGridApi.exportExcel. */
 interface FlatExportRow {
@@ -1367,7 +1301,7 @@ interface FlatExportRow {
 
 // deriveFactorTotal lives in lib/workbookCalc.ts — imported at the top of this file.
 
-/** Build one flattened export row from an evaluated sheet row (see `evaluateClonedRows`). */
+/** Build one flattened export row from an evaluated sheet row (see `engineSheetValues`). */
 function flatExportRowFrom(evaluated: unknown[], sectionCode: string, sectionDesc: string): FlatExportRow {
   const subtotal = numOrUndefined(evaluated[COL_SUBTOTAL]);
   const { factor, total } = deriveFactorTotal(subtotal, numOrUndefined(evaluated[COL_FACTOR]), numOrUndefined(evaluated[COL_TOTAL]));
@@ -1613,6 +1547,9 @@ export function WorkbookView() {
   const activeRevisionId = useAppStore(s => s.activeRevisionId);
   const revIdRef = useRef<number | null>(null);
   revIdRef.current = activeRevisionId;
+  // The revision whose sheet the grid is actually showing: set once a revision's L1 is on screen,
+  // null while a switch is still loading. Autosave targets this, not revIdRef (see flushPendingSave).
+  const displayedRevIdRef = useRef<number | null>(null);
 
   const setWorkbookRevisionProjectTotal = useAppStore(s => s.setWorkbookRevisionProjectTotal);
   const workbooks = useAppStore(s => s.workbooks);
@@ -1939,7 +1876,7 @@ export function WorkbookView() {
     namedCellMap.current.set(name, nc);
     registerNamedExpression(nc);
     try {
-      await invoke("save_workbook_named_cell", {
+      await wbInvoke("save_workbook_named_cell", {
         revisionId: revId, name, sheetPath: path, row, col,
       });
     } catch { /* non-fatal — local binding still works for this session */ }
@@ -1961,7 +1898,7 @@ export function WorkbookView() {
     registeredNamedExprRef.current.delete(name);
     if (revId == null) return;
     try {
-      await invoke("delete_workbook_named_cell", { revisionId: revId, name });
+      await wbInvoke("delete_workbook_named_cell", { revisionId: revId, name });
     } catch { /* non-fatal — local removal still took effect for this session */ }
   }
 
@@ -2006,7 +1943,7 @@ export function WorkbookView() {
   async function ensureSheetLinksLoaded(revisionId: number, path: string): Promise<void> {
     if (loadedLinkPathsRef.current.has(path)) return;
     try {
-      const json = await invoke<string>("load_workbook_sheet_links", { revisionId, sheetPath: path });
+      const json = await wbRead<string>("load_workbook_sheet_links", { revisionId, sheetPath: path });
       const obj = JSON.parse(json) as Record<string, CellLink>;
       const entries = Object.entries(obj);
       if (entries.length > 0) cellLinkMap.current.set(path, new Map(entries));
@@ -2021,7 +1958,7 @@ export function WorkbookView() {
   async function ensureSheetStylesLoaded(revisionId: number, path: string): Promise<void> {
     if (loadedStylePathsRef.current.has(path)) return;
     try {
-      const json = await invoke<string>("load_workbook_sheet_styles", { revisionId, sheetPath: path });
+      const json = await wbRead<string>("load_workbook_sheet_styles", { revisionId, sheetPath: path });
       const obj = JSON.parse(json) as Record<string, CellStyle>;
       const entries = Object.entries(obj);
       if (entries.length > 0) cellStyleMap.current.set(path, new Map(entries));
@@ -2038,7 +1975,7 @@ export function WorkbookView() {
   async function ensureSheetExclusionsLoaded(revisionId: number, path: string): Promise<void> {
     if (loadedExclusionPathsRef.current.has(path)) return;
     try {
-      const json = await invoke<string>("load_workbook_sheet_exclusions", { revisionId, sheetPath: path });
+      const json = await wbRead<string>("load_workbook_sheet_exclusions", { revisionId, sheetPath: path });
       const obj = JSON.parse(json) as Record<string, true>;
       const keys = Object.keys(obj);
       if (keys.length > 0) cellExclusionMap.current.set(path, new Set(keys));
@@ -2053,11 +1990,11 @@ export function WorkbookView() {
     const set = cellExclusionMap.current.get(path);
     const obj: Record<string, true> = {};
     if (set) for (const key of set) obj[key] = true;
-    invoke("save_workbook_sheet_exclusions", {
+    wbWrite("save_workbook_sheet_exclusions", {
       revisionId,
       sheetPath: path,
       exclusionsJson: JSON.stringify(obj),
-    }).catch(() => {/* non-fatal */});
+    });
   }
 
   /** Wraps loadLevelData so that `path`'s persisted exclusion set is loaded and in
@@ -2416,61 +2353,15 @@ export function WorkbookView() {
     }
   }
 
-  /** Moves the standard-layout line items occupying rows `[fromRow..lastRow]` down by
-   *  `by` rows, freeing `[fromRow, fromRow+by)` for new line items without overwriting
-   *  what's there — used when auto-placing "<size> Lintel to last" rows directly below a
-   *  dropped framing group would otherwise collide with existing takeoff rows.
-   *
-   *  Every cell is carried verbatim to its new row, except a plain (non-XSUM) formula has
-   *  its bare same-row cell references renumbered to match (`renumberRowFormula` — the same
-   *  treatment insertBlankRowAt/deleteRowAt give a shifted row). An XSUM formula (F/H when
-   *  drilled, or a hand-typed rollup in I/K/M/O) is left untouched and retargeted separately,
-   *  by cell position, via beforeChange's toStored round-trip once the write lands. Rows that
-   *  would land past the bottom of the fixed `NUM_ROWS` grid are dropped — sheets essentially
-   *  never fill all 100 rows, and losing trailing blank rows is harmless. */
-  function shiftStandardRowsDown(hot: Handsontable, path: string, fromRow: number, lastRow: number, by: number): void {
-    const data = captureSourceData(hot);
-    const cols = hot.countCols();
-
-    isAutoUpdatingRef.current = true;
-    try {
-      const batch: Array<[number, number, string]> = [];
-      for (let r = lastRow; r >= fromRow; r--) {
-        const dest = r + by;
-        if (dest > NUM_ROWS - 1) continue;
-        for (let c = 0; c < cols; c++) {
-          const v = data[r][c] ?? "";
-          batch.push([dest, c, renumberRowFormula(v, r, dest)]);
-        }
-      }
-      // Clear the rows the new line items will occupy — their old contents have
-      // already been copied onward to fromRow+by.. and won't be touched above.
-      for (let r = fromRow; r < fromRow + by; r++) {
-        for (let c = 0; c < cols; c++) batch.push([r, c, ""]);
-      }
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      if (batch.length) hot.setDataAtCell(batch as any);
-    } finally {
-      isAutoUpdatingRef.current = false;
-    }
-
-    shiftRowKeyedEntries(cellLinkMap.current.get(path), fromRow, lastRow + 1, by, cols);
-    shiftRowKeyedEntries(cellStyleMap.current.get(path), fromRow, lastRow + 1, by, cols);
-    shiftRowKeyedSet(cellExclusionMap.current.get(path), fromRow, lastRow + 1, by, cols);
-
-    // Regenerate F/H/J/L/N/P for every row (cheap, idempotent) now that the moved
-    // rows' inputs sit at their new positions.
-    deriveLevelFormulas(hot, levelRef.current, isAutoUpdatingRef, "standard", path, cellExclusionMap.current.get(path));
-  }
-
   /** Inserts plain `Description`/`Quantity`/`Unit` line items directly below `afterRow` on the
    *  current (Level 2) sheet — the framing group's "<size> Lintel to last" rows and a joist/rafter
    *  group's "<size> Blocking" row. A differently-sized sub-quantity is always an independent line
    *  item (never folded into the Quantity Build-up), placed as a plain takeoff-level value since
    *  there's nothing to drill into.
    *
-   *  If existing line items already occupy the rows directly below, shifts them down first
-   *  (formula-safely — see `shiftStandardRowsDown`) rather than overwriting them. */
+   *  If existing line items already occupy the rows directly below, inserts blank rows first
+   *  (`insertBlankRowAt`, so their sub-sheets, links and every reference to them follow) rather
+   *  than overwriting them. */
   function insertSubQuantityRowsBelow(
     hot: Handsontable,
     path: string,
@@ -2487,7 +2378,7 @@ export function WorkbookView() {
       if (isLineItemRow(data[r])) { lastOccupied = r; break; }
     }
     if (lastOccupied !== -1) {
-      shiftStandardRowsDown(hot, path, insertAt, lastOccupied, count);
+      for (let i = 0; i < count; i++) insertBlankRowAt(hot, path, insertAt);
     }
 
     for (let i = 0; i < count; i++) {
@@ -2936,7 +2827,7 @@ export function WorkbookView() {
 
   // Stable grid API exposed to the ribbon for row operations and output actions.
   // Implementation is kept in gridApiImplRef (updated each render) so closures
-  // always see the latest captureSourceData / shiftStandardRowsDown / etc. The
+  // always see the latest captureSourceData / insertBlankRowAt / etc. The
   // stable ref itself just delegates, matching the scheduleSaveRef pattern.
   const gridApiImplRef = useRef({
     addRow: () => {},
@@ -2988,31 +2879,21 @@ export function WorkbookView() {
    *  empty `{}` over the real persisted value, permanently deleting it. This is what wiped a
    *  revision's excluded-cell set on disk. */
   function persistSheet(revisionId: number, path: string, data: (string | null)[][]) {
-    invoke("save_workbook_sheet", {
+    const links = cellLinkMap.current.get(path);
+    const styles = cellStyleMap.current.get(path);
+    const excl = cellExclusionMap.current.get(path);
+    // One transaction for all four blobs; an unloaded blob is sent as null so the backend leaves it alone.
+    wbWrite("save_workbook_sheet_bundle", {
       revisionId,
       sheetPath: path,
       dataJson: JSON.stringify(data),
-    }).catch(() => {/* non-fatal */});
-
-    if (loadedLinkPathsRef.current.has(path)) {
-      const links = cellLinkMap.current.get(path);
-      invoke("save_workbook_sheet_links", {
-        revisionId,
-        sheetPath: path,
-        linksJson: JSON.stringify(links ? Object.fromEntries(links) : {}),
-      }).catch(() => {/* non-fatal */});
-    }
-
-    if (loadedStylePathsRef.current.has(path)) {
-      const styles = cellStyleMap.current.get(path);
-      invoke("save_workbook_sheet_styles", {
-        revisionId,
-        sheetPath: path,
-        stylesJson: JSON.stringify(styles ? Object.fromEntries(styles) : {}),
-      }).catch(() => {/* non-fatal */});
-    }
-
-    if (loadedExclusionPathsRef.current.has(path)) persistSheetExclusions(revisionId, path);
+      linksJson: loadedLinkPathsRef.current.has(path)
+        ? JSON.stringify(links ? Object.fromEntries(links) : {}) : null,
+      stylesJson: loadedStylePathsRef.current.has(path)
+        ? JSON.stringify(styles ? Object.fromEntries(styles) : {}) : null,
+      exclusionsJson: loadedExclusionPathsRef.current.has(path)
+        ? JSON.stringify(excl ? Object.fromEntries(Array.from(excl, k => [k, true])) : {}) : null,
+    });
   }
 
   /**
@@ -3074,18 +2955,51 @@ export function WorkbookView() {
     }
   }
 
+  /** Persist the displayed sheet now if an autosave is still waiting on its debounce. Saves to the
+   *  revision the grid is actually SHOWING (`displayedRevIdRef`), never `revIdRef`: that jumps to a
+   *  newly-selected revision immediately, while the grid keeps showing the old revision's sheet
+   *  until the switch finishes loading — saving by `revIdRef` in that window wrote the old
+   *  revision's sheet over the new revision's L1. */
+  function flushPendingSave() {
+    if (!saveTimerRef.current) return;
+    clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = null;
+    const revId = displayedRevIdRef.current;
+    const hot = hotRef.current?.hotInstance;
+    if (revId == null || !hot || hot.isDestroyed) return;
+    const curPath = pathStack.current[pathStack.current.length - 1];
+    const data = captureSourceData(hot);
+    sheetDataMap.current.set(curPath, data);
+    persistSheet(revId, curPath, data);
+  }
+  const flushPendingSaveRef = useRef(flushPendingSave);
+  flushPendingSaveRef.current = flushPendingSave;
+
+  // Report failed workbook writes in the footer, let project close/open flush a pending autosave,
+  // and flush before the app window closes. A layout effect so its cleanup (flush on unmount) runs
+  // before the grid's own teardown destroys the Handsontable instance it reads from.
+  useLayoutEffect(() => {
+    setWorkbookDbErrorHandler(msg => useAppStore.getState().setWorkbookSaveError(msg));
+    setWorkbookFlushHook(() => flushPendingSaveRef.current());
+    let unlistenClose: (() => void) | undefined;
+    let disposed = false;
+    getCurrentWindow()
+      .onCloseRequested(async () => { await flushWorkbookWrites(); })
+      .then(unlisten => { if (disposed) unlisten(); else unlistenClose = unlisten; })
+      .catch(err => console.error("Could not register workbook close flush:", err));
+    return () => {
+      disposed = true;
+      unlistenClose?.();
+      flushPendingSaveRef.current();
+      setWorkbookFlushHook(null);
+      setWorkbookDbErrorHandler(null);
+    };
+  }, []);
+
   /** Schedule a debounced auto-save of the current sheet. */
   function scheduleSave() {
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
-    saveTimerRef.current = setTimeout(() => {
-      const revId = revIdRef.current;
-      const hot   = hotRef.current?.hotInstance;
-      if (revId == null || !hot) return;
-      const curPath = pathStack.current[pathStack.current.length - 1];
-      const data    = captureSourceData(hot);
-      sheetDataMap.current.set(curPath, data);
-      persistSheet(revId, curPath, data);
-    }, 500);
+    saveTimerRef.current = setTimeout(() => flushPendingSaveRef.current(), 500);
   }
 
   // Expose scheduleSave in a ref so the memoised hotSettings closure can reach it
@@ -3094,93 +3008,192 @@ export function WorkbookView() {
 
   // ── Grid API implementations (updated each render so closures stay fresh) ─
 
+  /** Drops every live engine sheet at `path` or beneath it (a deleted row's build-up sheets). */
+  function removeEngineSubtree(hot: Handsontable, path: string): void {
+    const engine = getFormulasPlugin(hot)?.engine;
+    if (!engine) return;
+    const prefix = `${path}/`;
+    beginBulkSheetLoad(engine);
+    try {
+      for (const name of engine.getSheetNames() as string[]) {
+        const p = sheetNameToPath(name);
+        if (p !== path && !p.startsWith(prefix)) continue;
+        try { engine.removeSheet(engine.getSheetId(name)); } catch { /* already gone */ }
+      }
+    } finally {
+      endBulkSheetLoad(engine);
+    }
+  }
+
   /**
-   * Insert a blank row at `insertAt`, shifting all occupied rows from that
-   * position downward by one. Every cell is carried verbatim to its new row
-   * EXCEPT that a plain (non-XSUM) formula has its bare same-row cell
-   * references renumbered to match — see `renumberRowFormula`. An XSUM formula
-   * (a drilled F/E/C cell, or a hand-typed `=XSUMRATEUSER(1)` in a user column)
-   * is left untouched here and retargeted separately, by cell position, via
-   * `beforeChange`'s toStored round-trip once the write lands.
+   * Moves the drilled sub-sheets (/S, /R, /Q and all their descendants) of rows `[lo..hi]` on cost
+   * sheet `path` by `delta` rows — in the live engine, the in-memory caches, the named-cell map and
+   * the database — after first dropping `deletePaths` (a deleted row's own sub-sheets). Must run
+   * BEFORE the rows themselves move, so the retargeted rollup formulas land on sheets that already
+   * hold the right content.
+   *
+   * The database side is ONE atomic `shift_workbook_subtrees` command, queued behind every earlier
+   * write. It used to be one fire-and-forget rename per row (plus a separate delete), which could
+   * execute out of order: a delete landing after the next row's rename deleted the wrong build-up,
+   * and a rename colliding with a not-yet-moved row failed silently, leaving it behind.
+   */
+  function moveRowSubtrees(
+    hot: Handsontable, path: string, lo: number, hi: number, delta: number, deletePaths: string[],
+  ): void {
+    const prefixes = isCostSheetPath(path) ? ["S", "R", "Q"] : []; // M5: only cost sheets have children
+    if (prefixes.length === 0) return;
+
+    for (const p of deletePaths) {
+      purgeCachedSubtree(p);
+      removeEngineSubtree(hot, p);
+    }
+
+    if (hi >= lo) {
+      // One scan of the engine's sheet names and each cache, not one scan per shifted row — see
+      // planSubtreeRenames' doc comment.
+      let engineNames: string[] = [];
+      try { engineNames = (getFormulasPlugin(hot)?.engine?.getSheetNames() as string[]) ?? []; } catch { /* no engine yet */ }
+      const engineRenames = planSubtreeRenames(engineNames.map(sheetNameToPath), path, prefixes, lo, hi, delta);
+      // Move into an already-vacated slot first: highest row first going down, lowest going up.
+      engineRenames.sort((a, b) => (delta > 0 ? b.row - a.row : a.row - b.row));
+      applySubtreeRenamesToEngine(hot, engineRenames);
+
+      const plan = (keys: Iterable<string>) => planSubtreeRenames(keys, path, prefixes, lo, hi, delta);
+      applySubtreeRenamesToMap(sheetDataMap.current, plan(sheetDataMap.current.keys()), retargetSheetData);
+      applySubtreeRenamesToMap(sheetComputedMap.current, plan(sheetComputedMap.current.keys()));
+      applySubtreeRenamesToMap(cellLinkMap.current, plan(cellLinkMap.current.keys()));
+      applySubtreeRenamesToMap(cellStyleMap.current, plan(cellStyleMap.current.keys()));
+      applySubtreeRenamesToMap(cellExclusionMap.current, plan(cellExclusionMap.current.keys()));
+      applySubtreeRenamesToSet(loadedLinkPathsRef.current, plan(loadedLinkPathsRef.current));
+      applySubtreeRenamesToSet(loadedStylePathsRef.current, plan(loadedStylePathsRef.current));
+      applySubtreeRenamesToSet(loadedExclusionPathsRef.current, plan(loadedExclusionPathsRef.current));
+      // Named cells bound directly to a relocated sub-sheet follow it (scanned off the map's own
+      // paths — a name can be bound to a sub-sheet this session hasn't drilled into yet). The DB
+      // side is covered by shift_workbook_subtrees below.
+      applySubtreeRenamesToNamedCells(
+        namedCellMap.current,
+        plan(Array.from(namedCellMap.current.values(), nc => nc.path)),
+        registerNamedExpression,
+      );
+    }
+
+    const revId = revIdRef.current;
+    if (revId != null && (hi >= lo || deletePaths.length > 0)) {
+      wbWrite("shift_workbook_subtrees", {
+        revisionId: revId, ownerPath: path, prefixes, loRow: lo, hiRow: hi, delta, deletePaths,
+      });
+    }
+  }
+
+  /** Re-points every XSUM* rollup in rows `[from..to]` of the displayed sheet at the child sheet of
+   *  the row it now sits on. A native row insert/delete shifts ordinary cell references for us, but
+   *  a rollup names its child sheet by the row it was drilled from (`L1_sS5!…`), so a moved row's
+   *  rollup must be rebuilt from its new position — the same toStored round-trip `beforeChange`
+   *  applies to a typed or pasted rollup. */
+  function retargetRollupRows(hot: Handsontable, path: string, from: number, to: number): void {
+    const cols = hot.countCols();
+    const writes: Array<[number, number, string]> = [];
+    for (let r = Math.max(0, from); r <= to; r++) {
+      for (let c = 0; c < cols; c++) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const src = (hot as any).getSourceDataAtCell(r, c);
+        if (typeof src !== "string" || src.charAt(0) !== "=" || !/XSUM/i.test(src)) continue;
+        const stored = xsumToStored(xsumToDisplay(src), path, r);
+        if (stored !== src) writes.push([r, c, stored]);
+      }
+    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    if (writes.length) hot.setDataAtCell(writes as any);
+  }
+
+  /** After a native row insert/delete on `path`, HyperFormula has adjusted the parent's rollup range
+   *  into this sheet like any other reference — and inserting above row 1 turns `H1:H1000` into
+   *  `H2:H1001`, dropping the new top row from the parent's total. A rollup always means the
+   *  child's whole column, so rebuild the parent row's XSUM* references in canonical form. */
+  function canonicalizeParentRollups(hot: Handsontable, path: string): void {
+    const row = pathLastRow(path);
+    const parentPath = path.slice(0, path.lastIndexOf("/"));
+    const engine = getFormulasPlugin(hot)?.engine;
+    const parentName = pathToSheetName(parentPath);
+    if (row == null || !parentPath || !engine || !engine.doesSheetExist(parentName)) return;
+    const sheet = engine.getSheetId(parentName);
+    const cached = sheetDataMap.current.get(parentPath);
+    let changed = false;
+    const width = engine.getSheetDimensions(sheet).width as number;
+    for (let col = 0; col < width; col++) {
+      const src = engine.getCellSerialized({ sheet, row, col });
+      if (typeof src !== "string" || src.charAt(0) !== "=" || !/XSUM/i.test(src)) continue;
+      const canonical = xsumToStored(xsumToDisplay(src), parentPath, row);
+      if (canonical === src) continue;
+      engine.setCellContents({ sheet, row, col }, [[canonical]]);
+      if (cached?.[row]) cached[row][col] = canonical;
+      changed = true;
+    }
+    const revId = revIdRef.current;
+    if (changed && cached && revId != null) persistSheet(revId, parentPath, cached);
+  }
+
+  /** A native row insert/delete on `path` makes HyperFormula rewrite references to it in OTHER
+   *  sheets too (a parent's rollup range, a hand-typed cross-sheet reference). Only the edited sheet
+   *  goes through autosave, so persist every other sheet whose formulas mention it and whose engine
+   *  content no longer matches its cached copy — otherwise the file keeps the pre-shift text and
+   *  the workbook recalculates differently after a reopen than it did in the session. */
+  function persistSheetsReferencing(hot: Handsontable, path: string): void {
+    const engine = getFormulasPlugin(hot)?.engine;
+    const revId = revIdRef.current;
+    if (!engine || revId == null) return;
+    const needle = `${pathToSheetName(path)}!`;
+    for (const [otherPath, cached] of sheetDataMap.current) {
+      if (otherPath === path) continue;
+      if (!cached.some(row => row.some(cell => typeof cell === "string" && cell.includes(needle)))) continue;
+      const name = pathToSheetName(otherPath);
+      if (!engine.doesSheetExist(name)) continue;
+      const serialized = engine.getSheetSerialized(engine.getSheetId(name)) as unknown[][];
+      let changed = false;
+      const next = cached.map((row, r) => row.map((cell, c) => {
+        const v = serialized[r]?.[c];
+        const text = v == null || v === "" ? null : String(v);
+        if (text !== cell) changed = true;
+        return text;
+      }));
+      if (!changed) continue;
+      sheetDataMap.current.set(otherPath, next);
+      persistSheet(revId, otherPath, next);
+    }
+  }
+
+  /**
+   * Insert a blank row at `insertAt`, shifting every row below it down by one.
+   *
+   * Done as a NATIVE grid row insert, so HyperFormula adjusts every reference to the moved rows —
+   * on this sheet, on every other sheet, and in named expressions — and grows any range spanning
+   * the insert point, exactly as Excel does. (This used to copy cell text down a row by hand and
+   * only renumber a formula's references to its own row, so a total like `=SUM(H1:H20)`, a
+   * reference from another row, or one from another sheet kept pointing at the old row numbers and
+   * totals silently went wrong.) The grid's bottom row is trimmed afterwards to keep the shared
+   * row count; if that row holds content the grid is grown first so nothing falls off.
    */
   function insertBlankRowAt(hot: Handsontable, path: string, insertAt: number): void {
-    const data = captureSourceData(hot);
+    let data = captureSourceData(hot);
+    if (isLineItemRow(data[NUM_ROWS - 1])) {
+      growRowsTo(hot, NUM_ROWS + ROW_GROWTH_CHUNK);
+      data = captureSourceData(hot);
+    }
     const cols = hot.countCols();
     let lastOccupied = -1;
     for (let r = NUM_ROWS - 1; r >= insertAt; r--) {
       if (isLineItemRow(data[r])) { lastOccupied = r; break; }
     }
 
-    // Move every shifted row's own sub-sheets — live engine, in-memory caches, and the DB —
-    // BEFORE the row data itself moves. A moved row's own drilled-reference formula (F's
-    // =XSUMTOT(...), or I/K/M/O's =XSUMRATEUSER(...)) gets retargeted at its new row the instant
-    // the batch write below lands (beforeChange's toStored round-trip), so the live sheet it
-    // will point at must already hold the right content under that new name by then.
-    // At Level 1 sub-sheets are "<path>/R{r}"; at Level 2 also "<path>/Q{r}".
-    const subPrefixes = isCostSheetPath(path) ? ["S", "R", "Q"] : []; // M5: cost sheets carry S/R/Q children
-    if (lastOccupied >= insertAt && subPrefixes.length > 0) {
-      // One scan of the engine's sheet names and each cache, not one scan per shifted row — see
-      // planSubtreeRenames' doc comment for why the old per-row version got quadratically slower.
-      let engineNames: string[] = [];
-      try { engineNames = (getFormulasPlugin(hot)?.engine?.getSheetNames() as string[]) ?? []; } catch { /* no engine yet */ }
-      const engineRenames = planSubtreeRenames(
-        engineNames.map(sheetNameToPath), path, subPrefixes, insertAt, lastOccupied, 1,
-      );
-      // Down-shift: move the highest row first so a destination is never an unprocessed source.
-      engineRenames.sort((a, b) => b.row - a.row);
-      applySubtreeRenamesToEngine(hot, engineRenames);
-
-      const cacheRenames = (map: Iterable<string>) => planSubtreeRenames(map, path, subPrefixes, insertAt, lastOccupied, 1);
-      applySubtreeRenamesToMap(sheetDataMap.current, cacheRenames(sheetDataMap.current.keys()));
-      applySubtreeRenamesToMap(sheetComputedMap.current, cacheRenames(sheetComputedMap.current.keys()));
-      applySubtreeRenamesToMap(cellLinkMap.current, cacheRenames(cellLinkMap.current.keys()));
-      applySubtreeRenamesToMap(cellStyleMap.current, cacheRenames(cellStyleMap.current.keys()));
-      applySubtreeRenamesToMap(cellExclusionMap.current, cacheRenames(cellExclusionMap.current.keys()));
-      applySubtreeRenamesToSet(loadedLinkPathsRef.current, cacheRenames(loadedLinkPathsRef.current));
-      applySubtreeRenamesToSet(loadedStylePathsRef.current, cacheRenames(loadedStylePathsRef.current));
-      applySubtreeRenamesToSet(loadedExclusionPathsRef.current, cacheRenames(loadedExclusionPathsRef.current));
-      // Named cells bound directly to one of the relocated sub-sheets (not the parent row that
-      // owns it) — scanned off the named-cell map's own paths, not the live engine's sheet list,
-      // since a named cell can be bound to a sub-sheet the session hasn't drilled into yet.
-      applySubtreeRenamesToNamedCells(
-        namedCellMap.current,
-        cacheRenames(Array.from(namedCellMap.current.values(), nc => nc.path)),
-        registerNamedExpression,
-      );
-
-      // Persist the path renames to SQLite (bottom-up; fire-and-forget). Covers
-      // workbook_named_cells too (see rename_workbook_sheet_subtree), so the named-cell fix
-      // above only needs to fix the in-memory map/live registration, not re-persist.
-      const revId = revIdRef.current;
-      if (revId != null) {
-        for (let r = lastOccupied; r >= insertAt; r--) {
-          for (const prefix of subPrefixes) {
-            const oldSub = `${path}/${prefix}${r}`;
-            const newSub = `${path}/${prefix}${r + 1}`;
-            invoke("rename_workbook_sheet_subtree", {
-              revisionId: revId, oldPath: oldSub, newPath: newSub,
-            }).catch(() => {/* non-fatal */});
-          }
-        }
-      }
-    }
+    if (lastOccupied >= insertAt) moveRowSubtrees(hot, path, insertAt, lastOccupied, 1, []);
 
     isAutoUpdatingRef.current = true;
     try {
-      const batch: Array<[number, number, string]> = [];
-      if (lastOccupied >= insertAt) {
-        for (let r = lastOccupied; r >= insertAt; r--) {
-          const dest = r + 1;
-          if (dest > NUM_ROWS - 1) continue;
-          for (let c = 0; c < cols; c++) {
-            const v = data[r][c] ?? "";
-            batch.push([dest, c, renumberRowFormula(v, r, dest)]);
-          }
-        }
-      }
-      for (let c = 0; c < cols; c++) batch.push([insertAt, c, ""]);
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      if (batch.length) hot.setDataAtCell(batch as any);
+      hot.alter("insert_row_above", insertAt, 1);
+      hot.alter("remove_row", hot.countRows() - 1, 1); // trim back to the shared row count
+      if (lastOccupied >= insertAt) retargetRollupRows(hot, path, insertAt + 1, lastOccupied + 1);
+      canonicalizeParentRollups(hot, path);
+      persistSheetsReferencing(hot, path);
     } finally {
       isAutoUpdatingRef.current = false;
     }
@@ -3194,9 +3207,9 @@ export function WorkbookView() {
       registerNamedExpression(nc);
       const revId = revIdRef.current;
       if (revId != null) {
-        invoke("save_workbook_named_cell", {
+        wbWrite("save_workbook_named_cell", {
           revisionId: revId, name: nc.name, sheetPath: nc.path, row: nc.row, col: nc.col,
-        }).catch(() => {/* non-fatal */});
+        });
       }
     }
 
@@ -3206,22 +3219,21 @@ export function WorkbookView() {
       shiftRowKeyedSet(cellExclusionMap.current.get(path), insertAt, lastOccupied + 1, 1, cols);
     }
 
-    // Regenerate row-relative formula cells at their new positions — only the band that actually
-    // moved (each row's F/G/H depends solely on its own C/E, never a neighbour's), not the whole
-    // sheet: this used to rescan all NUM_ROWS on every single insert regardless of shift size.
+    // Regenerate row-relative formula cells for the band that moved (each row's F/G/H depends
+    // solely on its own C/E, never a neighbour's).
     deriveLevelFormulas(
       hot, levelRef.current, isAutoUpdatingRef, sheetKindForPath(path), path, cellExclusionMap.current.get(path),
       { from: insertAt, to: Math.min(Math.max(insertAt, lastOccupied + 1), NUM_ROWS - 1) },
     );
+    scheduleSaveRef.current();
   }
 
   /**
-   * Delete the row at `deleteAt`, shifting every row below it up by one and
-   * clearing the vacated last row — the mirror image of `insertBlankRowAt`.
-   * The deleted row's own sub-sheets (Rate/Quantity Build-up, if any) are
-   * permanently removed via `delete_workbook_sheet_subtree`; callers are
-   * expected to confirm with the user first when the row holds real content
-   * (see handleGridContextMenu).
+   * Delete the row at `deleteAt`, shifting every row below it up by one — the mirror image of
+   * `insertBlankRowAt`, and likewise a native grid operation so every reference follows (a
+   * reference to the deleted row itself becomes #REF!, as in Excel). The deleted row's own
+   * sub-sheets are permanently removed; callers confirm with the user first when the row holds
+   * real content (see handleGridContextMenu).
    */
   function deleteRowAt(hot: Handsontable, path: string, deleteAt: number): void {
     const data = captureSourceData(hot);
@@ -3231,18 +3243,8 @@ export function WorkbookView() {
       if (isLineItemRow(data[r])) { lastOccupied = r; break; }
     }
 
-    const subPrefixes = isCostSheetPath(path) ? ["S", "R", "Q"] : []; // M5: cost sheets carry S/R/Q children
-    const revId = revIdRef.current;
-
-    // Permanently remove the deleted row's own sub-sheets before anything else
-    // shifts into its slot — mirrors pruneOrphansUnder's cleanup of a cleared line item.
-    for (const prefix of subPrefixes) {
-      const deletedSub = `${path}/${prefix}${deleteAt}`;
-      purgeCachedSubtree(deletedSub);
-      if (revId != null) {
-        invoke("delete_workbook_sheet_subtree", { revisionId: revId, sheetPath: deletedSub }).catch(() => {/* non-fatal */});
-      }
-    }
+    const deletePaths = isCostSheetPath(path) ? ["S", "R", "Q"].map(p => `${path}/${p}${deleteAt}`) : [];
+    moveRowSubtrees(hot, path, deleteAt + 1, lastOccupied, -1, deletePaths);
 
     // Drop this row's own link/style/exclusion entries — the row is gone, not shifted.
     const linkMap  = cellLinkMap.current.get(path);
@@ -3254,77 +3256,19 @@ export function WorkbookView() {
       exclSet?.delete(styleKey(deleteAt, c));
     }
 
-    // Move every row-above's sub-sheets — live engine, in-memory caches, and the DB — BEFORE
-    // the row data itself moves. See insertBlankRowAt's matching comment: the retargeted
-    // drilled-reference formula (from beforeChange's toStored round-trip) must resolve against
-    // an already-moved live sheet the instant the batch write below lands.
-    if (lastOccupied >= deleteAt && subPrefixes.length > 0) {
-      // One scan of the engine's sheet names and each cache, not one scan per shifted row — see
-      // planSubtreeRenames' doc comment for why the old per-row version got quadratically slower.
-      let engineNames: string[] = [];
-      try { engineNames = (getFormulasPlugin(hot)?.engine?.getSheetNames() as string[]) ?? []; } catch { /* no engine yet */ }
-      const engineRenames = planSubtreeRenames(
-        engineNames.map(sheetNameToPath), path, subPrefixes, deleteAt + 1, lastOccupied, -1,
-      );
-      // Up-shift: move the lowest row first so a destination is never an unprocessed source.
-      engineRenames.sort((a, b) => a.row - b.row);
-      applySubtreeRenamesToEngine(hot, engineRenames);
-
-      const cacheRenames = (map: Iterable<string>) => planSubtreeRenames(map, path, subPrefixes, deleteAt + 1, lastOccupied, -1);
-      applySubtreeRenamesToMap(sheetDataMap.current, cacheRenames(sheetDataMap.current.keys()));
-      applySubtreeRenamesToMap(sheetComputedMap.current, cacheRenames(sheetComputedMap.current.keys()));
-      applySubtreeRenamesToMap(cellLinkMap.current, cacheRenames(cellLinkMap.current.keys()));
-      applySubtreeRenamesToMap(cellStyleMap.current, cacheRenames(cellStyleMap.current.keys()));
-      applySubtreeRenamesToMap(cellExclusionMap.current, cacheRenames(cellExclusionMap.current.keys()));
-      applySubtreeRenamesToSet(loadedLinkPathsRef.current, cacheRenames(loadedLinkPathsRef.current));
-      applySubtreeRenamesToSet(loadedStylePathsRef.current, cacheRenames(loadedStylePathsRef.current));
-      applySubtreeRenamesToSet(loadedExclusionPathsRef.current, cacheRenames(loadedExclusionPathsRef.current));
-      // See insertBlankRowAt's matching comment — named cells bound to a relocated sub-sheet
-      // follow it; the DB side is already covered by rename_workbook_sheet_subtree below.
-      applySubtreeRenamesToNamedCells(
-        namedCellMap.current,
-        cacheRenames(Array.from(namedCellMap.current.values(), nc => nc.path)),
-        registerNamedExpression,
-      );
-
-      if (revId != null) {
-        for (let r = deleteAt + 1; r <= lastOccupied; r++) {
-          for (const prefix of subPrefixes) {
-            const oldSub = `${path}/${prefix}${r}`;
-            const newSub = `${path}/${prefix}${r - 1}`;
-            invoke("rename_workbook_sheet_subtree", {
-              revisionId: revId, oldPath: oldSub, newPath: newSub,
-            }).catch(() => {/* non-fatal */});
-          }
-        }
-      }
-    }
-
     isAutoUpdatingRef.current = true;
     try {
-      const batch: Array<[number, number, string]> = [];
-      // See insertBlankRowAt's matching comment: a plain (non-XSUM) formula has its bare
-      // same-row cell references renumbered to follow the row; an XSUM formula is left
-      // untouched and retargeted separately via beforeChange.
-      if (lastOccupied >= deleteAt) {
-        for (let r = deleteAt + 1; r <= lastOccupied; r++) {
-          const dest = r - 1;
-          for (let c = 0; c < cols; c++) {
-            const v = data[r][c] ?? "";
-            batch.push([dest, c, renumberRowFormula(v, r, dest)]);
-          }
-        }
-        for (let c = 0; c < cols; c++) batch.push([lastOccupied, c, ""]);
-      } else {
-        for (let c = 0; c < cols; c++) batch.push([deleteAt, c, ""]);
-      }
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      if (batch.length) hot.setDataAtCell(batch as any);
+      hot.alter("remove_row", deleteAt, 1);
+      hot.alter("insert_row_below", hot.countRows() - 1, 1); // pad back to the shared row count
+      if (lastOccupied > deleteAt) retargetRollupRows(hot, path, deleteAt, lastOccupied - 1);
+      canonicalizeParentRollups(hot, path);
+      persistSheetsReferencing(hot, path);
     } finally {
       isAutoUpdatingRef.current = false;
     }
 
     // Named cells bound to the deleted row are gone; ones below shift up by one.
+    const revId = revIdRef.current;
     for (const nc of Array.from(namedCellMap.current.values())) {
       if (nc.path !== path) continue;
       if (nc.row === deleteAt) { void removeNamedCell(nc.name); continue; }
@@ -3332,9 +3276,9 @@ export function WorkbookView() {
       nc.row -= 1;
       registerNamedExpression(nc);
       if (revId != null) {
-        invoke("save_workbook_named_cell", {
+        wbWrite("save_workbook_named_cell", {
           revisionId: revId, name: nc.name, sheetPath: nc.path, row: nc.row, col: nc.col,
-        }).catch(() => {/* non-fatal */});
+        });
       }
     }
 
@@ -3349,34 +3293,34 @@ export function WorkbookView() {
       hot, levelRef.current, isAutoUpdatingRef, sheetKindForPath(path), path, cellExclusionMap.current.get(path),
       { from: deleteAt, to: Math.max(deleteAt, lastOccupied) },
     );
+    scheduleSaveRef.current();
+  }
+
+  /** Re-applies this sheet's column headers/widths after a column insert/delete changed its count. */
+  function refreshColumnChrome(hot: Handsontable, path: string): void {
+    const cols = hot.countCols();
+    const base = layoutColumnsFor(sheetKindForPath(path));
+    hot.updateSettings({ colHeaders: buildColHeaders(base, cols), colWidths: buildColWidths(base, cols) });
   }
 
   /**
-   * Insert a blank column at `insertAt` (must be >= BASE_NUMERIC_COL_COUNT — A–P
-   * are structural and never shift). Grows the current sheet's column count by
-   * one first (via growColsTo) so nothing at the right edge is lost, then shifts
-   * columns [insertAt..] right by one, mirroring insertBlankRowAt.
+   * Insert a blank column at `insertAt` (must be >= BASE_NUMERIC_COL_COUNT — A–P are structural
+   * and never shift). A native grid column insert, so every formula referencing a moved column
+   * follows it; the sheet grows by one column.
    */
   function insertBlankColAt(hot: Handsontable, path: string, insertAt: number): void {
     if (insertAt < BASE_NUMERIC_COL_COUNT) return;
-    const targetCols = hot.countCols() + 1;
-    growColsTo(hot, targetCols);
-    const cols = hot.countCols();
     const rows = NUM_ROWS;
-    const data = captureSourceData(hot);
 
     isAutoUpdatingRef.current = true;
     try {
-      const batch: Array<[number, number, string]> = [];
-      for (let c = cols - 2; c >= insertAt; c--) {
-        for (let r = 0; r < rows; r++) batch.push([r, c + 1, data[r][c] ?? ""]);
-      }
-      for (let r = 0; r < rows; r++) batch.push([r, insertAt, ""]);
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      if (batch.length) hot.setDataAtCell(batch as any);
+      hot.alter("insert_col_start", insertAt, 1);
     } finally {
       isAutoUpdatingRef.current = false;
     }
+    refreshColumnChrome(hot, path);
+    const cols = hot.countCols();
+    sheetDataMap.current.set(path, captureSourceData(hot));
 
     for (const nc of namedCellMap.current.values()) {
       if (nc.path !== path || nc.col < insertAt) continue;
@@ -3384,26 +3328,27 @@ export function WorkbookView() {
       registerNamedExpression(nc);
       const revId = revIdRef.current;
       if (revId != null) {
-        invoke("save_workbook_named_cell", {
+        wbWrite("save_workbook_named_cell", {
           revisionId: revId, name: nc.name, sheetPath: nc.path, row: nc.row, col: nc.col,
-        }).catch(() => {/* non-fatal */});
+        });
       }
     }
 
     shiftColKeyedEntries(cellLinkMap.current.get(path), insertAt, cols - 1, 1, rows, cols);
     shiftColKeyedEntries(cellStyleMap.current.get(path), insertAt, cols - 1, 1, rows, cols);
     shiftColKeyedSet(cellExclusionMap.current.get(path), insertAt, cols - 1, 1, rows, cols);
+    scheduleSaveRef.current();
   }
 
   /**
-   * Delete the column at `deleteAt` (must be >= BASE_NUMERIC_COL_COUNT). Shifts
-   * every column to its right left by one and clears the vacated rightmost column.
+   * Delete the column at `deleteAt` (must be >= BASE_NUMERIC_COL_COUNT). A native grid column
+   * delete (references follow; a reference to the deleted column becomes #REF!), with a blank
+   * column re-added on the right so the sheet keeps its width.
    */
   function deleteColAt(hot: Handsontable, path: string, deleteAt: number): void {
     if (deleteAt < BASE_NUMERIC_COL_COUNT) return;
     const cols = hot.countCols();
     const rows = NUM_ROWS;
-    const data = captureSourceData(hot);
 
     const linkMap  = cellLinkMap.current.get(path);
     const styleMap = cellStyleMap.current.get(path);
@@ -3416,16 +3361,13 @@ export function WorkbookView() {
 
     isAutoUpdatingRef.current = true;
     try {
-      const batch: Array<[number, number, string]> = [];
-      for (let c = deleteAt + 1; c < cols; c++) {
-        for (let r = 0; r < rows; r++) batch.push([r, c - 1, data[r][c] ?? ""]);
-      }
-      for (let r = 0; r < rows; r++) batch.push([r, cols - 1, ""]);
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      if (batch.length) hot.setDataAtCell(batch as any);
+      hot.alter("remove_col", deleteAt, 1);
+      hot.alter("insert_col_end", cols - 2, 1);
     } finally {
       isAutoUpdatingRef.current = false;
     }
+    refreshColumnChrome(hot, path);
+    sheetDataMap.current.set(path, captureSourceData(hot));
 
     for (const nc of Array.from(namedCellMap.current.values())) {
       if (nc.path !== path) continue;
@@ -3435,15 +3377,16 @@ export function WorkbookView() {
       registerNamedExpression(nc);
       const revId = revIdRef.current;
       if (revId != null) {
-        invoke("save_workbook_named_cell", {
+        wbWrite("save_workbook_named_cell", {
           revisionId: revId, name: nc.name, sheetPath: nc.path, row: nc.row, col: nc.col,
-        }).catch(() => {/* non-fatal */});
+        });
       }
     }
 
     shiftColKeyedEntries(cellLinkMap.current.get(path), deleteAt + 1, cols, -1, rows, cols);
     shiftColKeyedEntries(cellStyleMap.current.get(path), deleteAt + 1, cols, -1, rows, cols);
     shiftColKeyedSet(cellExclusionMap.current.get(path), deleteAt + 1, cols, -1, rows, cols);
+    scheduleSaveRef.current();
   }
 
   gridApiImplRef.current = {
@@ -3505,18 +3448,18 @@ export function WorkbookView() {
       // rows ARE that level, with no separate grouping columns.
       const includeSectionCols = levels.l1 && levels.l2;
 
-      // A Factor formula like `=1+margin_pct/100` references a named cell — evaluate
-      // against resolved named values (not the plain evaluateClonedRows) or HyperFormula
-      // can't resolve the name and the cell silently reads as blank/zero.
-      const namedValues = await resolveNamedValues(revId);
-
+      // Values come from the live engine, which holds every sheet of the revision — so a rollup
+      // (`=XSUMTOT(L1_sS3!…)`), a cross-sheet reference or a named cell (`=1+margin_pct/100`)
+      // exports exactly the figure shown on screen. (This used to re-evaluate each sheet alone in a
+      // throwaway engine, where every rollup's child sheet was missing: rolled-up Subtotals, Rates
+      // and Quantities exported blank or wrong.)
       const l1Source = await fetchSheetSourceData(revId, "L1");
-      const l1Evaluated = evaluateWithNames(l1Source, namedValues);
+      const l1Evaluated = engineSheetValues(hot, "L1");
 
       const flatRows: FlatExportRow[] = [];
       for (let row = 0; row < NUM_ROWS; row++) {
         if (!isLineItemRow(l1Source[row])) continue;
-        const sectionEval = l1Evaluated[row] as unknown[];
+        const sectionEval = l1Evaluated[row] ?? [];
         const sectionCode = textOrBlank(sectionEval[COL_CODE]);
         const sectionDesc = textOrBlank(sectionEval[COL_DESC]);
 
@@ -3545,9 +3488,9 @@ export function WorkbookView() {
           flatRows.push({ sectionCode, sectionDesc, code: "", desc: "", unit: "", rowKind: "header" });
         }
 
-        const childEvaluated = evaluateWithNames(childSource, namedValues);
+        const childEvaluated = engineSheetValues(hot, childPath);
         for (const cr of childLineRows) {
-          flatRows.push(flatExportRowFrom(childEvaluated[cr] as unknown[], sectionCode, sectionDesc));
+          flatRows.push(flatExportRowFrom(childEvaluated[cr] ?? [], sectionCode, sectionDesc));
         }
 
         if (includeSectionCols) {
@@ -3572,7 +3515,7 @@ export function WorkbookView() {
 
       // The blended $/hr labour rate for the cost-code export's TOTAL Labour formula —
       // same resolution mechanism Factor formulas use for names like `margin_pct`.
-      const labRate = levels.costCodes ? resolveNamedNumber(namedValues, "lab_rate") : undefined;
+      const labRate = levels.costCodes ? engineNamedNumber(hot, "lab_rate") : undefined;
 
       const filePath = await saveDialog({
         defaultPath: "workbook.xlsx",
@@ -3656,6 +3599,12 @@ export function WorkbookView() {
   // ── Load root sheet when active revision changes ───────────────────────
 
   useEffect(() => {
+    // Land any edit still waiting on the autosave debounce into the revision it was made in — the
+    // grid still shows that revision's sheet at this point — then stop autosaving until the new
+    // revision is on screen.
+    flushPendingSaveRef.current();
+    displayedRevIdRef.current = null;
+
     const revId = activeRevisionId;
     if (revId == null) return;
 
@@ -3727,11 +3676,12 @@ export function WorkbookView() {
         loadLevelDataExcl(hot, map.get("L1")!, 1, isAutoUpdatingRef, "L1");
         mark("loadLevelDataExcl(L1)", t);
       }
+      displayedRevIdRef.current = revId;
       syncSheetLinks("L1");
     };
     const registerNamedCells = () => {
       const t0 = performance.now();
-      return invoke<string>("load_workbook_named_cells", { revisionId: revId })
+      return wbRead<string>("load_workbook_named_cells", { revisionId: revId })
         .then(json => {
           mark("invoke load_workbook_named_cells", t0);
           if (isStale()) return; // a newer switch has already taken over — don't clobber it
@@ -3747,7 +3697,7 @@ export function WorkbookView() {
     };
 
     const invokeStartedAt = performance.now();
-    invoke<string>("load_workbook_all_sheets", { revisionId: revId })
+    wbRead<string>("load_workbook_all_sheets", { revisionId: revId })
       .then(async json => {
         mark("invoke load_workbook_all_sheets", invokeStartedAt);
         const parseStartedAt = performance.now();
@@ -3901,7 +3851,7 @@ export function WorkbookView() {
     if (sheetDataMap.current.has(newPath)) {
       requestAnimationFrame(() => display(sheetDataMap.current.get(newPath)!));
     } else if (revId != null) {
-      invoke<string>("load_workbook_sheet", { revisionId: revId, sheetPath: newPath })
+      wbRead<string>("load_workbook_sheet", { revisionId: revId, sheetPath: newPath })
         .then(json => {
           if (!json || json === "[]") { seedNewSheet(); return; }
           let data: (string | null)[][];
@@ -4018,70 +3968,17 @@ export function WorkbookView() {
     const cached = sheetDataMap.current.get(path);
     if (cached) return padRowsTo(cached, NUM_ROWS);
     try {
-      const json = await invoke<string>("load_workbook_sheet", { revisionId, sheetPath: path });
+      const json = await wbRead<string>("load_workbook_sheet", { revisionId, sheetPath: path });
       return padData(JSON.parse(json) as (string | null)[][]);
     } catch {
       return createEmptyData();
     }
   }
 
-  /** Like `fetchSheetSourceData`, but returns `null` when the sheet has never been
-   *  created (no persisted row) instead of an empty grid — used by `recalculateWorkbook`
-   *  to tell "no build-up sheet exists here, leave the parent's manually-entered value
-   *  alone" apart from "a real build-up sheet exists and is currently empty" (which
-   *  should roll up as zero/blank, same as `drillUp` already does). */
-  async function fetchSheetForRecalc(revisionId: number, path: string): Promise<(string | null)[][] | null> {
-    const cached = sheetDataMap.current.get(path);
-    if (cached) return padRowsTo(cached, NUM_ROWS);
-    try {
-      const json = await invoke<string>("load_workbook_sheet", { revisionId, sheetPath: path });
-      if (!json || json === "[]") return null;
-      return padData(JSON.parse(json) as (string | null)[][]);
-    } catch {
-      return null;
-    }
-  }
-
   /**
-   * Resolves every named cell's current true value by evaluating its bound sheet's own
-   * formulas — two passes so a named cell whose formula references another named cell
-   * settles to a stable value. Shared by `recalculateWorkbook` and `exportExcel`: both
-   * need every sheet's formulas evaluated with live named-cell values, since only one
-   * sheet is ever loaded into HyperFormula's "Sheet1" at a time (see the module doc
-   * comment above `evaluateClonedRows`), so a formula on a sheet other than the one
-   * currently displayed can't resolve a name like `margin_pct` without this.
-   */
-  async function resolveNamedValues(revisionId: number): Promise<Map<string, unknown>> {
-    const namedValues = new Map<string, unknown>();
-    for (const nc of namedCellMap.current.values()) namedValues.set(nc.name, 0);
-    for (let pass = 0; pass < 2; pass++) {
-      for (const nc of namedCellMap.current.values()) {
-        const data = (await fetchSheetForRecalc(revisionId, nc.path)) ?? createEmptyData();
-        const computed = evaluateWithNames(data, namedValues);
-        // Cache the full evaluated snapshot too — readCellValue() (used when this
-        // sheet's cells are later referenced by name from wherever the user is
-        // currently viewing) falls back to it instead of an un-evaluated formula string.
-        sheetComputedMap.current.set(nc.path, computed);
-        namedValues.set(nc.name, computed[nc.row]?.[nc.col] ?? null);
-      }
-    }
-    return namedValues;
-  }
-
-  /**
-   * Recalculate the whole workbook: re-evaluates every sheet's formulas against
-   * every named cell's *current* value, then re-runs the same rollup drillUp would
-   * apply at every parent/child boundary — without requiring the user to physically
-   * drill into and back out of every sheet.
-   *
-   * Why this is needed: only one sheet is ever loaded into HyperFormula's "Sheet1"
-   * at a time (see the module doc comment above `evaluateClonedRows`). A named cell
-   * bound to a *different* sheet is registered as a frozen literal snapshot of its
-   * last-known value (`namedExprFormula`), refreshed only when that sheet becomes
-   * active. Editing a named cell therefore only live-updates formulas on the sheet
-   * you're currently viewing — every other sheet's `=NamedRate*1.1`-style formula,
-   * and every rollup literal (E:Rate/C:Quantity/F:Subtotal/I-P) baked from one, stays
-   * stale until visited. This walks the whole L1→L2→L3 tree bottom-up and fixes it.
+   * Recalculate the whole workbook: persists the displayed sheet, then forces the live engine
+   * (which holds every sheet of the revision) to rebuild and re-evaluate, and repaints. Rollups and
+   * named cells are live formulas, so this is only a manual safety net.
    */
   async function recalculateWorkbook(): Promise<void> {
     const hot = hotRef.current?.hotInstance;
@@ -4150,7 +4047,7 @@ export function WorkbookView() {
       const sChild = `${path}/S${r}`;
       if (!isLineItemRow(data[r])) {
         for (const child of [sChild, `${path}/R${r}`, `${path}/Q${r}`]) {
-          const n = await invoke<number>("delete_workbook_sheet_subtree", { revisionId, sheetPath: child });
+          const n = await wbInvoke<number>("delete_workbook_sheet_subtree", { revisionId, sheetPath: child });
           if (n > 0) removed.push(child);
         }
       } else {
@@ -4221,7 +4118,7 @@ export function WorkbookView() {
     if (!srcData) {
       if (revId == null) return;
       try {
-        const json = await invoke<string>("load_workbook_sheet", { revisionId: revId, sheetPath: srcPath });
+        const json = await wbRead<string>("load_workbook_sheet", { revisionId: revId, sheetPath: srcPath });
         if (!json || json === "[]") return;
         srcData = padData(JSON.parse(json) as (string | null)[][]);
       } catch {
@@ -4238,7 +4135,7 @@ export function WorkbookView() {
     // first, so the clone is fully independent of any prior content there.
     purgeCachedSubtree(dstPath);
     if (revId != null) {
-      invoke("delete_workbook_sheet_subtree", { revisionId: revId, sheetPath: dstPath }).catch(() => {/* non-fatal */});
+      wbWrite("delete_workbook_sheet_subtree", { revisionId: revId, sheetPath: dstPath });
     }
 
     const cloned = cloneSheetData(srcData);
@@ -4265,14 +4162,8 @@ export function WorkbookView() {
     // `cloneSheetData` copies cell text verbatim, and (unlike a normal grid paste) nothing
     // here goes through beforeChange's toStored round-trip to fix that up on its own.
     if (isCostSheetPath(srcPath)) {
-      const oldPrefix = pathToSheetName(srcPath);
-      const newPrefix = pathToSheetName(dstPath);
-      const retarget = (cellText: string | null): string | null => {
-        if (typeof cellText !== "string" || cellText.charAt(0) !== "=" || !/XSUM/i.test(cellText)) return cellText;
-        return cellText.replace(new RegExp(`${oldPrefix}(?=[_!])`, "g"), newPrefix);
-      };
       for (const row of cloned) {
-        for (let c = 0; c < row.length; c++) row[c] = retarget(row[c]);
+        for (let c = 0; c < row.length; c++) row[c] = retargetSheetRefs(row[c], srcPath, dstPath);
       }
       // Every row, not just ones that "look like" a real line item (isLineItemRow only checks
       // Code/Description) — a template row can be a pure formula/rate holder with neither, so
@@ -4396,7 +4287,7 @@ export function WorkbookView() {
 
     const revId = revIdRef.current;
     if (revId != null) {
-      invoke<string>("load_workbook_sheet", { revisionId: revId, sheetPath: path })
+      wbRead<string>("load_workbook_sheet", { revisionId: revId, sheetPath: path })
         .then(json => {
           let data: (string | null)[][];
           try { data = padData(JSON.parse(json) as (string | null)[][]); }
@@ -4440,7 +4331,12 @@ export function WorkbookView() {
 
       const removed: string[] = [];
       await pruneOrphansUnder(revId, "L1", removed);
-      for (const p of removed) purgeCachedSubtree(p);
+      for (const p of removed) {
+        purgeCachedSubtree(p);
+        // The live engine holds every sheet of the revision; drop the deleted ones there too, or
+        // they keep feeding totals for the rest of the session while the file no longer has them.
+        if (hot) removeEngineSubtree(hot, p);
+      }
 
       // If we're currently viewing a sheet that was just removed, jump back to L1.
       const viewingRemoved = pathStack.current.some(p =>
@@ -4466,8 +4362,11 @@ export function WorkbookView() {
     setCleanupBusy(true);
     try {
       if (saveTimerRef.current) { clearTimeout(saveTimerRef.current); saveTimerRef.current = null; }
-      await invoke<number>("clear_workbook_revision_data", { revisionId: revId });
+      await wbInvoke<number>("clear_workbook_revision_data", { revisionId: revId });
       sheetDataMap.current = new Map([["L1", createEmptyData()]]);
+      // Mirror the wipe in the live engine: every other sheet goes, L1 is blanked.
+      const hot = hotRef.current?.hotInstance;
+      if (hot) await resetEngineSheets(hot, [{ path: "L1", data: createEmptyData() }]);
       cellLinkMap.current = new Map();
       loadedLinkPathsRef.current = new Set();
       cellStyleMap.current = new Map();
@@ -4801,11 +4700,11 @@ export function WorkbookView() {
             links.delete(linkKey);
             const revId = revIdRef.current;
             if (revId != null) {
-              invoke("save_workbook_sheet_links", {
+              wbWrite("save_workbook_sheet_links", {
                 revisionId: revId,
                 sheetPath: path,
                 linksJson: JSON.stringify(Object.fromEntries(links)),
-              }).catch(() => {/* non-fatal */});
+              });
             }
           }
         }

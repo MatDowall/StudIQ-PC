@@ -2871,11 +2871,104 @@ async fn load_workbook_named_cells(
     serde_json::to_string(&entries).map_err(|e| format!("Failed to serialise named cells: {e}"))
 }
 
+/// Per-sheet blob tables keyed by (revision_id, sheet_path). `workbook_named_cells` also carries a
+/// `sheet_path` but is revision-scoped by name, so it is handled separately where it matters.
+const WORKBOOK_SHEET_TABLES: [&str; 4] = [
+    "workbook_sheet_data",
+    "workbook_sheet_links",
+    "workbook_sheet_styles",
+    "workbook_sheet_exclusions",
+];
+
+/// Escapes `%`, `_` and `\` so a sheet path can be embedded in a `LIKE ... ESCAPE '\'` pattern.
+fn like_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Deletes one sheet path and all of its descendants from every per-sheet blob table, on an open
+/// transaction. Returns the number of `workbook_sheet_data` rows removed.
+async fn delete_subtree_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    revision_id: i64,
+    sheet_path: &str,
+) -> Result<u64, String> {
+    let like_pattern = format!("{}/%", like_escape(sheet_path));
+    let mut data_rows = 0;
+    for table in WORKBOOK_SHEET_TABLES {
+        let sql = format!(
+            "DELETE FROM {table} WHERE revision_id = ? AND (sheet_path = ? OR sheet_path LIKE ? ESCAPE '\\')"
+        );
+        let n = sqlx::query(&sql)
+            .bind(revision_id)
+            .bind(sheet_path)
+            .bind(&like_pattern)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| format!("Failed to delete sheet subtree from {table}: {e}"))?
+            .rows_affected();
+        if table == "workbook_sheet_data" {
+            data_rows = n;
+        }
+    }
+    Ok(data_rows)
+}
+
+/// Persist one sheet's data plus (optionally) its links, styles and exclusions in a single
+/// transaction. `None` leaves that blob untouched — the frontend passes `None` for any blob it has
+/// not loaded yet, so an unloaded map can never be written back as `{}` over the stored value.
+#[tauri::command]
+async fn save_workbook_sheet_bundle(
+    state: State<'_, AppState>,
+    revision_id: i64,
+    sheet_path: String,
+    data_json: String,
+    links_json: Option<String>,
+    styles_json: Option<String>,
+    exclusions_json: Option<String>,
+) -> Result<(), String> {
+    let db = active_project_db(state.inner())?;
+    let mut tx = db
+        .begin()
+        .await
+        .map_err(|e| format!("Failed to begin transaction: {e}"))?;
+    let blobs = [
+        ("workbook_sheet_data", "data_json", Some(data_json)),
+        ("workbook_sheet_links", "links_json", links_json),
+        ("workbook_sheet_styles", "styles_json", styles_json),
+        ("workbook_sheet_exclusions", "exclusions_json", exclusions_json),
+    ];
+    for (table, col, value) in blobs {
+        let Some(value) = value else { continue };
+        let sql = format!(
+            "INSERT INTO {table} (revision_id, sheet_path, {col}) VALUES (?, ?, ?) \
+             ON CONFLICT(revision_id, sheet_path) DO UPDATE SET {col} = excluded.{col}"
+        );
+        sqlx::query(&sql)
+            .bind(revision_id)
+            .bind(&sheet_path)
+            .bind(value)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| format!("Failed to save {table}: {e}"))?;
+    }
+    tx.commit()
+        .await
+        .map_err(|e| format!("Failed to commit sheet save: {e}"))?;
+    Ok(())
+}
+
 /// Delete a single sheet's persisted data plus all of its descendant sheets
-/// (paths of the form `<sheet_path>/...`). Used to clean up "orphaned" build-up
-/// sheets left behind in the DB after the line item that owned them is cleared
-/// in its parent sheet. Returns the number of rows removed (0 if nothing existed
-/// at that path — safe to call speculatively).
+/// (paths of the form `<sheet_path>/...`), atomically across every per-sheet table. Used to clean
+/// up "orphaned" build-up sheets left behind after the line item that owned them is cleared, and
+/// to clear a clone-on-paste destination. Returns the number of sheet-data rows removed (0 if
+/// nothing existed at that path — safe to call speculatively).
 #[tauri::command]
 async fn delete_workbook_sheet_subtree(
     state: State<'_, AppState>,
@@ -2883,46 +2976,15 @@ async fn delete_workbook_sheet_subtree(
     sheet_path: String,
 ) -> Result<i64, String> {
     let db = active_project_db(state.inner())?;
-    let like_pattern = format!("{sheet_path}/%");
-    let rows_affected = sqlx::query(
-        "DELETE FROM workbook_sheet_data \
-         WHERE revision_id = ? AND (sheet_path = ? OR sheet_path LIKE ?)",
-    )
-    .bind(revision_id)
-    .bind(&sheet_path)
-    .bind(&like_pattern)
-    .execute(&db)
-    .await
-    .map_err(|e| format!("Failed to delete sheet subtree: {e}"))?
-    .rows_affected();
-    let _ = sqlx::query(
-        "DELETE FROM workbook_sheet_links \
-         WHERE revision_id = ? AND (sheet_path = ? OR sheet_path LIKE ?)",
-    )
-    .bind(revision_id)
-    .bind(&sheet_path)
-    .bind(&like_pattern)
-    .execute(&db)
-    .await;
-    let _ = sqlx::query(
-        "DELETE FROM workbook_sheet_styles \
-         WHERE revision_id = ? AND (sheet_path = ? OR sheet_path LIKE ?)",
-    )
-    .bind(revision_id)
-    .bind(&sheet_path)
-    .bind(&like_pattern)
-    .execute(&db)
-    .await;
-    let _ = sqlx::query(
-        "DELETE FROM workbook_sheet_exclusions \
-         WHERE revision_id = ? AND (sheet_path = ? OR sheet_path LIKE ?)",
-    )
-    .bind(revision_id)
-    .bind(&sheet_path)
-    .bind(&like_pattern)
-    .execute(&db)
-    .await;
-    Ok(rows_affected as i64)
+    let mut tx = db
+        .begin()
+        .await
+        .map_err(|e| format!("Failed to begin transaction: {e}"))?;
+    let removed = delete_subtree_in_tx(&mut tx, revision_id, &sheet_path).await?;
+    tx.commit()
+        .await
+        .map_err(|e| format!("Failed to commit sheet subtree delete: {e}"))?;
+    Ok(removed as i64)
 }
 
 /// Wipe all persisted sheet data for a workbook revision — i.e. "clear the whole
@@ -2933,30 +2995,27 @@ async fn clear_workbook_revision_data(
     revision_id: i64,
 ) -> Result<i64, String> {
     let db = active_project_db(state.inner())?;
-    let rows_affected = sqlx::query("DELETE FROM workbook_sheet_data WHERE revision_id = ?")
-        .bind(revision_id)
-        .execute(&db)
+    let mut tx = db
+        .begin()
         .await
-        .map_err(|e| format!("Failed to clear workbook revision data: {e}"))?
-        .rows_affected();
-    let _ = sqlx::query("DELETE FROM workbook_sheet_links WHERE revision_id = ?")
-        .bind(revision_id)
-        .execute(&db)
-        .await;
-    let _ = sqlx::query("DELETE FROM workbook_sheet_styles WHERE revision_id = ?")
-        .bind(revision_id)
-        .execute(&db)
-        .await;
-    let _ = sqlx::query("DELETE FROM workbook_sheet_exclusions WHERE revision_id = ?")
-        .bind(revision_id)
-        .execute(&db)
-        .await;
+        .map_err(|e| format!("Failed to begin transaction: {e}"))?;
+    let mut rows_affected = 0;
     // Named cells are revision-scoped and reference sheet cells by path/row/col; clearing the
     // revision's sheet data without clearing them leaves every name dangling at a deleted cell.
-    let _ = sqlx::query("DELETE FROM workbook_named_cells WHERE revision_id = ?")
-        .bind(revision_id)
-        .execute(&db)
-        .await;
+    for table in WORKBOOK_SHEET_TABLES.iter().chain(std::iter::once(&"workbook_named_cells")) {
+        let n = sqlx::query(&format!("DELETE FROM {table} WHERE revision_id = ?"))
+            .bind(revision_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| format!("Failed to clear {table}: {e}"))?
+            .rows_affected();
+        if *table == "workbook_sheet_data" {
+            rows_affected = n;
+        }
+    }
+    tx.commit()
+        .await
+        .map_err(|e| format!("Failed to commit workbook clear: {e}"))?;
     Ok(rows_affected as i64)
 }
 
@@ -3894,46 +3953,214 @@ async fn import_template(src_path: String, state: State<'_, AppState>) -> Result
     })
 }
 
-/// Rename a sheet path prefix across all workbook tables — used when inserting a
-/// blank row shifts existing sub-sheet paths (e.g. "L1/R3" → "L1/R4" and all
-/// descendants like "L1/R3/R1" → "L1/R4/R1"). Must be called bottom-up (highest
-/// row first) so a rename cannot clobber a path that hasn't been renamed yet.
+/// HyperFormula sheet name for a workbook sheet path — must match `pathToSheetName` in
+/// `src-frontend/src/lib/workbookSheetNames.ts` ("_" → "_u" within a segment, "/" → "_s").
+fn workbook_sheet_name(path: &str) -> String {
+    path.split('/')
+        .map(|seg| seg.replace('_', "_u"))
+        .collect::<Vec<_>>()
+        .join("_s")
+}
+
+/// Replaces every reference to sheet `old` (or to one of its descendants) in formula text with
+/// `new` — i.e. each occurrence of `old` immediately followed by `_` (a descendant's name) or `!`
+/// (a cell reference). Mirrors `retargetSheetRefs` in WorkbookView.tsx.
+fn retarget_sheet_refs(text: &str, old: &str, new: &str) -> String {
+    if old.is_empty() || !text.contains(old) {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find(old) {
+        let after = &rest[i + old.len()..];
+        out.push_str(&rest[..i]);
+        if after.starts_with('_') || after.starts_with('!') {
+            out.push_str(new);
+        } else {
+            out.push_str(old);
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// For a path under `<owner>/<prefix><row>` with `row` in `[lo_row, hi_row]`, returns the moved
+/// path and the (old, new) root of the move, e.g. "L1/S3/R2" → ("L1/S4/R2", "L1/S3", "L1/S4").
+fn shifted_subtree_path(
+    path: &str,
+    owner: &str,
+    prefixes: &[String],
+    lo_row: i64,
+    hi_row: i64,
+    delta: i64,
+) -> Option<(String, String, String)> {
+    let tail = path.strip_prefix(owner)?.strip_prefix('/')?;
+    for prefix in prefixes {
+        let Some(after) = tail.strip_prefix(prefix.as_str()) else { continue };
+        let digits_len = after.bytes().take_while(|b| b.is_ascii_digit()).count();
+        if digits_len == 0 {
+            continue;
+        }
+        let rest = &after[digits_len..];
+        if !(rest.is_empty() || rest.starts_with('/')) {
+            continue;
+        }
+        let row: i64 = after[..digits_len].parse().ok()?;
+        if row < lo_row || row > hi_row {
+            return None;
+        }
+        let old_root = format!("{owner}/{prefix}{row}");
+        let new_root = format!("{owner}/{prefix}{}", row + delta);
+        return Some((format!("{new_root}{rest}"), old_root, new_root));
+    }
+    None
+}
+
+/// Atomically moves the sub-sheets of a block of rows on one cost sheet — the database side of a
+/// row insert/delete. Every sheet under `<owner_path>/<prefix><row>` (for each prefix, and every
+/// row in `[lo_row, hi_row]`) moves to row `row + delta`, descendants included, across every
+/// per-sheet table and `workbook_named_cells`. `delete_paths` (the deleted row's own sub-sheets,
+/// on a row delete) are removed first, in the same transaction.
+///
+/// Done in one transaction, with every moved row parked under a temporary path first, so the move
+/// can't collide with itself (row 3 → 4 while 4 → 5 is still pending) and never leaves the tables
+/// half-renamed. A leftover orphan sheet already sitting at a destination path is dead data (its
+/// row was cleared without the sheet being cleaned up) and is replaced. Formula text inside each
+/// moved sheet that references its own descendants is retargeted to their new names.
 #[tauri::command]
-async fn rename_workbook_sheet_subtree(
+async fn shift_workbook_subtrees(
     state: State<'_, AppState>,
     revision_id: i64,
-    old_path: String,
-    new_path: String,
+    owner_path: String,
+    prefixes: Vec<String>,
+    lo_row: i64,
+    hi_row: i64,
+    delta: i64,
+    delete_paths: Vec<String>,
 ) -> Result<(), String> {
     let db = active_project_db(state.inner())?;
-    let like_pattern = format!("{old_path}/%");
-    let prefix_len = (old_path.len() as i64) + 1; // +1 to skip the trailing char before substr
-    // `workbook_named_cells` carries a `sheet_path` too, so a subtree rename must rewrite it
-    // alongside the per-sheet blob tables — otherwise a row insert/move that renames child
-    // sheets leaves every named cell in the moved subtree pointing at a now-nonexistent path.
-    for table in &[
-        "workbook_sheet_data",
-        "workbook_sheet_links",
-        "workbook_sheet_styles",
-        "workbook_sheet_exclusions",
-        "workbook_named_cells",
-    ] {
-        let sql = format!(
-            "UPDATE {table} \
-             SET sheet_path = ? || substr(sheet_path, ?) \
-             WHERE revision_id = ? AND (sheet_path = ? OR sheet_path LIKE ?)"
-        );
-        let _ = sqlx::query(&sql)
-            .bind(&new_path)
-            .bind(prefix_len)
-            .bind(revision_id)
-            .bind(&old_path)
-            .bind(&like_pattern)
-            .execute(&db)
-            .await
-            .map_err(|e| format!("Failed to rename {table}: {e}"))?;
+    let mut tx = db
+        .begin()
+        .await
+        .map_err(|e| format!("Failed to begin transaction: {e}"))?;
+
+    for path in &delete_paths {
+        delete_subtree_in_tx(&mut tx, revision_id, path).await?;
     }
+
+    let like_pattern = format!("{}/%", like_escape(&owner_path));
+    for (table, blob_col) in [
+        ("workbook_sheet_data", Some("data_json")),
+        ("workbook_sheet_links", None),
+        ("workbook_sheet_styles", None),
+        ("workbook_sheet_exclusions", None),
+        ("workbook_named_cells", None),
+    ] {
+        let rows: Vec<(i64, String)> = sqlx::query_as(&format!(
+            "SELECT id, sheet_path FROM {table} WHERE revision_id = ? AND sheet_path LIKE ? ESCAPE '\\'"
+        ))
+        .bind(revision_id)
+        .bind(&like_pattern)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| format!("Failed to read {table}: {e}"))?;
+
+        let moves: Vec<(i64, String, String, String)> = rows
+            .into_iter()
+            .filter_map(|(id, path)| {
+                shifted_subtree_path(&path, &owner_path, &prefixes, lo_row, hi_row, delta)
+                    .map(|(new_path, old_root, new_root)| (id, new_path, old_root, new_root))
+            })
+            .collect();
+        if moves.is_empty() {
+            continue;
+        }
+
+        // Phase 1: park every moved row on a unique temporary path.
+        for (id, ..) in &moves {
+            sqlx::query(&format!("UPDATE {table} SET sheet_path = ? WHERE id = ?"))
+                .bind(format!("\u{1}shift:{id}"))
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| format!("Failed to shift {table}: {e}"))?;
+        }
+        // Phase 2: drop orphans occupying a destination (per-sheet tables only — named cells have
+        // no per-path uniqueness, and deleting one would lose a user-defined name).
+        if table != "workbook_named_cells" {
+            for (_, new_path, ..) in &moves {
+                sqlx::query(&format!("DELETE FROM {table} WHERE revision_id = ? AND sheet_path = ?"))
+                    .bind(revision_id)
+                    .bind(new_path)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| format!("Failed to clear shift destination in {table}: {e}"))?;
+            }
+        }
+        // Phase 3: land each row on its final path, retargeting formula text in the sheet data.
+        for (id, new_path, old_root, new_root) in &moves {
+            if let Some(col) = blob_col {
+                let text: String = sqlx::query_scalar(&format!("SELECT {col} FROM {table} WHERE id = ?"))
+                    .bind(id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|e| format!("Failed to read {table}: {e}"))?;
+                let retargeted = retarget_sheet_refs(
+                    &text,
+                    &workbook_sheet_name(old_root),
+                    &workbook_sheet_name(new_root),
+                );
+                sqlx::query(&format!("UPDATE {table} SET sheet_path = ?, {col} = ? WHERE id = ?"))
+                    .bind(new_path)
+                    .bind(retargeted)
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| format!("Failed to shift {table}: {e}"))?;
+            } else {
+                sqlx::query(&format!("UPDATE {table} SET sheet_path = ? WHERE id = ?"))
+                    .bind(new_path)
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| format!("Failed to shift {table}: {e}"))?;
+            }
+        }
+    }
+
+    tx.commit()
+        .await
+        .map_err(|e| format!("Failed to commit sub-sheet shift: {e}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod workbook_shift_tests {
+    use super::*;
+
+    #[test]
+    fn shifted_path_moves_row_and_descendants() {
+        let p = vec!["S".to_string(), "R".to_string(), "Q".to_string()];
+        assert_eq!(
+            shifted_subtree_path("L1/S3/R2", "L1", &p, 3, 9, 1),
+            Some(("L1/S4/R2".into(), "L1/S3".into(), "L1/S4".into()))
+        );
+        assert_eq!(shifted_subtree_path("L1/Q12", "L1", &p, 3, 20, -1).unwrap().0, "L1/Q11");
+        assert_eq!(shifted_subtree_path("L1/S2", "L1", &p, 3, 9, 1), None); // outside range
+        assert_eq!(shifted_subtree_path("L1/S3/S4", "L1/S3", &p, 5, 9, 1), None);
+        assert_eq!(shifted_subtree_path("L10/S3", "L1", &p, 0, 9, 1), None); // different owner
+    }
+
+    #[test]
+    fn retarget_only_rewrites_whole_sheet_names() {
+        let t = "=XSUMTOT(L1_sS3!H1:H1000)+XSUMRATE(L1_sS3_sR2!H1:H1000)+XSUMTOT(L1_sS30!H1:H9)";
+        assert_eq!(
+            retarget_sheet_refs(t, "L1_sS3", "L1_sS4"),
+            "=XSUMTOT(L1_sS4!H1:H1000)+XSUMRATE(L1_sS4_sR2!H1:H1000)+XSUMTOT(L1_sS30!H1:H9)"
+        );
+        assert_eq!(workbook_sheet_name("L1/S3/R2"), "L1_sS3_sR2");
+    }
 }
 
 async fn init_database(db_path: &Path) -> Result<SqlitePool, String> {
@@ -6046,6 +6273,7 @@ pub fn run() {
             get_dimension_group_props,
             set_dimension_group_props,
             save_workbook_sheet,
+            save_workbook_sheet_bundle,
             load_workbook_sheet,
             load_workbook_all_sheets,
             save_workbook_sheet_links,
@@ -6079,7 +6307,7 @@ pub fn run() {
             read_text_file,
             write_binary_file,
             export_workbook_excel,
-            rename_workbook_sheet_subtree,
+            shift_workbook_subtrees,
             bridge_respond,
             list_rates,
             create_rate,

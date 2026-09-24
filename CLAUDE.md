@@ -463,6 +463,36 @@ When writing formulas that use these functions, function names (`LET`, `FILTER`,
 auto-prefixed with `_xlfn.`/`_xlfn._xlws.` by the crate — but `LET`/`LAMBDA`-bound variable names
 must be prefixed with `_xlpm.` by hand in the formula string, or Excel won't recognize them.
 
+### Workbook persistence and row operations
+
+**Every workbook DB call goes through `lib/workbookDb.ts`** (`wbWrite` / `wbInvoke` / `wbRead`), a
+FIFO queue: each command starts only after the previous one settles. Bare `invoke`s run as
+independent tasks over a multi-connection pool and can execute out of order — which deleted the
+wrong build-up sheet on a row delete and let a clone-on-paste's "clear destination" wipe the clone.
+Failures are reported in the footer (`workbookSaveError`), never swallowed. Multi-table operations
+are single backend transactions: `save_workbook_sheet_bundle` (data + links + styles + exclusions;
+a `null` blob is left untouched), `delete_workbook_sheet_subtree`, and `shift_workbook_subtrees`.
+`flushWorkbookWrites()` runs before project open/create/close and on window close.
+
+Autosave targets `displayedRevIdRef` (the revision the grid is actually showing), never `revIdRef`,
+and a pending autosave is flushed at the top of the revision-switch effect — otherwise the old
+revision's sheet was saved over the new revision's L1 while it loaded.
+
+**Row/column insert and delete are native Handsontable `alter` calls**, so HyperFormula adjusts every
+reference to the moved rows (same sheet, other sheets, named expressions; ranges grow/shrink) exactly
+as Excel does. Do not go back to copying cell text between rows by hand — that only renumbered a
+formula's own-row references and left totals and cross-row/cross-sheet references pointing at the
+old rows. The grid's bottom row is trimmed (insert) or padded (delete) to keep the shared `NUM_ROWS`.
+On top of HyperFormula's adjustment: the moved rows' sub-sheets move via `moveRowSubtrees` (engine,
+caches, named cells, and one atomic `shift_workbook_subtrees`, which also retargets the moved sheets'
+references to their own children); the moved rows' XSUM* rollups are rebuilt for their new row
+(`retargetRollupRows`); and the parent's rollup into the edited sheet is re-canonicalized
+(`canonicalizeParentRollups`), since an insert above row 1 would otherwise shift `H1:H1000` to
+`H2:H1001` and drop the new row from the parent total.
+
+**Excel export reads the live engine** (`engineSheetValues`), which holds every sheet of the
+revision — never re-evaluate a sheet on its own, where cross-sheet rollups can't resolve.
+
 ### Rate library is a supplier price book, shared across every project
 
 The sidebar's **Rate Library** tab (`DimensionGroupPane.tsx`'s pane-level tab bar, beside

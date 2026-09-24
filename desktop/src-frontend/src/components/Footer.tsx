@@ -34,6 +34,8 @@ export function Footer() {
   const goToPage = useAppStore((state) => state.goToPage);
   const activeTab = useAppStore((state) => state.activeTab);
   const workbookActivity = useAppStore((state) => state.workbookActivity);
+  const workbookSaveError = useAppStore((state) => state.workbookSaveError);
+  const setWorkbookSaveError = useAppStore((state) => state.setWorkbookSaveError);
 
   const pageCount = currentDocument?.page_count ?? 0;
   const hasDoc = currentDocument !== null;
@@ -57,7 +59,17 @@ export function Footer() {
       }}
     >
       <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-        {activeTab === "workbook" && (
+        {activeTab === "workbook" && workbookSaveError && (
+          <span
+            title={`${workbookSaveError}\n\nClick to dismiss.`}
+            onClick={() => setWorkbookSaveError(null)}
+            style={{ display: "flex", alignItems: "center", gap: 6, color: theme.danger, cursor: "pointer", minWidth: 0 }}
+          >
+            <span className="material-symbols-outlined" style={{ fontSize: 13, lineHeight: 1 }}>error</span>
+            <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{workbookSaveError}</span>
+          </span>
+        )}
+        {activeTab === "workbook" && !workbookSaveError && (
           <>
             <span
               className="material-symbols-outlined"

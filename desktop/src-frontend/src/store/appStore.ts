@@ -1,3 +1,4 @@
+import { flushWorkbookWrites } from "../lib/workbookDb";
 import { invoke } from "@tauri-apps/api/core";
 import { create } from "zustand";
 import type { GroupProps } from "../lib/quantity";
@@ -452,6 +453,9 @@ interface AppStore {
   // it's doing rather than looking hung. See `withWorkbookActivity` in WorkbookView.tsx.
   workbookActivity: string;
   setWorkbookActivity: (status: string) => void;
+  // Last workbook database write that failed (shown in the footer until dismissed), or null.
+  workbookSaveError: string | null;
+  setWorkbookSaveError: (message: string | null) => void;
   // When set, the viewer is placing a door/window opening: hovering a framing wall shows a ghost
   // that commits onto the wall on click. Overrides add/select while active.
   openingPlacement: OpeningTemplate | null;
@@ -980,6 +984,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
   selectedMeasurementIds: [],
   viewerStatus: "",
   workbookActivity: "",
+  workbookSaveError: null,
   openingPlacement: null,
   arrayTrimMode: false,
   arrayTrimType: "line",
@@ -1077,6 +1082,10 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   setViewerStatus: (status) => {
     set({ viewerStatus: status });
+  },
+
+  setWorkbookSaveError: (message) => {
+    set({ workbookSaveError: message });
   },
 
   setWorkbookActivity: (status) => {
@@ -1481,6 +1490,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
   },
 
   createProject: async (name, client, contractNumber, filePath) => {
+    await flushWorkbookWrites(); // land pending workbook edits before the project DB changes
     const project = await invoke<ProjectMeta>("create_project", {
       name,
       client,
@@ -1493,6 +1503,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
   },
 
   openProject: async (filePath) => {
+    await flushWorkbookWrites(); // land pending workbook edits before the project DB changes
     const project = await invoke<ProjectMeta>("open_project", { filePath });
     set({ activeProject: project, workbooks: [], activeRevisionId: null });
     await get().loadRecentProjects();
@@ -1500,6 +1511,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
   },
 
   closeProject: async () => {
+    await flushWorkbookWrites(); // land pending workbook edits before the project DB changes
     await invoke<void>("close_project");
     set((state) => ({
       activeProject: null,

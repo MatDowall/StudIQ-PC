@@ -95,3 +95,14 @@ export class SheetNameRegistry {
     this.nameToPath.clear();
   }
 }
+
+/** Rewrites references to sheet `oldPath` — or to any of its descendants — in one cell's formula
+ *  text so they name `newPath` instead. Matches the whole HyperFormula sheet name only (followed by
+ *  `_` for a descendant or `!` for a cell reference), so "L1_sS3" never touches "L1_sS30". Mirrors
+ *  `retarget_sheet_refs` in the backend's shift_workbook_subtrees (lib.rs). */
+export function retargetSheetRefs(cellText: string | null, oldPath: string, newPath: string): string | null {
+  if (typeof cellText !== "string" || cellText.charAt(0) !== "=") return cellText;
+  const oldName = pathToSheetName(oldPath);
+  if (!cellText.includes(oldName)) return cellText;
+  return cellText.replace(new RegExp(`${oldName}(?=[_!])`, "g"), pathToSheetName(newPath));
+}
