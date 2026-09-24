@@ -2780,24 +2780,6 @@ async fn save_workbook_layout(
     Ok(())
 }
 
-/// Set a revision's calculation engine version (M4): 1 = legacy baked rollups, 2 = declarative.
-/// Written by the opt-in upgrade only after its equivalence gate passes.
-#[tauri::command]
-async fn save_workbook_engine_version(
-    state: State<'_, AppState>,
-    revision_id: i64,
-    version: i64,
-) -> Result<(), String> {
-    let db = active_project_db(state.inner())?;
-    sqlx::query("UPDATE workbook_revisions SET engine_version = ? WHERE id = ?")
-        .bind(version)
-        .bind(revision_id)
-        .execute(&db)
-        .await
-        .map_err(|e| format!("Failed to save engine version: {e}"))?;
-    Ok(())
-}
-
 /// Create or update a named cell — a workbook-wide name bound to a single cell
 /// (identified by sheet path + row/col) that can be referenced from formulas at
 /// any level. Names are unique per revision; saving an existing name moves it.
@@ -2985,6 +2967,103 @@ async fn delete_workbook_sheet_subtree(
         .await
         .map_err(|e| format!("Failed to commit sheet subtree delete: {e}"))?;
     Ok(removed as i64)
+}
+
+/// Splits a sub-sheet path into its parent path and the parent row it belongs to
+/// ("L1/S3/R12" → ("L1/S3", 12)). `None` for the root sheet or a malformed segment.
+fn sub_sheet_parent(path: &str) -> Option<(&str, usize)> {
+    let (parent, seg) = path.rsplit_once('/')?;
+    let mut chars = seg.chars();
+    if !matches!(chars.next(), Some('S' | 'R' | 'Q')) {
+        return None;
+    }
+    let row = chars.as_str().parse().ok()?;
+    Some((parent, row))
+}
+
+/// True when a stored sheet row holds nothing — every cell null or an empty string. A row index
+/// past the end of the stored data (which is trimmed on save) is blank too.
+fn stored_row_is_blank(rows: &[Vec<serde_json::Value>], row: usize) -> bool {
+    rows.get(row).map_or(true, |cells| {
+        cells.iter().all(|v| v.is_null() || v.as_str() == Some(""))
+    })
+}
+
+/// Deletes every orphaned build-up sheet in a revision in one transaction and returns the removed
+/// subtree roots. A sheet is orphaned when the row that owns it is blank, when its parent sheet no
+/// longer exists, or when its parent is itself orphaned (it's then removed with that subtree). This
+/// replaces a frontend walk that issued three sequential delete round trips per blank row of every
+/// cost sheet.
+#[tauri::command]
+async fn prune_workbook_orphans(
+    state: State<'_, AppState>,
+    revision_id: i64,
+) -> Result<Vec<String>, String> {
+    let db = active_project_db(state.inner())?;
+    let mut tx = db
+        .begin()
+        .await
+        .map_err(|e| format!("Failed to begin transaction: {e}"))?;
+
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT sheet_path, data_json FROM workbook_sheet_data WHERE revision_id = ?")
+            .bind(revision_id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| format!("Failed to read workbook sheets: {e}"))?;
+    let sheets: std::collections::HashMap<String, Vec<Vec<serde_json::Value>>> = rows
+        .into_iter()
+        .map(|(path, json)| (path, serde_json::from_str(&json).unwrap_or_default()))
+        .collect();
+
+    // Parents before children, so an orphaned parent is known before its descendants are visited.
+    let mut paths: Vec<&String> = sheets.keys().collect();
+    paths.sort_by_key(|p| (p.matches('/').count(), p.as_str().to_string()));
+
+    let mut orphaned: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut roots: Vec<String> = Vec::new();
+    for path in paths {
+        let Some((parent, row)) = sub_sheet_parent(path) else { continue };
+        if orphaned.contains(parent) {
+            orphaned.insert(path.clone());
+            continue;
+        }
+        let parent_gone = parent != "L1" && !sheets.contains_key(parent);
+        let blank = sheets.get(parent).map_or(true, |data| stored_row_is_blank(data, row));
+        if parent_gone || blank {
+            orphaned.insert(path.clone());
+            roots.push(path.clone());
+        }
+    }
+
+    for root in &roots {
+        delete_subtree_in_tx(&mut tx, revision_id, root).await?;
+    }
+    tx.commit()
+        .await
+        .map_err(|e| format!("Failed to commit orphan cleanup: {e}"))?;
+    Ok(roots)
+}
+
+#[cfg(test)]
+mod workbook_prune_tests {
+    use super::*;
+
+    #[test]
+    fn parent_of_sub_sheet_paths() {
+        assert_eq!(sub_sheet_parent("L1/S3/R12"), Some(("L1/S3", 12)));
+        assert_eq!(sub_sheet_parent("L1/Q0"), Some(("L1", 0)));
+        assert_eq!(sub_sheet_parent("L1"), None);
+        assert_eq!(sub_sheet_parent("L1/X3"), None);
+    }
+
+    #[test]
+    fn blank_rows() {
+        let rows: Vec<Vec<serde_json::Value>> = serde_json::from_str(r#"[[null,"",null],[null,"x"]]"#).unwrap();
+        assert!(stored_row_is_blank(&rows, 0));
+        assert!(!stored_row_is_blank(&rows, 1));
+        assert!(stored_row_is_blank(&rows, 7)); // past the trimmed end
+    }
 }
 
 /// Wipe all persisted sheet data for a workbook revision — i.e. "clear the whole
@@ -4164,10 +4243,20 @@ mod workbook_shift_tests {
 }
 
 async fn init_database(db_path: &Path) -> Result<SqlitePool, String> {
+    // Project files routinely live on a network share (Y:\Shared\…), so no WAL: it needs a
+    // shared-memory index that network filesystems can't provide safely. Rollback journaling stays,
+    // but TRUNCATE rather than DELETE — each commit empties the journal instead of deleting and
+    // recreating the file, which is a noticeably cheaper round trip over SMB. An explicit busy wait
+    // lets a write queue behind another connection's commit instead of failing with "database is
+    // locked", and a larger page cache avoids re-reading the workbook's big sheet blobs.
     let options = SqliteConnectOptions::new()
         .filename(db_path)
         .create_if_missing(true)
-        .foreign_keys(true);
+        .foreign_keys(true)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Truncate)
+        .busy_timeout(std::time::Duration::from_secs(15))
+        .pragma("cache_size", "-32000") // ~32 MB
+        .pragma("temp_store", "MEMORY");
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
         .connect_with(options)
@@ -4885,10 +4974,10 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), String> {
         .execute(pool)
         .await;
 
-    // Additive: workbook calculation engine version (M4). 1 = legacy baked-literal rollups
-    // (drillUp writes numbers); 2 = declarative (parent cells hold SUM/XSUM formulas that read
-    // their child live). Default 1 so every existing workbook stays on the proven path until
-    // it is explicitly, verifiably upgraded.
+    // Additive: workbook calculation engine version (M4) — 1 = legacy baked-literal rollups, 2 =
+    // declarative XSUM formulas. No longer read or written by the app (every workbook now runs the
+    // declarative engine and the opt-in v1→v2 upgrade was removed); kept because columns are never
+    // dropped, and still carried along by revision copy/template so the value doesn't vanish.
     let _ = sqlx::query("ALTER TABLE workbook_revisions ADD COLUMN engine_version INTEGER NOT NULL DEFAULT 1")
         .execute(pool)
         .await;
@@ -6287,9 +6376,9 @@ pub fn run() {
             load_workbook_named_cells,
             save_workbook_project_total,
             save_workbook_layout,
-            save_workbook_engine_version,
             delete_workbook_sheet_subtree,
             clear_workbook_revision_data,
+            prune_workbook_orphans,
             list_workbooks,
             create_workbook_revision,
             create_workbook_revision_from_template,

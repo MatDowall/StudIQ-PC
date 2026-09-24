@@ -35,7 +35,7 @@ import {
   COL_LAB, COL_LAB_TOTAL, COL_MAT, COL_MAT_TOTAL, COL_SUB, COL_SUB_TOTAL, COL_SUM, COL_SUM_TOTAL,
   COL_COUNT, COL_LENGTH, COL_WIDTH, COL_HEIGHT,
   qtyTotalFormula, toNum, numOrUndefined, textOrBlank, sumComputedCol,
-  deriveFactorTotal, legacyColLetter, autoFormulaFor, isAutoOwnedCell,
+  deriveFactorTotal, legacyColLetter, autoFormulaFor, isAutoOwnedCell, trimSheetForStorage,
 } from "../lib/workbookCalc";
 import { pathToSheetName, sheetNameToPath, retargetSheetRefs } from "../lib/workbookSheetNames";
 import { wbInvoke, wbRead, wbWrite, flushWorkbookWrites, setWorkbookDbErrorHandler, setWorkbookFlushHook } from "../lib/workbookDb";
@@ -625,7 +625,7 @@ function deriveLevelFormulas(
     for (let r = rFrom; r <= rTo; r++) {
       const fRaw = hot.getDataAtCell(r, COL_SUBTOTAL);
       if (fRaw == null || fRaw === "") continue;
-      const f = typeof fRaw === "number" ? fRaw : parseFloat(String(fRaw)) || 0;
+      const f = toNum(fRaw);
 
       if (!isExcluded(r, COL_FACTOR)) {
         const gSrc = src(r, COL_FACTOR);
@@ -713,7 +713,24 @@ function loadLevelData(
 /** The Handsontable Formulas plugin, typed loosely (its addSheet/switchSheet/engine members
  *  aren't in the exported types we use). */
 function getFormulasPlugin(hot: Handsontable | null | undefined): any {
-  try { return hot ? (hot.getPlugin("formulas") as any) : null; } catch { return null; }
+  let plugin: any = null;
+  try { plugin = hot ? (hot.getPlugin("formulas") as any) : null; } catch { return null; }
+  if (plugin?.engine) detachSheetChurnRebuild(plugin.engine);
+  return plugin;
+}
+
+const churnDetached = new WeakSet<object>();
+/** Handsontable registers a FULL `rebuildAndRecalculate()` on every engine sheetAdded/sheetRemoved
+ *  ("hooks needed for cross-referencing sheets") — a workaround for older HyperFormula. HF 3.x
+ *  resolves a reference to a sheet by itself the moment that sheet is added, removed or re-added
+ *  (verified), so those rebuilds are pure cost: loading a revision paid one full rebuild per sheet,
+ *  and every drill into a new row or sub-sheet move paid another. Removed once per engine. The only
+ *  other listeners on those events are the plugin's afterSheetAdded/Removed hook relays, which
+ *  nothing here uses. */
+function detachSheetChurnRebuild(engine: { off: (e: string) => void }): void {
+  if (churnDetached.has(engine)) return;
+  churnDetached.add(engine);
+  try { engine.off("sheetAdded"); engine.off("sheetRemoved"); } catch { /* older API */ }
 }
 
 /** Ensure the engine has a sheet for `path` (empty if new). Lets a parent's positional XSUM*
@@ -849,34 +866,22 @@ function applySubtreeRenamesToEngine(hot: Handsontable, renames: SubtreeRename[]
   const plugin = getFormulasPlugin(hot);
   const engine = plugin?.engine;
   if (!plugin || !engine || renames.length === 0) return;
-  // Each addSheet/removeSheet below fires the Formulas plugin's own "sheetAdded"/"sheetRemoved"
-  // listener, which by default runs a FULL engine rebuild+recalculate (see beginBulkSheetLoad's
-  // doc) — exactly the O(n²)-in-sheet-count storm `resetEngineSheets` already suppresses for bulk
-  // loading. A row insert/delete that displaces K rate/qty build-up sub-sheets was paying for K
-  // full-engine recalculations here; this is what actually dominated the cost `planSubtreeRenames`
-  // above was fixing the scan side of. Suppress the same way, then settle once at the end.
-  beginBulkSheetLoad(engine);
-  try {
-    for (const rename of renames) {
-      const { oldPath, newPath } = rename;
-      try {
-        const oldName = pathToSheetName(oldPath);
-        if (!engine.doesSheetExist(oldName)) continue;
-        const oldId = engine.getSheetId(oldName);
-        if (oldId == null) continue;
-        // Re-point the moved sheet's own references to its (also moving) children.
-        const content = (engine.getSheetSerialized(oldId) as unknown[][]).map(row =>
-          row.map(cell => (typeof cell === "string" ? retargetSheetRefs(cell, rename.rootOld, rename.rootNew) : cell)));
-        const newName = pathToSheetName(newPath);
-        if (engine.doesSheetExist(newName)) engine.setSheetContent(engine.getSheetId(newName), content);
-        else plugin.addSheet(newName, content);
-        engine.removeSheet(oldId);
-      } catch { /* non-fatal — the cache/DB rename above still keeps it consistent on reload */ }
-    }
-  } finally {
-    endBulkSheetLoad(engine);
+  for (const rename of renames) {
+    const { oldPath, newPath } = rename;
+    try {
+      const oldName = pathToSheetName(oldPath);
+      if (!engine.doesSheetExist(oldName)) continue;
+      const oldId = engine.getSheetId(oldName);
+      if (oldId == null) continue;
+      // Re-point the moved sheet's own references to its (also moving) children.
+      const content = (engine.getSheetSerialized(oldId) as unknown[][]).map(row =>
+        row.map(cell => (typeof cell === "string" ? retargetSheetRefs(cell, rename.rootOld, rename.rootNew) : cell)));
+      const newName = pathToSheetName(newPath);
+      if (engine.doesSheetExist(newName)) engine.setSheetContent(engine.getSheetId(newName), content);
+      else plugin.addSheet(newName, content);
+      engine.removeSheet(oldId);
+    } catch { /* non-fatal — the cache/DB rename above still keeps it consistent on reload */ }
   }
-  engine.rebuildAndRecalculate();
 }
 
 /**
@@ -929,53 +934,6 @@ async function withWorkbookActivity<T>(label: string, fn: () => T | Promise<T>):
   }
 }
 
-/** How many concurrent bulk sheet loads (see `resetEngineSheets`) currently have a given engine's
- *  automatic per-sheet-add/-remove full recalculation suppressed. Depth-counted per engine, rather
- *  than a plain boolean, because two `resetEngineSheets` runs against the SAME shared engine can
- *  genuinely overlap in time — a newer revision switch is allowed to start (and begin suppressing)
- *  while an older, now-superseded one is still mid-loop between its `setTimeout(0)` yields (see the
- *  `isStale`/`cancelled` handling at this function's call site). Without depth-counting, the first
- *  call to finish would re-enable the listener out from under the second call still mid-loop
- *  (reintroducing the O(n²) rebuild storm for its remainder), or — if both finish — the listener
- *  would end up attached twice, double-firing the settle-recalculation on every later single-sheet
- *  add. */
-const bulkLoadSuppressDepth = new WeakMap<object, number>();
-
-function sheetChurnRecalc(engine: { rebuildAndRecalculate: () => void }): void {
-  engine.rebuildAndRecalculate();
-}
-
-/** Suspends the Formulas plugin's built-in "full rebuild + recalculate on every sheetAdded/
- *  sheetRemoved" behaviour (registered by Handsontable itself when the engine is created — see
- *  `setupEngine`/`registerEngine` in handsontable's formulas plugin). That default exists so a
- *  one-off sheet add/remove (the normal case elsewhere in this file, e.g. `ensureEngineSheet`
- *  drilling into a freshly-created row) settles cross-sheet references immediately. But it makes
- *  loading N sheets in a loop cost N full-engine rebuilds — effectively O(n²) in sheet count, which
- *  is the dominant cost of `resetEngineSheets` on a 100+-sheet workbook. Pairs with
- *  `endBulkSheetLoad`; always call that in a `finally` so a suppressed engine is never left without
- *  its listener (an aborted/superseded load must not leave the shared engine silently un-settling
- *  future one-off sheet adds). Uses plain event-listener add/remove (`engine.off`/`engine.on`), NOT
- *  `engine.batch()`/`suspendEvaluation()`/`resumeEvaluation()` — those were tried here previously
- *  and desynced the Formulas plugin's own UndoRedo batch tracking ("Batch mode wasn't started");
- *  toggling these two listeners doesn't touch that machinery at all. */
-function beginBulkSheetLoad(engine: { off: (e: string) => void; on: (e: string, cb: () => void) => void }): void {
-  const depth = bulkLoadSuppressDepth.get(engine) ?? 0;
-  if (depth === 0) {
-    engine.off("sheetAdded");
-    engine.off("sheetRemoved");
-  }
-  bulkLoadSuppressDepth.set(engine, depth + 1);
-}
-
-function endBulkSheetLoad(engine: { off: (e: string) => void; on: (e: string, cb: () => void) => void }): void {
-  const depth = Math.max(0, (bulkLoadSuppressDepth.get(engine) ?? 1) - 1);
-  bulkLoadSuppressDepth.set(engine, depth);
-  if (depth === 0) {
-    engine.on("sheetAdded", () => sheetChurnRecalc(engine as unknown as { rebuildAndRecalculate: () => void }));
-    engine.on("sheetRemoved", () => sheetChurnRecalc(engine as unknown as { rebuildAndRecalculate: () => void }));
-  }
-}
-
 /** Replace the plugin engine's sheets with exactly `sheets` (the whole revision), so cross-sheet
  *  rollup formulas and named-cell references resolve. Adds/replaces every wanted sheet, binds the
  *  grid to L1, then drops any sheet left over from a previous revision. Idempotent.
@@ -989,10 +947,8 @@ function endBulkSheetLoad(engine: { off: (e: string) => void; on: (e: string, cb
  *  the shared engine underneath the switch that replaced it — exactly the stale-switch corruption
  *  fixed elsewhere in this file.
  *
- *  The add/remove loop runs with the engine's auto-recalculate-on-sheet-churn listener suppressed
- *  (`beginBulkSheetLoad`/`endBulkSheetLoad`) — see that pair's doc for why. One explicit
- *  `rebuildAndRecalculate()` after the loop (before `switchSheet`, so the grid reads settled values)
- *  replaces what would otherwise have been one rebuild per sheet. */
+ *  No rebuild is needed after the loop: HyperFormula resolves a reference to a sheet as soon as that
+ *  sheet is added (see detachSheetChurnRebuild). */
 const PROGRESS_CHUNK = 3;
 async function resetEngineSheets(
   hot: Handsontable,
@@ -1009,28 +965,22 @@ async function resetEngineSheets(
   if (!wanted.has(l1Name)) wanted.set(l1Name, createEmptyData());
   const entries = [...wanted];
   const total = entries.length;
-  beginBulkSheetLoad(engine);
-  try {
-    for (let i = 0; i < entries.length; i++) {
-      const [name, data] = entries[i];
-      const rows = dataForHot(data);
-      if (engine.doesSheetExist(name)) engine.setSheetContent(engine.getSheetId(name), rows);
-      else plugin.addSheet(name, rows);
-      if ((i + 1) % PROGRESS_CHUNK === 0 || i === entries.length - 1) {
-        onProgress?.(i + 1, total);
-        await new Promise<void>(resolve => setTimeout(resolve, 0));
-        if (shouldAbort?.()) return;
-      }
+  for (let i = 0; i < entries.length; i++) {
+    const [name, data] = entries[i];
+    const rows = dataForHot(data);
+    if (engine.doesSheetExist(name)) engine.setSheetContent(engine.getSheetId(name), rows);
+    else plugin.addSheet(name, rows);
+    if ((i + 1) % PROGRESS_CHUNK === 0 || i === entries.length - 1) {
+      onProgress?.(i + 1, total);
+      await new Promise<void>(resolve => setTimeout(resolve, 0));
+      if (shouldAbort?.()) return;
     }
-    engine.rebuildAndRecalculate();
-    plugin.switchSheet(l1Name); // bind to a kept sheet before removing any stale ones
-    for (const name of engine.getSheetNames() as string[]) {
-      if (!wanted.has(name)) {
-        try { engine.removeSheet(engine.getSheetId(name)); } catch { /* ignore */ }
-      }
+  }
+  plugin.switchSheet(l1Name); // bind to a kept sheet before removing any stale ones
+  for (const name of engine.getSheetNames() as string[]) {
+    if (!wanted.has(name)) {
+      try { engine.removeSheet(engine.getSheetId(name)); } catch { /* ignore */ }
     }
-  } finally {
-    endBulkSheetLoad(engine);
   }
 }
 /* eslint-enable @typescript-eslint/no-explicit-any */
@@ -2889,7 +2839,7 @@ export function WorkbookView() {
     wbWrite("save_workbook_sheet_bundle", {
       revisionId,
       sheetPath: path,
-      dataJson: JSON.stringify(data),
+      dataJson: JSON.stringify(trimSheetForStorage(data)),
       linksJson: loadedLinkPathsRef.current.has(path)
         ? JSON.stringify(links ? Object.fromEntries(links) : {}) : null,
       stylesJson: loadedStylePathsRef.current.has(path)
@@ -3016,15 +2966,10 @@ export function WorkbookView() {
     const engine = getFormulasPlugin(hot)?.engine;
     if (!engine) return;
     const prefix = `${path}/`;
-    beginBulkSheetLoad(engine);
-    try {
-      for (const name of engine.getSheetNames() as string[]) {
-        const p = sheetNameToPath(name);
-        if (p !== path && !p.startsWith(prefix)) continue;
-        try { engine.removeSheet(engine.getSheetId(name)); } catch { /* already gone */ }
-      }
-    } finally {
-      endBulkSheetLoad(engine);
+    for (const name of engine.getSheetNames() as string[]) {
+      const p = sheetNameToPath(name);
+      if (p !== path && !p.startsWith(prefix)) continue;
+      try { engine.removeSheet(engine.getSheetId(name)); } catch { /* already gone */ }
     }
   }
 
@@ -3363,6 +3308,40 @@ export function WorkbookView() {
     scheduleSaveRef.current();
   }
 
+  /**
+   * Appends the leaf line items of cost sheet `path` to `out`, recursing through every row whose
+   * F:Subtotal is the rollup of its own cost sheet (/S) — so the export reaches every level, not
+   * just L1 → L2. A row is expanded only when its Factor is 1 (or blank): its children's totals
+   * then add up to the row's own, so replacing the row by them can't change the export's total.
+   * A row with any other factor, a typed subtotal, or no line items beneath it is exported as one
+   * line. Items below the first level carry their parents' descriptions (`prefix`, "A › B › ")
+   * so a flattened item keeps its context.
+   */
+  async function collectLeafItems(
+    path: string, sectionCode: string, sectionDesc: string, prefix: string, out: FlatExportRow[],
+  ): Promise<void> {
+    const hot = hotRef.current?.hotInstance;
+    const revId = revIdRef.current;
+    if (!hot || revId == null) return;
+    const source = await fetchSheetSourceData(revId, path);
+    const evaluated = engineSheetValues(hot, path);
+    for (let r = 0; r < source.length; r++) {
+      if (!isLineItemRow(source[r])) continue;
+      const ev = evaluated[r] ?? [];
+      const fSrc = source[r][COL_SUBTOTAL];
+      const factor = numOrUndefined(ev[COL_FACTOR]);
+      if (typeof fSrc === "string" && /XSUMTOT\s*\(/i.test(fSrc) && (factor == null || factor === 1)) {
+        const before = out.length;
+        const label = textOrBlank(ev[COL_DESC]);
+        await collectLeafItems(`${path}/S${r}`, sectionCode, sectionDesc, label ? `${prefix}${label} › ` : prefix, out);
+        if (out.length > before) continue;
+      }
+      const item = flatExportRowFrom(ev, sectionCode, sectionDesc);
+      if (prefix) item.desc = `${prefix}${item.desc}`;
+      out.push(item);
+    }
+  }
+
   gridApiImplRef.current = {
     addRow() {
       const hot = hotRef.current?.hotInstance;
@@ -3442,14 +3421,11 @@ export function WorkbookView() {
           continue;
         }
 
-        const childPath = `L1/S${row}`; // M5: F:Subtotal's cost child is /S (full recursive export is M8)
-        const childSource = await fetchSheetSourceData(revId, childPath);
-        const childLineRows: number[] = [];
-        for (let cr = 0; cr < NUM_ROWS; cr++) {
-          if (isLineItemRow(childSource[cr])) childLineRows.push(cr);
-        }
+        // Every leaf line item beneath this section, at any depth (see collectLeafItems).
+        const items: FlatExportRow[] = [];
+        await collectLeafItems(`L1/S${row}`, sectionCode, sectionDesc, "", items);
 
-        if (childLineRows.length === 0) {
+        if (items.length === 0) {
           // No breakdown sheet — the section row itself is the leaf item.
           flatRows.push(flatExportRowFrom(sectionEval, sectionCode, sectionDesc));
           continue;
@@ -3461,11 +3437,7 @@ export function WorkbookView() {
         if (includeSectionCols) {
           flatRows.push({ sectionCode, sectionDesc, code: "", desc: "", unit: "", rowKind: "header" });
         }
-
-        const childEvaluated = engineSheetValues(hot, childPath);
-        for (const cr of childLineRows) {
-          flatRows.push(flatExportRowFrom(childEvaluated[cr] ?? [], sectionCode, sectionDesc));
-        }
+        flatRows.push(...items);
 
         if (includeSectionCols) {
           // Subtotal = the section's own rolled-up Subtotal (from L1); Factor = the
@@ -3585,15 +3557,6 @@ export function WorkbookView() {
     setWorkbookLoading(true);
     setLoadProgress(null);
 
-    // ── Timing instrumentation (temporary — helps diagnose the multi-second revision-switch
-    // lag reported against real tenders). Logs each phase's wall time to the console so it can
-    // be read straight out of DevTools without attaching a profiler. Remove once the slow phase
-    // is identified and fixed.
-    const switchStartedAt = performance.now();
-    const mark = (label: string, since: number) => {
-      // eslint-disable-next-line no-console
-      console.log(`[workbook-switch] ${label}: ${(performance.now() - since).toFixed(0)}ms`);
-    };
 
     // Guards against a stale/superseded switch: sheet names in the shared HyperFormula engine
     // are derived from path alone (no revision qualifier), so a second run of this effect for
@@ -3636,51 +3599,39 @@ export function WorkbookView() {
       sheetDataMap.current = map;
       const hot = hotRef.current?.hotInstance;
       if (hot) {
-        let t = performance.now();
         await resetEngineSheets(
           hot,
           [...map].map(([path, data]) => ({ path, data })),
           (done, total) => setLoadProgress({ done, total }),
           isStale,
         );
-        mark(`resetEngineSheets (${map.size} sheets)`, t);
         if (isStale()) return; // superseded mid-load — resetEngineSheets already bailed out
         setLoadProgress(null);
-        t = performance.now();
         loadLevelDataExcl(hot, map.get("L1")!, 1, isAutoUpdatingRef, "L1");
-        mark("loadLevelDataExcl(L1)", t);
       }
       displayedRevIdRef.current = revId;
       syncSheetLinks("L1");
     };
     const registerNamedCells = () => {
-      const t0 = performance.now();
       return wbRead<string>("load_workbook_named_cells", { revisionId: revId })
         .then(json => {
-          mark("invoke load_workbook_named_cells", t0);
           if (isStale()) return; // a newer switch has already taken over — don't clobber it
           let entries: NamedCell[];
           try { entries = JSON.parse(json) as NamedCell[]; } catch { entries = []; }
           namedCellMap.current = new Map(entries.map(nc => [nc.name, nc]));
-          const t1 = performance.now();
           for (const nc of entries) registerNamedExpression(nc);
-          mark(`registerNamedExpression x${entries.length}`, t1);
           if (entries.length > 0) hotRef.current?.hotInstance?.render();
         })
         .catch(() => { /* non-fatal — workbook simply has no named cells yet */ });
     };
 
-    const invokeStartedAt = performance.now();
     wbRead<string>("load_workbook_all_sheets", { revisionId: revId })
       .then(async json => {
-        mark("invoke load_workbook_all_sheets", invokeStartedAt);
-        const parseStartedAt = performance.now();
         let sheets: Array<{ path: string; data: (string | null)[][] }>;
         try { sheets = JSON.parse(json) as typeof sheets; } catch { sheets = []; }
         const map = new Map<string, (string | null)[][]>();
         for (const s of sheets) map.set(s.path, padData(Array.isArray(s.data) ? s.data : []));
         if (!map.has("L1")) map.set("L1", createEmptyData());
-        mark(`JSON.parse + pad (${sheets.length} sheets, ${json.length} chars)`, parseStartedAt);
         await displayL1(map);
         return registerNamedCells();
       })
@@ -3691,7 +3642,6 @@ export function WorkbookView() {
       .finally(() => {
         setLoadProgress(null);
         if (!isStale()) setWorkbookLoading(false);
-        mark("TOTAL revision switch", switchStartedAt);
       });
 
     return () => { cancelled = true; };
@@ -3914,9 +3864,8 @@ export function WorkbookView() {
   // clears the line item (Code + Description) but had already drilled into it,
   // the child (and grandchild) sheet rows remain in `workbook_sheet_data`,
   // silently still contributing to ancestor totals via rollup. "Clean orphaned
-  // sheets" walks the tree from L1, and for every row that no longer looks like
-  // a real line item, deletes that row's persisted sub-sheet (and everything
-  // beneath it) — a no-op if nothing was ever saved there.
+  // sheets" deletes every sub-sheet whose owning row no longer holds anything (and
+  // everything beneath it) — done in one backend transaction, prune_workbook_orphans.
 
   // A row counts as a real line item if ANY of its cells holds a value — not just Code/Desc.
   // Checking Code/Desc alone (the original test) missed two real, common cases: a Quantity
@@ -4001,33 +3950,6 @@ export function WorkbookView() {
       });
     }
     setBreadcrumb(ctxs);
-  }
-
-  /**
-   * Recursively walk the sheet tree from `path` (currently at `level`), deleting
-   * the persisted sub-sheet for every row that no longer holds a real line item.
-   * Collects the paths actually removed (rows_affected > 0) into `removed`.
-   */
-  async function pruneOrphansUnder(
-    revisionId: number,
-    path: string,
-    removed: string[],
-  ): Promise<void> {
-    // Only cost sheets carry children (M5): a live row's F may hold a /S cost child (recursive),
-    // E a /R rate leaf, C a /Q qty leaf. A row that's no longer a line item has orphaned children.
-    const data = await fetchSheetSourceData(revisionId, path);
-    for (let r = 0; r < NUM_ROWS; r++) {
-      const sChild = `${path}/S${r}`;
-      if (!isLineItemRow(data[r])) {
-        for (const child of [sChild, `${path}/R${r}`, `${path}/Q${r}`]) {
-          const n = await wbInvoke<number>("delete_workbook_sheet_subtree", { revisionId, sheetPath: child });
-          if (n > 0) removed.push(child);
-        }
-      } else {
-        // Live row — recurse into its cost child (a non-existent one reads empty and stops).
-        await pruneOrphansUnder(revisionId, sChild, removed);
-      }
-    }
   }
 
   /** Drop any cached entries for `path` and everything beneath it. */
@@ -4138,24 +4060,27 @@ export function WorkbookView() {
       for (const row of cloned) {
         for (let c = 0; c < row.length; c++) row[c] = retargetSheetRefs(row[c], srcPath, dstPath);
       }
-      // Every row, not just ones that "look like" a real line item (isLineItemRow only checks
-      // Code/Description) — a template row can be a pure formula/rate holder with neither, so
-      // gating on that silently skipped its own drilled children. Concurrent, not sequential: a
-      // Cost sheet can easily have dozens of rows, each independently checked (and, for the vast
-      // majority — rows with nothing drilled — immediately no-op'd, see the "no-op if never
-      // drilled" note above) across three suffixes. Awaiting them one at a time here made the
-      // whole clone noticeably slow and, worse, meant checking the result right after pasting
-      // could catch it still mid-flight. Each call touches only its own distinct src/dst paths,
-      // so nothing here races. A single child failing is logged, not left to silently abort the
-      // PARENT's own persist/engine-push below via an unhandled rejection.
+      // Only the children that actually exist. The live engine holds every sheet of the revision,
+      // and the cache holds any created this session, so between them they list every direct
+      // child — this used to probe all three suffixes on every row of the sheet (hundreds of
+      // lookups, most of them database round trips, per pasted row). Concurrent: each call touches
+      // only its own src/dst paths. A child failing is logged, not left to abort the parent's
+      // persist/engine-push below via an unhandled rejection.
+      const prefix = `${srcPath}/`;
+      const children = new Set<string>();
+      let engineNames: string[] = [];
+      try { engineNames = (getFormulasPlugin(hotRef.current?.hotInstance)?.engine?.getSheetNames() as string[]) ?? []; } catch { /* no engine */ }
+      for (const p of [...engineNames.map(sheetNameToPath), ...sheetDataMap.current.keys()]) {
+        if (!p.startsWith(prefix)) continue;
+        const seg = p.slice(prefix.length);
+        if (/^[SRQ]\d+$/.test(seg)) children.add(seg); // direct children only; each recursion handles its own
+      }
       const childClones: Array<Promise<void>> = [];
-      for (let r = 0; r < Math.max(srcData.length, NUM_ROWS); r++) {
-        for (const suffix of ["S", "R", "Q"] as const) {
-          childClones.push(
-            maybeCloneChildSheet(`${srcPath}/${suffix}${r}`, `${dstPath}/${suffix}${r}`)
-              .catch(err => { console.error(`clone-on-paste: failed to clone ${srcPath}/${suffix}${r}`, err); }),
-          );
-        }
+      for (const seg of children) {
+        childClones.push(
+          maybeCloneChildSheet(`${srcPath}/${seg}`, `${dstPath}/${seg}`)
+            .catch(err => { console.error(`clone-on-paste: failed to clone ${srcPath}/${seg}`, err); }),
+        );
       }
       await Promise.all(childClones);
     }
@@ -4172,24 +4097,19 @@ export function WorkbookView() {
     // Deliberately does NOT settle (recompute/render) here — this function recurses into every
     // occupied row's own S/R/Q children (M5), and a paste of a cost sheet with dozens of rows
     // used to mean dozens of full-engine recalculations plus dozens of full grid re-renders, one
-    // per clone, each already paying for the OTHERS' now-stale-again engine state. `addSheet`/
-    // `setSheetContent` also fire the Formulas plugin's own full-rebuild "sheetAdded"/
-    // "sheetRemoved" listener (see beginBulkSheetLoad's doc) unless suppressed, so this is
-    // wrapped the same way `resetEngineSheets` wraps bulk loading. Callers settle ONCE after
-    // every clone in the paste has finished — see afterPaste.
+    // per clone, each already paying for the OTHERS' now-stale-again engine state. Callers
+    // settle ONCE after every clone in the paste has finished — see afterPaste.
     const hot = hotRef.current?.hotInstance;
     if (hot) {
       const plugin = getFormulasPlugin(hot);
       const engine = plugin?.engine;
       if (plugin && engine) {
-        beginBulkSheetLoad(engine);
         try {
           const name = pathToSheetName(dstPath);
           const rows = dataForHot(cloned);
           if (engine.doesSheetExist(name)) engine.setSheetContent(engine.getSheetId(name), rows);
           else plugin.addSheet(name, rows);
         } catch { /* non-fatal — the cache/DB clone above still keeps it consistent on reload */ }
-        finally { endBulkSheetLoad(engine); }
       }
     }
   }
@@ -4199,7 +4119,7 @@ export function WorkbookView() {
   function settleAfterCloneOnPaste(): void {
     const hot = hotRef.current?.hotInstance;
     if (!hot) return;
-    recomputeEngine(hot);
+    // No full recompute: the engine already reflects the cloned sheets (values are live).
     propagateLiveRollupRef.current();
     refreshProjectTotal();
     hot.render();
@@ -4302,8 +4222,9 @@ export function WorkbookView() {
         persistSheet(revId, curPath, curData);
       }
 
-      const removed: string[] = [];
-      await pruneOrphansUnder(revId, "L1", removed);
+      // One backend transaction finds and deletes every orphan (prune_workbook_orphans); it runs
+      // behind the save queued just above, so it sees the current sheet's latest rows.
+      const removed = await wbInvoke<string[]>("prune_workbook_orphans", { revisionId: revId });
       for (const p of removed) {
         purgeCachedSubtree(p);
         // The live engine holds every sheet of the revision; drop the deleted ones there too, or
@@ -4585,7 +4506,6 @@ export function WorkbookView() {
         } finally {
           isAutoUpdatingRef.current = false;
         }
-        recomputeEngine(hot);
         propagateLiveRollupRef.current();
         refreshProjectTotal();
         hot.render();

@@ -503,7 +503,23 @@ unconditional derivation — it replaced a typed Subtotal with Rate × Quantity 
 was displayed.
 
 **Excel export reads the live engine** (`engineSheetValues`), which holds every sheet of the
-revision — never re-evaluate a sheet on its own, where cross-sheet rollups can't resolve.
+revision — never re-evaluate a sheet on its own, where cross-sheet rollups can't resolve. It
+flattens to leaf items at any depth (`collectLeafItems`): a row whose Subtotal is an `XSUMTOT`
+of its own cost sheet is replaced by that sheet's items — but only when its Factor is 1/blank, so
+the flattened items still add up to the row.
+
+**No full rebuild on sheet add/remove.** Handsontable registers `rebuildAndRecalculate()` on every
+engine `sheetAdded`/`sheetRemoved` (a workaround for older HyperFormula); HF 3.x resolves
+cross-sheet references itself, so `detachSheetChurnRebuild` removes those listeners once per
+engine. Only the manual Recalculate button forces a rebuild.
+
+**Numbers are read strictly** (`strictNumber` in workbookCalc.ts) wherever the workbook sums or
+exports values — `"3 no."` is text, not 3. Sheets are **stored trimmed** (`trimSheetForStorage`);
+the in-memory `NUM_ROWS` padding is never written to disk. Orphaned build-ups are pruned by one
+backend transaction (`prune_workbook_orphans`).
+
+**Project DB settings** (`init_database`): project files often live on a network share, so the DB
+stays in rollback-journal mode (TRUNCATE) — never switch it to WAL, which is unsafe over SMB.
 
 ### Rate library is a supplier price book, shared across every project
 

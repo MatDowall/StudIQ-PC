@@ -89,18 +89,30 @@ export function isAutoOwnedCell(source: unknown, kind: "standard" | "qty", col: 
   return false;
 }
 
+// A whole-cell number: optional sign, digits with an optional decimal part (or a bare decimal),
+// optional exponent, surrounding whitespace allowed. Deliberately rejects anything with trailing
+// text — the same rule HyperFormula applies to a string cell.
+const STRICT_NUMBER_RE = /^\s*[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?\s*$/;
+
+/** A cell value as a finite number, or NaN when it isn't one. Strings must be a number in full:
+ *  `parseFloat` read "3 no." as 3 and "12abc" as 12, so descriptive text typed into a numeric
+ *  column was silently summed into rollups. */
+export function strictNumber(v: unknown): number {
+  if (typeof v === "number") return isFinite(v) ? v : NaN;
+  if (typeof v === "string" && STRICT_NUMBER_RE.test(v)) return Number(v);
+  return NaN;
+}
+
 /** Coerce a cell value (number, numeric string, formula string, null) to a finite number, defaulting to 0. */
 export function toNum(v: unknown): number {
-  if (typeof v === "number") return isFinite(v) ? v : 0;
-  if (typeof v === "string" && v !== "") { const n = parseFloat(v); if (isFinite(n)) return n; }
-  return 0;
+  const n = strictNumber(v);
+  return isFinite(n) ? n : 0;
 }
 
 /** Coerce an *evaluated* cell value to a number, or `undefined` if the cell is blank —
  *  used by the Excel flatten-export so empty cells stay empty rather than rendering as 0. */
 export function numOrUndefined(v: unknown): number | undefined {
-  if (v == null || v === "") return undefined;
-  const n = typeof v === "number" ? v : parseFloat(String(v));
+  const n = strictNumber(v);
   return isFinite(n) ? n : undefined;
 }
 
@@ -118,7 +130,7 @@ export function sumComputedCol(computedData: unknown[][], colIndex: number): num
   let hasData = false;
   for (const row of computedData) {
     const v = (row as unknown[])[colIndex];
-    const n = typeof v === "number" ? v : typeof v === "string" && v !== "" ? parseFloat(v) : NaN;
+    const n = strictNumber(v);
     if (isFinite(n)) { total += n; hasData = true; }
   }
   return hasData ? total : null;
@@ -207,4 +219,23 @@ export function deriveFactorTotal(
   if (factor == null && subtotal > 0) factor = 1;
   if (total == null) total = subtotal * (factor ?? 0);
   return { factor, total };
+}
+
+/** A sheet as it should be stored: trailing empty rows dropped, and each row's trailing empty
+ *  cells dropped. Every sheet is held in memory padded to the workbook-wide row count (so the grid
+ *  and its row loops see one shape) and at least 26 columns — which, saved as-is, wrote every sheet
+ *  as thousands of `null`s, and every sheet grew the moment any one sheet did. Loading pads back
+ *  out (`padData`), so the round trip is lossless. */
+export function trimSheetForStorage(data: (string | null)[][]): (string | null)[][] {
+  const isBlank = (v: string | null | undefined) => v == null || v === "";
+  let lastRow = data.length - 1;
+  while (lastRow >= 0 && (data[lastRow] ?? []).every(isBlank)) lastRow--;
+  const out: (string | null)[][] = [];
+  for (let r = 0; r <= lastRow; r++) {
+    const row = data[r] ?? [];
+    let lastCol = row.length - 1;
+    while (lastCol >= 0 && isBlank(row[lastCol])) lastCol--;
+    out.push(row.slice(0, lastCol + 1).map(v => (isBlank(v) ? null : v)));
+  }
+  return out;
 }

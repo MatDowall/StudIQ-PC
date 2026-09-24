@@ -19,7 +19,7 @@ import {
   COL_COUNT, COL_LENGTH, COL_WIDTH, COL_HEIGHT,
   legacyColLetter, qtyTotalFormula, toNum, numOrUndefined, textOrBlank,
   sumComputedCol, rollupRateIntoL2, rollupQtyIntoL2, rollupL2IntoL1, deriveFactorTotal,
-  autoFormulaFor, isAutoOwnedCell,
+  autoFormulaFor, isAutoOwnedCell, strictNumber, trimSheetForStorage,
 } from "./workbookCalc";
 
 // ─── Test helpers mirroring WorkbookView's engine usage ────────────────────
@@ -326,5 +326,40 @@ describe("auto-derived F/H ownership (isAutoOwnedCell)", () => {
     expect(isAutoOwnedCell("=XSUMTOT(L1_sS3!H:H)", "standard", COL_SUBTOTAL)).toBe(false); // drilled rollup
     expect(isAutoOwnedCell("=F5*G5+100", "standard", COL_TOTAL)).toBe(false);
     expect(isAutoOwnedCell("=C3*D3", "qty", COL_TOTAL)).toBe(false);
+  });
+});
+
+describe("strict number reading", () => {
+  it("accepts whole-cell numbers only", () => {
+    expect(strictNumber(12)).toBe(12);
+    expect(strictNumber("45.52")).toBe(45.52);
+    expect(strictNumber(" -3 ")).toBe(-3);
+    expect(strictNumber(".5")).toBe(0.5);
+    expect(strictNumber("1e3")).toBe(1000);
+    expect(strictNumber("3 no.")).toBeNaN();   // parseFloat read this as 3
+    expect(strictNumber("12abc")).toBeNaN();
+    expect(strictNumber("1,234")).toBeNaN();   // not a number to HyperFormula either
+    expect(strictNumber("")).toBeNaN();
+    expect(strictNumber(null)).toBeNaN();
+  });
+
+  it("text in a numeric column no longer leaks into a rollup sum", () => {
+    expect(sumComputedCol([[null, "3 no."], [null, 10], [null, "2.5"]], 1)).toBe(12.5);
+    expect(toNum("12abc")).toBe(0);
+    expect(numOrUndefined("3 no.")).toBeUndefined();
+  });
+});
+
+describe("trimSheetForStorage", () => {
+  it("drops trailing blank rows and cells, keeps interior blanks", () => {
+    const data = [
+      ["a", null, "b", null, ""],
+      [null, null, null],
+      ["", "x", null],
+      [null, "", null],
+      [null],
+    ];
+    expect(trimSheetForStorage(data)).toEqual([["a", null, "b"], [], [null, "x"]]);
+    expect(trimSheetForStorage([[null, ""], []])).toEqual([]);
   });
 });

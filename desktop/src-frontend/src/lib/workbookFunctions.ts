@@ -15,6 +15,7 @@
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { HyperFormula, FunctionPlugin, FunctionArgumentType } from "hyperformula";
+import { strictNumber } from "./workbookCalc";
 
 function roundTo(value: number, dp: number): number {
   if (!isFinite(dp) || dp < 0) return value;
@@ -29,9 +30,10 @@ export class WorkbookFunctionsPlugin extends FunctionPlugin {
     let total = 0;
     // Blank cells come back as HyperFormula's EmptyValue (a Symbol) and cells can hold CellError
     // objects — only fold in real numbers and numeric strings; never call Number() on a Symbol.
+    // (strictNumber: a text cell like "3 no." is not a number and is skipped, not read as 3.)
     const add = (v: unknown) => {
-      if (typeof v === "number") { if (isFinite(v)) total += v; return; }
-      if (typeof v === "string" && v !== "") { const n = parseFloat(v); if (isFinite(n)) total += n; }
+      const n = strictNumber(v);
+      if (isFinite(n)) total += n;
     };
     if (ast.args && ast.args.length > 0) {
       const val = self.evaluateAst(ast.args[0], state);

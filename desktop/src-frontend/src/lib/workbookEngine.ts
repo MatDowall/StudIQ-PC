@@ -1,17 +1,10 @@
-// The multi-sheet workbook calculation engine (M1).
+// A standalone multi-sheet HyperFormula engine holding every sheet of a revision.
 //
-// Today WorkbookView keeps exactly one HyperFormula sheet ("Sheet1"), cleared and reloaded
-// on every drill, and evaluates every *other* sheet in throwaway `HyperFormula.buildFromArray`
-// instances (evaluateClonedRows / evaluateWithNames) because those sheets aren't loaded. This
-// class replaces that model: ONE long-lived engine holds every sheet of a revision at once, so
-//   - any sheet's evaluated values are readable at any time (no throwaway instances), and
-//   - a parent cell can hold a *live cross-sheet formula* (`=SUM(child!H1:H200)`) instead of a
-//     baked literal — the declarative CostX rollup the re-architecture is heading toward.
-//
-// The engine is standalone (owns its own HyperFormula), so it is fully unit-testable headlessly
-// — see workbookEngine.test.ts, which proves the declarative rollup reproduces the golden
-// fixture's totals. Wiring it to the live Handsontable grid (switchSheet on drill) is a separate
-// step done under GUI verification; this module carries no React/Handsontable dependency.
+// The live grid does the same job through Handsontable's Formulas plugin (WorkbookView's
+// resetEngineSheets / loadLevelData drive one engine, one HF sheet per path). This class is the
+// headless equivalent with no React/Handsontable dependency, used by the tests to exercise the
+// workbook's formula behaviour — cross-sheet rollups, named cells, row shifts — against the real
+// engine (see workbookEngine.test.ts, workbookFunctions.test.ts, workbookRowShift.test.ts).
 
 import { HyperFormula } from "hyperformula";
 import { SheetNameRegistry, pathToSheetName } from "./workbookSheetNames";
