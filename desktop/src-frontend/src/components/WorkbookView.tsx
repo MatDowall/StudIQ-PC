@@ -35,12 +35,12 @@ import {
   COL_LAB, COL_LAB_TOTAL, COL_MAT, COL_MAT_TOTAL, COL_SUB, COL_SUB_TOTAL, COL_SUM, COL_SUM_TOTAL,
   COL_COUNT, COL_LENGTH, COL_WIDTH, COL_HEIGHT,
   qtyTotalFormula, toNum, numOrUndefined, textOrBlank, sumComputedCol,
-  deriveFactorTotal, legacyColLetter,
+  deriveFactorTotal, legacyColLetter, autoFormulaFor, isAutoOwnedCell,
 } from "../lib/workbookCalc";
 import { pathToSheetName, sheetNameToPath, retargetSheetRefs } from "../lib/workbookSheetNames";
 import { wbInvoke, wbRead, wbWrite, flushWorkbookWrites, setWorkbookDbErrorHandler, setWorkbookFlushHook } from "../lib/workbookDb";
 import { registerWorkbookFunctions } from "../lib/workbookFunctions";
-import { toDisplay as xsumToDisplay, toStored as xsumToStored, XSUM_ROW_BOUND } from "../lib/workbookXsumDisplay";
+import { toDisplay as xsumToDisplay, toStored as xsumToStored, rollupRangeRef, normalizeLegacyRollups } from "../lib/workbookXsumDisplay";
 import {
   DEFAULT_WORKBOOK_LAYOUT, standardColumns, qtyColumns, parseLayout, serializeLayout,
   isDefaultLayout, FIRST_USER_COL, type WorkbookLayout,
@@ -397,7 +397,8 @@ function padData(raw: (string | null)[][]): (string | null)[][] {
     const row = raw[r] ?? [];
     for (let c = 0; c < Math.min(row.length, cols); c++) {
       const v = row[c];
-      result[r][c] = (v != null && v !== "") ? String(v) : null;
+      // Legacy rollups stored a row-bounded child range (H1:H1000); upgrade to whole-column on load.
+      result[r][c] = (v != null && v !== "") ? normalizeLegacyRollups(String(v)) : null;
     }
   }
   return result;
@@ -568,12 +569,19 @@ function deriveLevelFormulas(
     const rFrom = rowRange?.from ?? 0;
     const rTo = rowRange?.to ?? NUM_ROWS - 1;
     const isExcluded = (r: number, c: number) => excluded != null && excluded.has(styleKey(r, c));
-    // A drilled rollup cell (=XSUMTOT/=XSUMUSER…) is authoritative — the auto F=E*C / J=I*C
-    // derivation must never overwrite it (M5: F/E/C are all drillable on a cost sheet).
-    const isXsum = (r: number, c: number) => {
+    // The app only writes its auto formula into a cell that is blank or still holds that auto
+    // formula (isAutoOwnedCell). A typed lump sum, a hand-built formula or a drilled =XSUMTOT(...)
+    // rollup belongs to the estimator and is left alone — and a cell already holding the right
+    // formula isn't rewritten, so merely displaying a sheet doesn't dirty it.
+    const src = (r: number, c: number): unknown =>
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const s = (hot as any).getSourceDataAtCell(r, c);
-      return typeof s === "string" && s.toUpperCase().startsWith("=XSUM");
+      (hot as any).getSourceDataAtCell(r, c);
+    const deriveInto = (out: Array<[number, number, string]>, r: number, c: number) => {
+      if (isExcluded(r, c)) return;
+      const cur = src(r, c);
+      const formula = autoFormulaFor(kind, c, r);
+      if (formula == null || cur === formula || !isAutoOwnedCell(cur, kind, c)) return;
+      out.push([r, c, formula]);
     };
 
     if (kind === "qty") {
@@ -588,13 +596,12 @@ function deriveLevelFormulas(
         if (!hasInput) continue;
 
         if (!isExcluded(r, COL_FACTOR)) {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const gSrc = (hot as any).getSourceDataAtCell(r, COL_FACTOR);
+          const gSrc = src(r, COL_FACTOR);
           if (gSrc == null || String(gSrc) === "") {
             pass.push([r, COL_FACTOR, "1"]);
           }
         }
-        if (!isExcluded(r, COL_TOTAL)) pass.push([r, COL_TOTAL, qtyTotalFormula(r)]);
+        deriveInto(pass, r, COL_TOTAL);
       }
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       if (pass.length) hot.setDataAtCell(pass as any);
@@ -602,16 +609,13 @@ function deriveLevelFormulas(
     }
 
     // Pass 1: F = E×C for every row with a Quantity or Rate value — at ANY depth now (M5: every
-    // cost sheet, including L1, computes its own subtotals). Skips a row whose F is a drilled
-    // =XSUMTOT rollup (that subtotal comes from the child cost sheet, not from rate×qty).
+    // cost sheet, including L1, computes its own subtotals) — unless F holds the estimator's own
+    // content (a typed subtotal, or a drilled =XSUMTOT rollup from a child cost sheet).
     const pass1: Array<[number, number, string]> = [];
     for (let r = rFrom; r <= rTo; r++) {
-      if (isExcluded(r, COL_SUBTOTAL) || isXsum(r, COL_SUBTOTAL)) continue;
       const cVal = hot.getDataAtCell(r, COL_QTY);
       const eVal = hot.getDataAtCell(r, COL_RATE);
-      if ((cVal != null && cVal !== "") || (eVal != null && eVal !== "")) {
-        pass1.push([r, COL_SUBTOTAL, `=E${r + 1}*C${r + 1}`]);
-      }
+      if ((cVal != null && cVal !== "") || (eVal != null && eVal !== "")) deriveInto(pass1, r, COL_SUBTOTAL);
     }
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     if (pass1.length) hot.setDataAtCell(pass1 as any);
@@ -624,13 +628,12 @@ function deriveLevelFormulas(
       const f = typeof fRaw === "number" ? fRaw : parseFloat(String(fRaw)) || 0;
 
       if (!isExcluded(r, COL_FACTOR)) {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const gSrc = (hot as any).getSourceDataAtCell(r, COL_FACTOR);
+        const gSrc = src(r, COL_FACTOR);
         if (f > 0 && (gSrc == null || String(gSrc) === "")) {
           pass2.push([r, COL_FACTOR, "1"]);
         }
       }
-      if (!isExcluded(r, COL_TOTAL)) pass2.push([r, COL_TOTAL, `=F${r + 1}*G${r + 1}`]);
+      deriveInto(pass2, r, COL_TOTAL);
     }
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     if (pass2.length) hot.setDataAtCell(pass2 as any);
@@ -1062,7 +1065,7 @@ function readRowCtxFromGrid(hot: Handsontable, rowIndex: number): BreadcrumbCtx 
     let val = hot.getDataAtCell(rowIndex, col);
     // A cell whose rollup formula was just written can hand back its raw source here (not yet
     // re-cached) — read the engine's evaluated value instead so the breadcrumb shows the number,
-    // not "…!H1:H1000)". Last resort: display the clean positional form rather than the raw ref.
+    // not "…!H:H)". Last resort: display the clean positional form rather than the raw ref.
     if (typeof val === "string" && val.charAt(0) === "=") {
       if (engine && sheetId != null) {
         try { const e = engine.getCellValue({ sheet: sheetId, row: rowIndex, col }); if (e != null && typeof e !== "object") val = e; } catch { /* fall through */ }
@@ -3106,35 +3109,8 @@ export function WorkbookView() {
     if (writes.length) hot.setDataAtCell(writes as any);
   }
 
-  /** After a native row insert/delete on `path`, HyperFormula has adjusted the parent's rollup range
-   *  into this sheet like any other reference — and inserting above row 1 turns `H1:H1000` into
-   *  `H2:H1001`, dropping the new top row from the parent's total. A rollup always means the
-   *  child's whole column, so rebuild the parent row's XSUM* references in canonical form. */
-  function canonicalizeParentRollups(hot: Handsontable, path: string): void {
-    const row = pathLastRow(path);
-    const parentPath = path.slice(0, path.lastIndexOf("/"));
-    const engine = getFormulasPlugin(hot)?.engine;
-    const parentName = pathToSheetName(parentPath);
-    if (row == null || !parentPath || !engine || !engine.doesSheetExist(parentName)) return;
-    const sheet = engine.getSheetId(parentName);
-    const cached = sheetDataMap.current.get(parentPath);
-    let changed = false;
-    const width = engine.getSheetDimensions(sheet).width as number;
-    for (let col = 0; col < width; col++) {
-      const src = engine.getCellSerialized({ sheet, row, col });
-      if (typeof src !== "string" || src.charAt(0) !== "=" || !/XSUM/i.test(src)) continue;
-      const canonical = xsumToStored(xsumToDisplay(src), parentPath, row);
-      if (canonical === src) continue;
-      engine.setCellContents({ sheet, row, col }, [[canonical]]);
-      if (cached?.[row]) cached[row][col] = canonical;
-      changed = true;
-    }
-    const revId = revIdRef.current;
-    if (changed && cached && revId != null) persistSheet(revId, parentPath, cached);
-  }
-
   /** A native row insert/delete on `path` makes HyperFormula rewrite references to it in OTHER
-   *  sheets too (a parent's rollup range, a hand-typed cross-sheet reference). Only the edited sheet
+   *  sheets too (e.g. a hand-typed cross-sheet reference). Only the edited sheet
    *  goes through autosave, so persist every other sheet whose formulas mention it and whose engine
    *  content no longer matches its cached copy — otherwise the file keeps the pre-shift text and
    *  the workbook recalculates differently after a reopen than it did in the session. */
@@ -3192,7 +3168,6 @@ export function WorkbookView() {
       hot.alter("insert_row_above", insertAt, 1);
       hot.alter("remove_row", hot.countRows() - 1, 1); // trim back to the shared row count
       if (lastOccupied >= insertAt) retargetRollupRows(hot, path, insertAt + 1, lastOccupied + 1);
-      canonicalizeParentRollups(hot, path);
       persistSheetsReferencing(hot, path);
     } finally {
       isAutoUpdatingRef.current = false;
@@ -3261,7 +3236,6 @@ export function WorkbookView() {
       hot.alter("remove_row", deleteAt, 1);
       hot.alter("insert_row_below", hot.countRows() - 1, 1); // pad back to the shared row count
       if (lastOccupied > deleteAt) retargetRollupRows(hot, path, deleteAt, lastOccupied - 1);
-      canonicalizeParentRollups(hot, path);
       persistSheetsReferencing(hot, path);
     } finally {
       isAutoUpdatingRef.current = false;
@@ -3758,11 +3732,10 @@ export function WorkbookView() {
   function writeRollupFormulasIntoGrid(hot: Handsontable, row: number, col: number, childPath: string, parentPath: string) {
     // Ensure the child sheet exists so the reference resolves immediately (no #REF flash).
     ensureEngineSheet(hot, childPath);
-    const childName = pathToSheetName(childPath);
-    // CostX-named XSUM over the child column. The child range is an explicit argument so
+    // CostX-named XSUM over the child's whole column. The child range is an explicit argument so
     // HyperFormula orders the child's own formulas (F=E*C, H=F*G) BEFORE this rollup — required
     // for correctness. All XSUM* are ROUND(SUM(range), dp); the name documents intent.
-    const xsum = (fn: string, c: number) => `=${fn}(${childName}!${legacyColLetter(c)}1:${legacyColLetter(c)}${XSUM_ROW_BOUND})`;
+    const xsum = (fn: string, c: number) => `=${fn}(${rollupRangeRef(childPath, c)})`;
     const writes: Array<[number, number, string]> = [];
     const put = (c: number, formula: string) => { if (!isCellExcluded(parentPath, row, c)) writes.push([row, c, formula]); };
     if (col === COL_SUBTOTAL) {
@@ -4537,12 +4510,9 @@ export function WorkbookView() {
     //     `=M3*C3` — via shiftFormulaRowRefs. Handsontable pastes the source text verbatim, so
     //     without this the pasted formula would silently keep reading the row it was copied
     //     FROM. An XSUM formula is retargeted separately, by cell position, via beforeChange's
-    //     toStored round-trip. F:Subtotal/H:Total are skipped here entirely (unless excluded
-    //     from auto-calc) — the paste's own afterChange already ran deriveLevelFormulas' pass
-    //     1/2 by the time afterPaste fires, which unconditionally regenerates those two purely
-    //     positionally (`=E<row>*C<row>`, `=F<row>*G<row>`); shifting them AGAIN here on top of
-    //     that already-correct value double-counted the offset (row 5 pasted to row 7 read
-    //     row 9 — the same +2 shift applied twice).
+    //     toStored round-trip. An F:Subtotal/H:Total already holding the auto formula for its
+    //     new row is skipped — the paste's own afterChange re-derived it, and shifting it again
+    //     double-counted the offset (row 5 pasted to row 7 read row 9).
     //  2. Pasting a copied drill-column cell (F:Subtotal, E:Rate or C:Quantity) additionally
     //     clones the source row's drilled child sheet onto the destination row, so its full
     //     breakdown comes along independently of the original. Any drill column, any level —
@@ -4559,9 +4529,15 @@ export function WorkbookView() {
         [COL_SUBTOTAL, "S"], [COL_RATE, "R"], [COL_QTY, "Q"],
       ];
       const kind = sheetKindForPath(dstPath);
+      // By the time afterPaste runs, the paste's own afterChange may already have re-derived an auto
+      // formula (F=E×C, H=F×G, qty H=PRODUCT) onto its new row; shifting that again would double the
+      // offset. So skip exactly the cells that already hold the auto formula for THEIR OWN row.
+      // Everything else — an estimator's own F/H formula (never re-derived), or an auto formula the
+      // derivation didn't reach (e.g. only column H was pasted) — gets the ordinary shift below.
       const isAutoRegenerated = (row: number, col: number) => {
-        if (isCellExcluded(dstPath, row, col)) return false;
-        return kind === "qty" ? col === COL_TOTAL : (col === COL_SUBTOTAL || col === COL_TOTAL);
+        const formula = autoFormulaFor(kind, col, row);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        return formula != null && (hot as any)?.getSourceDataAtCell(row, col) === formula;
       };
       const refFix: Array<[number, number, string]> = [];
       // Tracked so the footer's activity indicator (set below) clears only once every

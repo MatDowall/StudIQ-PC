@@ -2,7 +2,7 @@
 // child-reference form). Pure string logic. M5 suffixes: cost/Sub-Total → /S, rate → /R, qty → /Q.
 
 import { describe, it, expect } from "vitest";
-import { toDisplay, toStored, isStoredRollup } from "./workbookXsumDisplay";
+import { toDisplay, toStored, isStoredRollup, normalizeLegacyRollups } from "./workbookXsumDisplay";
 import { FIRST_USER_COL } from "./workbookLayout";
 import { legacyColLetter } from "./workbookCalc";
 
@@ -12,14 +12,14 @@ const K = legacyColLetter(FIRST_USER_COL + 2);   // "K" (user col 3)
 
 describe("toDisplay: stored reference → clean positional", () => {
   it("XSUMTOT (cost /S) / RATE (/R) / QTY (/Q) drop the reference (keep dp)", () => {
-    expect(toDisplay("=XSUMTOT(L1_sS6!H1:H1000)")).toBe("=XSUMTOT()");
-    expect(toDisplay("=XSUMRATE(L1_sS6_sR2!H1:H1000,2)")).toBe("=XSUMRATE(2)");
-    expect(toDisplay("=XSUMQTY(L1_sS6_sQ2!H1:H1000,3)")).toBe("=XSUMQTY(3)");
+    expect(toDisplay("=XSUMTOT(L1_sS6!H:H)")).toBe("=XSUMTOT()");
+    expect(toDisplay("=XSUMRATE(L1_sS6_sR2!H:H,2)")).toBe("=XSUMRATE(2)");
+    expect(toDisplay("=XSUMQTY(L1_sS6_sQ2!H:H,3)")).toBe("=XSUMQTY(3)");
   });
   it("XSUMUSER family recover the user-column number from the reference column", () => {
-    expect(toDisplay(`=XSUMUSER(L1_sS6!${J}1:${J}1000)`)).toBe("=XSUMUSER(2)");
-    expect(toDisplay(`=XSUMRATEUSER(L1_sS6_sR2!${I}1:${I}1000,2)`)).toBe("=XSUMRATEUSER(1,2)");
-    expect(toDisplay(`=XSUMRATEUSER(L1_sS6_sR2!${K}1:${K}1000)`)).toBe("=XSUMRATEUSER(3)");
+    expect(toDisplay(`=XSUMUSER(L1_sS6!${J}:${J})`)).toBe("=XSUMUSER(2)");
+    expect(toDisplay(`=XSUMRATEUSER(L1_sS6_sR2!${I}:${I},2)`)).toBe("=XSUMRATEUSER(1,2)");
+    expect(toDisplay(`=XSUMRATEUSER(L1_sS6_sR2!${K}:${K})`)).toBe("=XSUMRATEUSER(3)");
   });
   it("passes non-rollup content through unchanged", () => {
     expect(toDisplay("=E1*C1")).toBe("=E1*C1");
@@ -28,42 +28,42 @@ describe("toDisplay: stored reference → clean positional", () => {
     expect(toDisplay("42")).toBe("42");
   });
   it("rewrites a rollup call nested inside another formula (e.g. IF), leaving the rest alone", () => {
-    expect(toDisplay(`=IF(H5>0,XSUMRATEUSER(L1_sS6_sR6!${I}1:${I}1000,2),0)`))
+    expect(toDisplay(`=IF(H5>0,XSUMRATEUSER(L1_sS6_sR6!${I}:${I},2),0)`))
       .toBe("=IF(H5>0,XSUMRATEUSER(1,2),0)");
   });
 });
 
 describe("toStored: clean positional → stored reference (from cell position)", () => {
   it("rebuilds the /S cost child for XSUMTOT and the /R rate child for XSUMRATE", () => {
-    expect(toStored("=XSUMTOT()", "L1", 6)).toBe("=XSUMTOT(L1_sS6!H1:H1000)");
-    expect(toStored("=XSUMRATE(2)", "L1/S6", 2)).toBe("=XSUMRATE(L1_sS6_sR2!H1:H1000,2)");
+    expect(toStored("=XSUMTOT()", "L1", 6)).toBe("=XSUMTOT(L1_sS6!H:H)");
+    expect(toStored("=XSUMRATE(2)", "L1/S6", 2)).toBe("=XSUMRATE(L1_sS6_sR2!H:H,2)");
   });
   it("rebuilds the /Q child reference for the QTY family", () => {
-    expect(toStored("=XSUMQTY(3)", "L1/S6", 2)).toBe("=XSUMQTY(L1_sS6_sQ2!H1:H1000,3)");
+    expect(toStored("=XSUMQTY(3)", "L1/S6", 2)).toBe("=XSUMQTY(L1_sS6_sQ2!H:H,3)");
   });
   it("maps the user-column number back to the right column", () => {
-    expect(toStored("=XSUMRATEUSER(1,2)", "L1/S6", 2)).toBe(`=XSUMRATEUSER(L1_sS6_sR2!${I}1:${I}1000,2)`);
-    expect(toStored("=XSUMUSER(3)", "L1", 6)).toBe(`=XSUMUSER(L1_sS6!${K}1:${K}1000)`);
+    expect(toStored("=XSUMRATEUSER(1,2)", "L1/S6", 2)).toBe(`=XSUMRATEUSER(L1_sS6_sR2!${I}:${I},2)`);
+    expect(toStored("=XSUMUSER(3)", "L1", 6)).toBe(`=XSUMUSER(L1_sS6!${K}:${K})`);
   });
   it("passes non-rollup content through unchanged", () => {
     expect(toStored("=E1*C1", "L1", 0)).toBe("=E1*C1");
     expect(toStored("123", "L1", 0)).toBe("123");
-    expect(toStored("=XSUMTOT(L1_sS6!H1:H1000)", "L1", 6)).toBe("=XSUMTOT(L1_sS6!H1:H1000)"); // already stored → untouched
+    expect(toStored("=XSUMTOT(L1_sS6!H:H)", "L1", 6)).toBe("=XSUMTOT(L1_sS6!H:H)"); // already stored → untouched
   });
   it("rebuilds a rollup call nested inside another formula (e.g. IF), leaving the rest alone", () => {
     expect(toStored("=IF(H5>0,XSUMRATEUSER(1,2),0)", "L1/S6", 6))
-      .toBe(`=IF(H5>0,XSUMRATEUSER(L1_sS6_sR6!${I}1:${I}1000,2),0)`);
+      .toBe(`=IF(H5>0,XSUMRATEUSER(L1_sS6_sR6!${I}:${I},2),0)`);
   });
 });
 
 describe("round-trip", () => {
   it("stored → display → stored is stable for the same cell position", () => {
     const cases: Array<[string, string, number]> = [
-      ["=XSUMTOT(L1_sS6!H1:H1000)", "L1", 6],
-      ["=XSUMRATE(L1_sS6_sR2!H1:H1000,2)", "L1/S6", 2],
-      ["=XSUMQTY(L1_sS6_sQ2!H1:H1000,3)", "L1/S6", 2],
-      [`=XSUMRATEUSER(L1_sS6_sR2!${I}1:${I}1000,2)`, "L1/S6", 2],
-      [`=XSUMUSER(L1_sS6!${K}1:${K}1000)`, "L1", 6],
+      ["=XSUMTOT(L1_sS6!H:H)", "L1", 6],
+      ["=XSUMRATE(L1_sS6_sR2!H:H,2)", "L1/S6", 2],
+      ["=XSUMQTY(L1_sS6_sQ2!H:H,3)", "L1/S6", 2],
+      [`=XSUMRATEUSER(L1_sS6_sR2!${I}:${I},2)`, "L1/S6", 2],
+      [`=XSUMUSER(L1_sS6!${K}:${K})`, "L1", 6],
     ];
     for (const [stored, path, r] of cases) {
       expect(toStored(toDisplay(stored), path, r)).toBe(stored);
@@ -75,19 +75,37 @@ describe("round-trip", () => {
     // (e.g. from row 6) into row 9 must rebuild the child reference for row 9, not keep
     // pointing at row 6. WorkbookView's beforeChange achieves this by always routing a
     // pasted value through toDisplay before toStored — this test asserts that composition.
-    const stored = "=XSUMRATE(L1_sS6_sR6!H1:H1000,2)";
-    expect(toStored(toDisplay(stored), "L1/S6", 9)).toBe("=XSUMRATE(L1_sS6_sR9!H1:H1000,2)");
+    const stored = "=XSUMRATE(L1_sS6_sR6!H:H,2)";
+    expect(toStored(toDisplay(stored), "L1/S6", 9)).toBe("=XSUMRATE(L1_sS6_sR9!H:H,2)");
 
-    const storedUser = `=XSUMUSER(L1_sS6!${K}1:${K}1000)`;
-    expect(toStored(toDisplay(storedUser), "L1", 12)).toBe(`=XSUMUSER(L1_sS12!${K}1:${K}1000)`);
+    const storedUser = `=XSUMUSER(L1_sS6!${K}:${K})`;
+    expect(toStored(toDisplay(storedUser), "L1", 12)).toBe(`=XSUMUSER(L1_sS12!${K}:${K})`);
   });
 });
 
 describe("isStoredRollup", () => {
   it("recognises stored rollups only", () => {
-    expect(isStoredRollup("=XSUMTOT(L1_sS6!H1:H1000)")).toBe(true);
+    expect(isStoredRollup("=XSUMTOT(L1_sS6!H:H)")).toBe(true);
     expect(isStoredRollup("=XSUMTOT()")).toBe(false); // positional, not stored
     expect(isStoredRollup("=E1*C1")).toBe(false);
     expect(isStoredRollup(42)).toBe(false);
+  });
+});
+
+describe("legacy row-bounded rollups (H1:H1000)", () => {
+  it("still display and re-store, now as a whole-column reference", () => {
+    expect(toDisplay("=XSUMRATE(L1_sS6_sR2!H1:H1000,2)")).toBe("=XSUMRATE(2)");
+    expect(toStored(toDisplay("=XSUMTOT(L1_sS6!H1:H1000)"), "L1", 6)).toBe("=XSUMTOT(L1_sS6!H:H)");
+    expect(isStoredRollup("=XSUMTOT(L1_sS6!$H$1:$H$1000)")).toBe(true);
+  });
+
+  it("normalizeLegacyRollups upgrades only the bounded child range, anywhere in the formula", () => {
+    expect(normalizeLegacyRollups("=XSUMTOT(L1_sS18!H1:H1000)")).toBe("=XSUMTOT(L1_sS18!H:H)");
+    expect(normalizeLegacyRollups("=IF(H44>0,XSUMRATEUSER(L1_sS18_sR43!J1:J1000),0)"))
+      .toBe("=IF(H44>0,XSUMRATEUSER(L1_sS18_sR43!J:J),0)");
+    expect(normalizeLegacyRollups("=XSUMRATE(L1_sS6_sR2!H1:H1001,2)")).toBe("=XSUMRATE(L1_sS6_sR2!H:H,2)");
+    expect(normalizeLegacyRollups("=SUM(H1:H1000)")).toBe("=SUM(H1:H1000)"); // not a rollup
+    expect(normalizeLegacyRollups("=XSUMTOT(L1_sS6!H:H)")).toBe("=XSUMTOT(L1_sS6!H:H)");
+    expect(normalizeLegacyRollups("plain text")).toBe("plain text");
   });
 });

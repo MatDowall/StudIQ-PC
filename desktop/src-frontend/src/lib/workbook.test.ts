@@ -19,6 +19,7 @@ import {
   COL_COUNT, COL_LENGTH, COL_WIDTH, COL_HEIGHT,
   legacyColLetter, qtyTotalFormula, toNum, numOrUndefined, textOrBlank,
   sumComputedCol, rollupRateIntoL2, rollupQtyIntoL2, rollupL2IntoL1, deriveFactorTotal,
+  autoFormulaFor, isAutoOwnedCell,
 } from "./workbookCalc";
 
 // ─── Test helpers mirroring WorkbookView's engine usage ────────────────────
@@ -297,5 +298,33 @@ describe("golden fixture: three-level rollup end to end", () => {
     summary[0][COL_FACTOR] = "1.15";
     summary[0][COL_TOTAL] = "=F1*G1";
     expect(evaluate(summary)[0][COL_TOTAL]).toBeCloseTo(6900, 10);
+  });
+});
+
+describe("auto-derived F/H ownership (isAutoOwnedCell)", () => {
+  it("auto formulas are row-relative: F=E×C and H=F×G on a standard sheet, PRODUCT on a qty sheet", () => {
+    expect(autoFormulaFor("standard", COL_SUBTOTAL, 4)).toBe("=E5*C5");
+    expect(autoFormulaFor("standard", COL_TOTAL, 4)).toBe("=F5*G5");
+    expect(autoFormulaFor("qty", COL_TOTAL, 4)).toBe(qtyTotalFormula(4));
+    expect(autoFormulaFor("qty", COL_SUBTOTAL, 4)).toBeNull(); // F is Height on a qty sheet
+    expect(autoFormulaFor("standard", COL_FACTOR, 4)).toBeNull();
+  });
+
+  it("the app may write into a blank cell or one holding its own auto formula (any row)", () => {
+    expect(isAutoOwnedCell(null, "standard", COL_SUBTOTAL)).toBe(true);
+    expect(isAutoOwnedCell("", "standard", COL_SUBTOTAL)).toBe(true);
+    expect(isAutoOwnedCell("=E5*C5", "standard", COL_SUBTOTAL)).toBe(true);
+    expect(isAutoOwnedCell("=e21*c21", "standard", COL_SUBTOTAL)).toBe(true); // stale row from an old shift
+    expect(isAutoOwnedCell("=F9*G9", "standard", COL_TOTAL)).toBe(true);
+    expect(isAutoOwnedCell("=PRODUCT(C3,D3,E3,F3,G3)", "qty", COL_TOTAL)).toBe(true);
+  });
+
+  it("never overwrites the estimator's own subtotal or total", () => {
+    expect(isAutoOwnedCell("2500", "standard", COL_SUBTOTAL)).toBe(false);        // typed lump sum
+    expect(isAutoOwnedCell("=E5*C5*1.1", "standard", COL_SUBTOTAL)).toBe(false);  // hand-built formula
+    expect(isAutoOwnedCell("=E5*C6", "standard", COL_SUBTOTAL)).toBe(false);      // mixed rows: deliberate
+    expect(isAutoOwnedCell("=XSUMTOT(L1_sS3!H:H)", "standard", COL_SUBTOTAL)).toBe(false); // drilled rollup
+    expect(isAutoOwnedCell("=F5*G5+100", "standard", COL_TOTAL)).toBe(false);
+    expect(isAutoOwnedCell("=C3*D3", "qty", COL_TOTAL)).toBe(false);
   });
 });

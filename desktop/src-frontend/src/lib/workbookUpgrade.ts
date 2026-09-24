@@ -17,22 +17,17 @@
 // The pull-through user columns follow the shipped default layout (I..P = user 1..8).
 
 import { WorkbookEngine, type SheetPayload } from "./workbookEngine";
-import { COL_QTY, COL_RATE, COL_SUBTOTAL, COL_TOTAL, legacyColLetter } from "./workbookCalc";
+import { COL_QTY, COL_RATE, COL_SUBTOTAL, COL_TOTAL } from "./workbookCalc";
 import { FIRST_USER_COL } from "./workbookLayout";
-import { pathToSheetName } from "./workbookSheetNames";
+import { rollupRangeRef } from "./workbookXsumDisplay";
 
-// Upper bound of rows summed from a child column (sheets grow in 50-row chunks).
-const CHILD_ROWS = 1000;
-
-/** A CostX-named XSUM over one column of a child sheet, e.g. `=XSUMRATE(L1_sR3!H1:H1000)`. The
+/** A CostX-named XSUM over one column of a child sheet, e.g. `=XSUMRATE(L1_sR3!H:H)`. The
  *  child range is an explicit argument, so HyperFormula builds a real dependency edge child→parent
  *  and a multi-level rollup chain converges in one recalc (a volatile function deriving its child
  *  implicitly does not — see the roadmap). `fn` is the CostX function whose name documents intent
  *  (XSUMTOT/XSUMRATE/XSUMQTY/XSUMUSER/XSUMRATEUSER); all are ROUND(SUM(range), dp). */
 function childColSum(fn: string, childPath: string, col: number): string {
-  const name = pathToSheetName(childPath);
-  const c = legacyColLetter(col);
-  return `=${fn}(${name}!${c}1:${c}${CHILD_ROWS})`;
+  return `=${fn}(${rollupRangeRef(childPath, col)})`;
 }
 
 /** User-column *totals* rolled from a child COST sheet at L1 (J,L,N,P → user 2,4,6,8). */

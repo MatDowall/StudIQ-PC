@@ -67,14 +67,14 @@ describe("transformSheetsToV2", () => {
     const t = transformed.get("L1/R0")!;
 
     // L1 summary: F and J(Lab-Total) → explicit-range SUM of the L2 child's H and J columns.
-    expect(l1[0][COL_SUBTOTAL]).toBe("=XSUMTOT(L1_sR0!H1:H1000)");
-    expect(l1[0][COL_LAB_TOTAL]).toBe("=XSUMUSER(L1_sR0!J1:J1000)"); // J = user col 2
+    expect(l1[0][COL_SUBTOTAL]).toBe("=XSUMTOT(L1_sR0!H:H)");
+    expect(l1[0][COL_LAB_TOTAL]).toBe("=XSUMUSER(L1_sR0!J:J)"); // J = user col 2
     expect(l1[0][COL_TOTAL]).toBe("=F1*G1");                     // H formula untouched
 
     // Takeoff slab row (has both children): C from the qty child, E + I from the rate child.
-    expect(t[0][COL_QTY]).toBe("=XSUMQTY(L1_sR0_sQ0!H1:H1000)");
-    expect(t[0][COL_RATE]).toBe("=XSUMRATE(L1_sR0_sR0!H1:H1000)");
-    expect(t[0][COL_LAB]).toBe("=XSUMRATEUSER(L1_sR0_sR0!I1:I1000)"); // I = user col 1
+    expect(t[0][COL_QTY]).toBe("=XSUMQTY(L1_sR0_sQ0!H:H)");
+    expect(t[0][COL_RATE]).toBe("=XSUMRATE(L1_sR0_sR0!H:H)");
+    expect(t[0][COL_LAB]).toBe("=XSUMRATEUSER(L1_sR0_sR0!I:I)"); // I = user col 1
     expect(t[0][COL_SUBTOTAL]).toBe("=E1*C1");               // F formula untouched
     expect(t[0][COL_LAB_TOTAL]).toBe("=I1*C1");              // J formula untouched
 
@@ -94,7 +94,7 @@ describe("transformSheetsToV2", () => {
     });
     expect(transformed.get("L1")![0][COL_SUBTOTAL]).toBe("6000");   // excluded: literal kept
     expect(transformed.get("L1/R0")![0][COL_QTY]).toBe("25");        // linked: literal kept
-    expect(transformed.get("L1/R0")![0][COL_RATE]).toBe("=XSUMRATE(L1_sR0_sR0!H1:H1000)"); // others still upgraded
+    expect(transformed.get("L1/R0")![0][COL_RATE]).toBe("=XSUMRATE(L1_sR0_sR0!H:H)"); // others still upgraded
   });
 });
 
@@ -124,7 +124,7 @@ describe("equivalence gate", () => {
     const v1 = bakedV1Fixture();
     const { transformed } = transformSheetsToV2(v1);
     // Simulate a bad transform: point L1 F at the wrong child column (Quantity, not Total).
-    transformed.get("L1")![0][COL_SUBTOTAL] = "=SUM(L1_sR0!C1:C1000)";
+    transformed.get("L1")![0][COL_SUBTOTAL] = "=SUM(L1_sR0!C:C)";
     const diffs = verifyEquivalence(v1, transformed);
     expect(diffs.length).toBeGreaterThan(0);
     expect(diffs.some((d) => d.path === "L1")).toBe(true);

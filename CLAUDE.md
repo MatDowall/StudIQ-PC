@@ -486,9 +486,21 @@ old rows. The grid's bottom row is trimmed (insert) or padded (delete) to keep t
 On top of HyperFormula's adjustment: the moved rows' sub-sheets move via `moveRowSubtrees` (engine,
 caches, named cells, and one atomic `shift_workbook_subtrees`, which also retargets the moved sheets'
 references to their own children); the moved rows' XSUM* rollups are rebuilt for their new row
-(`retargetRollupRows`); and the parent's rollup into the edited sheet is re-canonicalized
-(`canonicalizeParentRollups`), since an insert above row 1 would otherwise shift `H1:H1000` to
-`H2:H1001` and drop the new row from the parent total.
+(`retargetRollupRows`); and any other sheet whose formulas HyperFormula adjusted is saved
+(`persistSheetsReferencing`).
+
+**Rollups reference the child's whole column** (`=XSUMTOT(L1_sS3!H:H)`, built by `rollupRangeRef`),
+never a row-bounded range. The old `H1:H1000` form silently dropped build-up rows past 1,000, and an
+insert above the child's first row shifted it to `H2:H1001`, dropping the new row. Legacy bounded references are upgraded as each
+sheet loads (`normalizeLegacyRollups`, applied in `padData`) and saved with the sheet's next save.
+The display/input transform (`toDisplay`/`toStored`) accepts both forms.
+
+**Auto-derived cells belong to the estimator once edited.** `deriveLevelFormulas` only writes F =
+E×C, H = F×G (or a qty sheet's H = PRODUCT) into a cell that is blank or still holds that auto
+formula (`isAutoOwnedCell` in workbookCalc.ts). A typed lump sum, a hand-built formula or a drilled
+XSUM rollup is never overwritten; clearing the cell hands it back to the app. Don't reintroduce
+unconditional derivation — it replaced a typed Subtotal with Rate × Quantity every time the sheet
+was displayed.
 
 **Excel export reads the live engine** (`engineSheetValues`), which holds every sheet of the
 revision — never re-evaluate a sheet on its own, where cross-sheet rollups can't resolve.

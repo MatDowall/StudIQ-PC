@@ -61,6 +61,34 @@ export function qtyTotalFormula(r: number): string {
   return `=PRODUCT(C${row},D${row},E${row},F${row},G${row})`;
 }
 
+/** The formula the app auto-derives into a cell — F:Subtotal `=E×C` and H:Total `=F×G` on a
+ *  standard sheet, H:Quantity `=PRODUCT(C..G)` on a Quantity Build-up — or null for any other cell. */
+export function autoFormulaFor(kind: "standard" | "qty", col: number, r: number): string | null {
+  if (kind === "qty") return col === COL_TOTAL ? qtyTotalFormula(r) : null;
+  if (col === COL_SUBTOTAL) return `=E${r + 1}*C${r + 1}`;
+  if (col === COL_TOTAL) return `=F${r + 1}*G${r + 1}`;
+  return null;
+}
+
+// The auto formulas above, for any single row number (`\1` ties every reference to the same row).
+const AUTO_SUBTOTAL_RE = /^=\s*E(\d+)\s*\*\s*C\1\s*$/i;
+const AUTO_TOTAL_RE = /^=\s*F(\d+)\s*\*\s*G\1\s*$/i;
+const AUTO_QTY_TOTAL_RE = /^=\s*PRODUCT\(\s*C(\d+)\s*,\s*D\1\s*,\s*E\1\s*,\s*F\1\s*,\s*G\1\s*\)\s*$/i;
+
+/** True when the app may (re)write its auto formula into this cell: the cell is blank, or already
+ *  holds that auto formula — for any row, so one left pointing at a neighbour by an old row shift is
+ *  put right. Anything else — a typed number, a hand-built formula, a drilled `=XSUMTOT(...)` rollup —
+ *  belongs to the estimator and must never be overwritten. (Deriving unconditionally used to replace
+ *  a lump sum typed into F:Subtotal with Rate × Quantity every time the sheet was shown.) */
+export function isAutoOwnedCell(source: unknown, kind: "standard" | "qty", col: number): boolean {
+  if (source == null || source === "") return true;
+  if (typeof source !== "string") return false;
+  if (kind === "qty") return col === COL_TOTAL && AUTO_QTY_TOTAL_RE.test(source);
+  if (col === COL_SUBTOTAL) return AUTO_SUBTOTAL_RE.test(source);
+  if (col === COL_TOTAL) return AUTO_TOTAL_RE.test(source);
+  return false;
+}
+
 /** Coerce a cell value (number, numeric string, formula string, null) to a finite number, defaulting to 0. */
 export function toNum(v: unknown): number {
   if (typeof v === "number") return isFinite(v) ? v : 0;

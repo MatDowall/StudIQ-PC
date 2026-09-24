@@ -1,13 +1,13 @@
 // Row insert/delete in the workbook is a native Handsontable `alter`, which the Formulas plugin
 // forwards to HyperFormula's addRows/removeRows. These tests pin the HyperFormula behaviour that
 // relies on — every reference to a moved row follows it, on the same sheet, from other sheets and
-// in named expressions — plus the two things WorkbookView does on top: retargeting sheet names of
-// moved sub-sheets, and re-canonicalizing a parent's rollup range after a child's rows move.
+// in named expressions — plus what WorkbookView relies on around that: rollups reference a child's
+// whole column (so a row op never shifts them), and sheet names of moved sub-sheets are retargeted.
 
 import { describe, it, expect } from "vitest";
 import { WorkbookEngine } from "./workbookEngine";
 import { retargetSheetRefs } from "./workbookSheetNames";
-import { toDisplay, toStored } from "./workbookXsumDisplay";
+import { toStored } from "./workbookXsumDisplay";
 import { COL_DESC, COL_SUBTOTAL, COL_TOTAL } from "./workbookCalc";
 
 const NUM_COLS = 16;
@@ -70,29 +70,25 @@ describe("native row insert/delete — references follow the moved rows", () => 
   });
 });
 
-describe("rollup references around a child's row insert", () => {
-  it("an insert above a child's first row shifts the parent's range — canonicalizing restores it", () => {
+describe("rollup references into a child sheet", () => {
+  it("a whole-column rollup counts a row inserted above the child's first row, and rows past 1,000", () => {
     const eng = new WorkbookEngine();
     const parent = sheet(5);
     parent[3][COL_SUBTOTAL] = toStored("=XSUMTOT()", "L1", 3);
-    const child = sheet(5);
+    expect(parent[3][COL_SUBTOTAL]).toBe("=XSUMTOT(L1_sS3!H:H)");
+    const child = sheet(1200);
     child[0][COL_TOTAL] = "100";
+    child[1100][COL_TOTAL] = "50"; // past the old H1:H1000 bound
     eng.loadAll([{ path: "L1", data: parent }, { path: "L1/S3", data: child }]);
     const hf = eng.raw();
     const pId = hf.getSheetId(eng.sheetName("L1"))!;
     const cId = hf.getSheetId(eng.sheetName("L1/S3"))!;
+    expect(hf.getCellValue({ sheet: pId, row: 3, col: COL_SUBTOTAL })).toBe(150);
 
     hf.addRows(cId, [0, 1]);
-    const shifted = hf.getCellSerialized({ sheet: pId, row: 3, col: COL_SUBTOTAL }) as string;
-    expect(shifted).toContain("H2:");
     hf.setCellContents({ sheet: cId, row: 0, col: COL_TOTAL }, [["7"]]);
-    expect(hf.getCellValue({ sheet: pId, row: 3, col: COL_SUBTOTAL })).toBe(100); // new row missed
-
-    // What canonicalizeParentRollups does: rebuild the reference from the cell's own position.
-    const canonical = toStored(toDisplay(shifted), "L1", 3);
-    expect(canonical).toBe(parent[3][COL_SUBTOTAL]);
-    hf.setCellContents({ sheet: pId, row: 3, col: COL_SUBTOTAL }, [[canonical]]);
-    expect(hf.getCellValue({ sheet: pId, row: 3, col: COL_SUBTOTAL })).toBe(107);
+    expect(hf.getCellSerialized({ sheet: pId, row: 3, col: COL_SUBTOTAL })).toBe("=XSUMTOT(L1_sS3!H:H)");
+    expect(hf.getCellValue({ sheet: pId, row: 3, col: COL_SUBTOTAL })).toBe(157);
     eng.destroy();
   });
 });
