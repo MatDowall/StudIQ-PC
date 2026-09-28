@@ -6142,6 +6142,11 @@ async fn get_tree_node(pool: &SqlitePool, node_id: i64) -> Result<TreeNodeDto, S
     })
 }
 
+fn is_startup_file_arg(arg: &str) -> bool {
+    let lower = arg.to_lowercase();
+    lower.ends_with(".tcop") || lower.ends_with(".tcopkg") || lower.ends_with(".sqtemplate")
+}
+
 pub fn run() {
     // Two TLS-using dependency chains (the bridge's tokio-rustls server and the
     // updater's reqwest client) pull in both the "ring" and "aws-lc-rs" crypto
@@ -6152,6 +6157,20 @@ pub fn run() {
     tracing_subscriber::fmt::init();
 
     tauri::Builder::default()
+        // Must be registered first. A second launch (a double-click that registered
+        // twice, or opening a .tcop from Explorer while StudIQ is running) exits
+        // immediately and hands its arguments to this process instead of racing it
+        // for registry.db, the Excel bridge port and the renderer processes.
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if let Some(main) = app.get_webview_window("main") {
+                let _ = main.unminimize();
+                let _ = main.show();
+                let _ = main.set_focus();
+            }
+            if let Some(file) = args.iter().skip(1).find(|arg| is_startup_file_arg(arg)) {
+                let _ = app.emit("open-file-from-shell", file.clone());
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -6248,10 +6267,7 @@ pub fn run() {
                 tauri::async_runtime::block_on(init_registry_database(&registry_path))
                     .expect("Recent projects registry initialisation failed");
 
-            let startup_file = std::env::args().skip(1).find(|arg| {
-                let lower = arg.to_lowercase();
-                lower.ends_with(".tcop") || lower.ends_with(".tcopkg") || lower.ends_with(".sqtemplate")
-            });
+            let startup_file = std::env::args().skip(1).find(|arg| is_startup_file_arg(arg));
 
             tracing::info!("pdfium path: {}", pdfium_lib_path);
 
@@ -6317,6 +6333,22 @@ pub fn run() {
                 settle_store,
                 bridge,
             });
+
+            // The main window is declared with `"create": false` and built only now,
+            // after AppState is managed. Tauri creates config windows *before* running
+            // this hook, and everything above (registry DB, four renderer processes,
+            // the bridge) takes long enough that a warm WebView2 could load the UI and
+            // call get_recent_projects first — failing with "state not managed" and
+            // leaving the start screen dead behind a splash that never closed.
+            let main_config = app
+                .config()
+                .app
+                .windows
+                .iter()
+                .find(|w| w.label == "main")
+                .cloned()
+                .expect("main window missing from tauri.conf.json");
+            tauri::WebviewWindowBuilder::from_config(app.handle(), &main_config)?.build()?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

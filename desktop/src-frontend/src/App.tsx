@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { Footer } from "./components/Footer";
 import { LeftColumn } from "./components/LeftColumn";
 import { Ribbon } from "./components/Ribbon";
@@ -36,17 +37,26 @@ export default function App() {
         console.error("Failed to load active project", error);
       });
 
+    const openShellFile = (filePath: string | null) => {
+      if (!filePath) return;
+      const lower = filePath.toLowerCase();
+      if (lower.endsWith(".tcop")) {
+        void useAppStore.getState().openProject(filePath);
+      } else if (lower.endsWith(".tcopkg")) {
+        useAppStore.getState().setPendingImportPath(filePath);
+      }
+    };
+
     invoke<string | null>("get_startup_file")
-      .then((filePath) => {
-        if (!filePath) return;
-        const lower = filePath.toLowerCase();
-        if (lower.endsWith(".tcop")) {
-          void useAppStore.getState().openProject(filePath);
-        } else if (lower.endsWith(".tcopkg")) {
-          useAppStore.getState().setPendingImportPath(filePath);
-        }
-      })
+      .then(openShellFile)
       .catch(() => {});
+
+    // A second launch (e.g. double-clicking a .tcop while StudIQ is already open) is
+    // folded into this instance by the single-instance plugin, which forwards the file.
+    const unlisten = listen<string>("open-file-from-shell", (event) => openShellFile(event.payload));
+    return () => {
+      void unlisten.then((fn) => fn());
+    };
   }, []);
 
   function handlePointerMove(event: React.PointerEvent<HTMLDivElement>) {

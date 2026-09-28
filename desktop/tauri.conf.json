@@ -13,6 +13,7 @@
     "windows": [
       {
         "label": "main",
+        "create": false,
         "title": "StudIQ",
         "width": 1400,
         "height": 900,
