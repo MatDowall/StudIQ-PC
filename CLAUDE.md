@@ -680,6 +680,7 @@ Material Symbols Outlined.
 | Flip Horizontal (Page / Takeoff Item) | `flip` |
 | Flip Vertical (Page / Takeoff Item) | `flip` (rotated 90° via `Icon`'s `rotate` prop) |
 | Set Scale / Rescale (Drawing group) | `straighten` |
+| Quick Measure (Drawing group) | `square_foot` |
 | Add mode (Takeoff Items group) | `edit` |
 | Select mode (Takeoff Items group) | `select` |
 | Positive polarity (Takeoff Items group) | `rectangle_add` |

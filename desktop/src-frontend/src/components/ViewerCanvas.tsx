@@ -1709,6 +1709,10 @@ export function ViewerCanvas({
   const [calibPoints, setCalibPoints] = useState<PagePoint[]>([]);
   const [calibDialog, setCalibDialog] = useState<{ pixelLength: number } | null>(null);
   const calibPointsRef = useRef<PagePoint[]>([]);
+  // Quick Measure capture: the start point, then both ends for as long as the second click is
+  // held. Never persisted — releasing the second click discards it.
+  const [quickPoints, setQuickPoints] = useState<PagePoint[]>([]);
+  const quickPointsRef = useRef<PagePoint[]>([]);
   // Last placed vertex on this page; lets Ctrl+click resume a path even after the
   // previous dimension was committed (CostX behaviour).
   const lastEndpointRef = useRef<PagePoint | null>(null);
@@ -1755,6 +1759,8 @@ export function ViewerCanvas({
   const pageScale = useAppStore((state) => state.pageScale);
   const calibrating = useAppStore((state) => state.calibrating);
   const setCalibrating = useAppStore((state) => state.setCalibrating);
+  const quickMeasure = useAppStore((state) => state.quickMeasure);
+  const setQuickMeasure = useAppStore((state) => state.setQuickMeasure);
   const setPageScale = useAppStore((state) => state.setPageScale);
   const loadPageScale = useAppStore((state) => state.loadPageScale);
   const groupProps = useAppStore((state) => state.groupProps);
@@ -1797,8 +1803,9 @@ export function ViewerCanvas({
   // Add-mode is active when a dimension group is selected, a page is open, and the
   // viewer isn't in select/edit or scale-calibration mode.
   // Opening placement overrides add/select while active.
-  const measuring = viewerMode === "add" && activeDimensionGroupId !== null && page !== null && !calibrating && !openingPlacement;
-  const selectMode = viewerMode === "select" && page !== null && !calibrating && !openingPlacement;
+  // Quick Measure also overrides both — it is independent of any dimension group.
+  const measuring = viewerMode === "add" && activeDimensionGroupId !== null && page !== null && !calibrating && !quickMeasure && !openingPlacement;
+  const selectMode = viewerMode === "select" && page !== null && !calibrating && !quickMeasure && !openingPlacement;
   const preview = previews.get(pageIndex) ?? null;
   const pageSize = useMemo(() => (page ? pagePixelSize(page, zoom) : { width: 0, height: 0 }), [page, zoom]);
   const activeZoomBucket = zoomBucket(zoom);
@@ -1917,6 +1924,22 @@ export function ViewerCanvas({
     applyCalib([]);
     setCalibDialog(null);
   }, [calibrating, pageIndex, doc?.path, applyCalib]);
+
+  const applyQuick = useCallback((points: PagePoint[]) => {
+    quickPointsRef.current = points;
+    setQuickPoints(points);
+  }, []);
+
+  // Reset the Quick Measure capture whenever it is armed or disarmed; Esc disarms it.
+  useEffect(() => {
+    applyQuick([]);
+    if (!quickMeasure) return;
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") setQuickMeasure(false);
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [quickMeasure, pageIndex, doc?.path, applyQuick, setQuickMeasure]);
 
   // Screen (client) coords → page point in PDF points, Y-up.
   const clientToPagePoint = useCallback(
@@ -2672,6 +2695,12 @@ export function ViewerCanvas({
       const livePoint = calibDialog ? null : snapPoint ?? cursorPagePoint;
       drawDraft(ctx, calibPoints, livePoint, "#FFD700", pan, zoom, page);
     }
+    if (quickMeasure) {
+      // Drawn exactly as a length dimension in progress; once the second point is down the line
+      // is fixed until the button is released.
+      const livePoint = quickPoints.length >= 2 ? null : snapPoint ?? cursorPagePoint;
+      drawDraft(ctx, quickPoints, livePoint, overlayColour, pan, zoom, page);
+    }
     // Door/window placement ghost: the opening's daylight gap + jamb studs on the hovered wall.
     if (openingPlacement && openingGhost) {
       const measurement = overlayMeasurements.find((m) => m.id === openingGhost.measurementId);
@@ -2913,7 +2942,7 @@ export function ViewerCanvas({
         }
       }
     }
-  }, [drawingWallSurface, drawingInsulation, framingSourceWalls, wallFaceHover, wallSpanDrag, activeProps, activeDimensionGroupId, arrayDirection, arrayExtraMembers, arraySpacingPts, arrayTrimDraft, arrayTrimKeepPt, arrayTrimMode, arrayTrimType, calibDialog, calibPoints, calibrating, clipboard, cursorPagePoint, doc, doubleStudSelect, draftColour, draftPoints, draftStyle, drawingArea, drawingArray, drawingFraming, drawingType, editPreview, groupColours, groupProps, lightMode, lineSnapResult, marqueeState, measuring, moveMode, openingGhost, openingPlacement, overlayColour, overlayMeasurements, page, pageIndex, pageScale, pageSize.height, pageSize.width, pan, pasteMode, pendingRake, pitchAxisHover, pitchDirectionMode, pitchPickStart, selectedSet, shiftHeld, snapPoint, snapType, studGhost, viewportSize.height, viewportSize.width, zoom]);
+  }, [drawingWallSurface, drawingInsulation, framingSourceWalls, wallFaceHover, wallSpanDrag, activeProps, activeDimensionGroupId, arrayDirection, arrayExtraMembers, arraySpacingPts, arrayTrimDraft, arrayTrimKeepPt, arrayTrimMode, arrayTrimType, calibDialog, calibPoints, calibrating, quickMeasure, quickPoints, clipboard, cursorPagePoint, doc, doubleStudSelect, draftColour, draftPoints, draftStyle, drawingArea, drawingArray, drawingFraming, drawingType, editPreview, groupColours, groupProps, lightMode, lineSnapResult, marqueeState, measuring, moveMode, openingGhost, openingPlacement, overlayColour, overlayMeasurements, page, pageIndex, pageScale, pageSize.height, pageSize.width, pan, pasteMode, pendingRake, pitchAxisHover, pitchDirectionMode, pitchPickStart, selectedSet, shiftHeld, snapPoint, snapType, studGhost, viewportSize.height, viewportSize.width, zoom]);
 
   function clampPan(nextPan: { x: number; y: number }, nextZoom = zoom) {
     if (!page) return nextPan;
@@ -2973,6 +3002,17 @@ export function ViewerCanvas({
         applyCalib([start, point]);
         if (pixelLength > 1e-6) setCalibDialog({ pixelLength });
       }
+      return;
+    }
+
+    if (quickMeasure && page) {
+      // First click starts the measure; the second fixes its end, and releasing it (handlePointerUp)
+      // throws the measure away.
+      const point = placementPoint(event.clientX, event.clientY);
+      if (!point) return;
+      const current = quickPointsRef.current;
+      if (current.length === 0) applyQuick([point]);
+      else if (current.length === 1) applyQuick([current[0], point]);
       return;
     }
 
@@ -3254,7 +3294,7 @@ export function ViewerCanvas({
       );
     }
 
-    if (measuring || calibrating || moveMode || pasteMode || arrayTrimMode || pitchDirectionMode) {
+    if (measuring || calibrating || quickMeasure || moveMode || pasteMode || arrayTrimMode || pitchDirectionMode) {
       // Drive the live rubber-band endpoint (drawing a dimension, a calibration line,
       // or a move/paste ghost).
       setCursorClient({ x: event.clientX, y: event.clientY });
@@ -3295,12 +3335,15 @@ export function ViewerCanvas({
     // Hover-to-inspect committed dimensions works in add-mode too (add-mode is
     // always on while a group is selected). It's suppressed mid-path below, where
     // the live length readout takes over.
-    if (!drag && !calibrating) {
+    if (!drag && !calibrating && !quickMeasure) {
       updateHover(event.clientX, event.clientY);
     }
   }
 
   function handlePointerUp(event: React.PointerEvent<HTMLDivElement>) {
+    // Quick Measure: releasing the second click discards the measure (the tool stays armed).
+    if (event.button === 0 && quickPointsRef.current.length >= 2) applyQuick([]);
+
     // Finish a wall-surface gesture: a drag commits the run it drew, a plain click the whole face.
     const spanDrag = wallSpanDragRef.current;
     if (spanDrag) {
@@ -3364,6 +3407,13 @@ export function ViewerCanvas({
     // Trim mode: suppress context menu.
     if (arrayTrimMode) {
       event.preventDefault();
+      return;
+    }
+
+    if (quickMeasure) {
+      // Right-click abandons the measure in progress.
+      event.preventDefault();
+      applyQuick([]);
       return;
     }
 
@@ -5119,6 +5169,10 @@ export function ViewerCanvas({
     if (calibrating && !calibDialog && calibPoints.length >= 1 && livePoint) {
       return formatLength(pathLengthPts([...calibPoints, livePoint]), pageScale);
     }
+    if (quickMeasure && quickPoints.length >= 1) {
+      const pts = quickPoints.length >= 2 ? quickPoints : livePoint ? [...quickPoints, livePoint] : null;
+      return pts ? formatLength(pathLengthPts(pts), pageScale) : null;
+    }
     if (measuring && draftPoints.length >= 1) {
       if (drawingArray) {
         const pts = livePoint && draftPoints.length < 2 ? [...draftPoints, livePoint] : draftPoints;
@@ -5208,7 +5262,7 @@ export function ViewerCanvas({
         minHeight: 0,
         overflow: "hidden",
         cursor: doc
-          ? measuring || calibrating || openingPlacement || arrayTrimMode || pitchDirectionMode || pitchAxisPick
+          ? measuring || calibrating || quickMeasure || openingPlacement || arrayTrimMode || pitchDirectionMode || pitchAxisPick
             ? "crosshair"
             : moveMode || pasteMode
               ? "crosshair"

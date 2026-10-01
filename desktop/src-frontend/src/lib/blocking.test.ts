@@ -12,7 +12,7 @@ import {
   serializeJoistRafterSettings,
 } from "./framing";
 import { computeArrayMembers3D } from "./framing3d";
-import type { ArrayMeta, ArrayTrim, PagePoint } from "./quantity";
+import { respaceArrayJson, type ArrayMeta, type ArrayTrim, type PagePoint } from "./quantity";
 
 const MM_PER_PT = 1;
 
@@ -419,5 +419,29 @@ describe("computeArrayMembers3D — blocking placement", () => {
       pitchAngleDeg: 30,
     });
     expect(all).toHaveLength(5); // the five rafters only
+  });
+});
+
+describe("respaceArrayJson", () => {
+  const json = JSON.stringify({ type: "array", extraMembers: 10, spacingPts: 600, direction: -1, trims: [], pitch: { angleDeg: 5 } });
+
+  it("keeps the drawn extent and recounts the members at the new spacing", () => {
+    const out = JSON.parse(respaceArrayJson(json, 400)!);
+    expect(out.spacingPts).toBe(400);
+    expect(out.extraMembers).toBe(15);
+    expect(JSON.parse(respaceArrayJson(json, 450)!).extraMembers).toBe(13);
+  });
+
+  it("carries everything else in the blob unchanged", () => {
+    const out = JSON.parse(respaceArrayJson(json, 400)!);
+    expect(out.direction).toBe(-1);
+    expect(out.pitch).toEqual({ angleDeg: 5 });
+  });
+
+  it("returns null when there is nothing to change", () => {
+    expect(respaceArrayJson(json, 600)).toBeNull();
+    expect(respaceArrayJson(json, 0)).toBeNull();
+    expect(respaceArrayJson(null, 400)).toBeNull();
+    expect(respaceArrayJson(JSON.stringify({ openings: [] }), 400)).toBeNull();
   });
 });

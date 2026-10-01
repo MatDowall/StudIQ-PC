@@ -12,7 +12,7 @@ import {
   wallSurfaceMetaMatches,
   type OpeningTemplate,
 } from "../lib/framing";
-import { isWallSurfaceType, parseWallSurfaceMeta, serializeWallSurfaceMeta, wallSurfaceSpanOf } from "../lib/quantity";
+import { isWallSurfaceType, parseWallSurfaceMeta, respaceArrayJson,serializeWallSurfaceMeta, wallSurfaceSpanOf } from "../lib/quantity";
 import { computeWallElevations } from "../lib/elevation2d";
 import { exportElevationPdf, type WallElevationExport } from "../lib/elevationPdf";
 
@@ -492,6 +492,9 @@ interface AppStore {
   // Scale of the active drawing page, and whether the calibration capture is in progress.
   pageScale: PageScaleDto | null;
   calibrating: boolean;
+  // Quick Measure: a throwaway two-click distance check. Belongs to no dimension group and never
+  // persists anything; armed from the ribbon's Drawing group.
+  quickMeasure: boolean;
   // CostX props for each selected group, scales for every page referenced by loaded
   // measurements (keyed `${drawingId}:${pageIndex}`), and the polarity new dimensions take.
   groupProps: Record<number, DimensionGroupPropsDto>;
@@ -555,6 +558,7 @@ interface AppStore {
   updateMeasurementGeometry: (measurementId: number, geometryJson: string) => Promise<void>;
   updateMeasurementFraming: (measurementId: number, framingJson: string | null) => Promise<void>;
   setCalibrating: (calibrating: boolean) => void;
+  setQuickMeasure: (quickMeasure: boolean) => void;
   loadPageScale: (drawingId: number, pageIndex: number) => Promise<void>;
   setPageScale: (drawingId: number, pageIndex: number, mmPerPoint: number, unit: string) => Promise<void>;
   setDrawPolarity: (polarity: number) => void;
@@ -998,6 +1002,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
   drawingDimmer: 1,
   pageScale: null,
   calibrating: false,
+  quickMeasure: false,
   groupProps: {},
   scaleCache: {},
   drawPolarity: 1,
@@ -1039,7 +1044,49 @@ export const useAppStore = create<AppStore>((set, get) => ({
   },
 
   saveGroupProps: async (props) => {
+    const previous =
+      get().groupProps[props.node_id] ??
+      (await invoke<DimensionGroupPropsDto>("get_dimension_group_props", { nodeId: props.node_id }).catch(() => null));
     const saved = await invoke<DimensionGroupPropsDto>("set_dimension_group_props", { props });
+    // A Joist/Rafter array snapshots its spacing (in page points) when it is drawn, so a changed
+    // Default Spacing has to be pushed into the group's existing arrays — on every page, each at
+    // its own page scale — or only arrays drawn afterwards would pick it up.
+    if (saved.measurement_type === "array" && saved.default_width > 0 && previous?.default_width !== saved.default_width) {
+      const measurements = await invoke<MeasurementDto[]>("get_measurements_for_group", { groupId: saved.node_id });
+      const scales = new Map<string, number | null>();
+      for (const m of measurements) {
+        const key = `${m.drawing_id}:${m.page_index}`;
+        if (scales.has(key)) continue;
+        const scale = await invoke<PageScaleDto | null>("get_page_scale", { drawingId: m.drawing_id, pageIndex: m.page_index });
+        scales.set(key, scale?.mm_per_point ?? null);
+      }
+      const respaced = (
+        await Promise.all(
+          measurements.map((m) => {
+            const mmpp = scales.get(`${m.drawing_id}:${m.page_index}`);
+            const framingJson = mmpp && mmpp > 0 ? respaceArrayJson(m.framing_json, (saved.default_width * 1000) / mmpp) : null;
+            return framingJson
+              ? invoke<MeasurementDto>("update_measurement_framing", { measurementId: m.id, framingJson })
+              : null;
+          }),
+        )
+      ).filter((m): m is MeasurementDto => m !== null);
+      if (respaced.length > 0) {
+        const byId = new Map(respaced.map((m) => [m.id, m]));
+        set((state) => {
+          const cached = state.group3dCache[saved.node_id];
+          return {
+            overlayMeasurements: state.overlayMeasurements.map((m) => byId.get(m.id) ?? m),
+            group3dCache: cached
+              ? {
+                  ...state.group3dCache,
+                  [saved.node_id]: { ...cached, measurements: cached.measurements.map((m) => byId.get(m.id) ?? m) },
+                }
+              : state.group3dCache,
+          };
+        });
+      }
+    }
     await refreshTree("dimensions", set);
     set((state) => ({
       groupProps: { ...state.groupProps, [saved.node_id]: saved },
@@ -1051,7 +1098,11 @@ export const useAppStore = create<AppStore>((set, get) => ({
   },
 
   setCalibrating: (calibrating) => {
-    set({ calibrating });
+    set(calibrating ? { calibrating, quickMeasure: false } : { calibrating });
+  },
+
+  setQuickMeasure: (quickMeasure) => {
+    set(quickMeasure ? { quickMeasure, calibrating: false, openingPlacement: null, arrayTrimMode: false } : { quickMeasure });
   },
 
   loadPageScale: async (drawingId, pageIndex) => {
@@ -1543,6 +1594,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
       drawingDimmer: 1,
       pageScale: null,
       calibrating: false,
+      quickMeasure: false,
       groupProps: {},
       scaleCache: {},
       drawPolarity: 1,

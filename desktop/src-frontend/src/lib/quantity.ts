@@ -295,6 +295,29 @@ export function serializeArrayMeta(meta: ArrayMeta): string {
   return JSON.stringify({ type: "array", ...meta });
 }
 
+/**
+ * Re-space an array measurement to a new centre-to-centre spacing, keeping the extent it was drawn
+ * over: the member count is recomputed so the array still covers the same ground, the way the draw
+ * gesture would have set it out at the new spacing. Edits the blob in place so anything else riding
+ * in `framing_json` (trims, a pitch axis) is carried unchanged. Returns `null` when there is
+ * nothing to change — not an array, an unusable spacing, or already at that spacing.
+ */
+export function respaceArrayJson(framingJson: string | null, spacingPts: number): string | null {
+  if (!framingJson || !(spacingPts > 0)) return null;
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(framingJson);
+  } catch {
+    return null;
+  }
+  if (parsed?.type !== "array") return null;
+  const meta = parseArrayMeta(framingJson);
+  if (Math.abs(meta.spacingPts - spacingPts) <= 1e-6 * spacingPts) return null;
+  const extentPts = meta.extraMembers * meta.spacingPts;
+  const extraMembers = meta.spacingPts > 0 ? Math.floor(extentPts / spacingPts + 1e-6) : meta.extraMembers;
+  return JSON.stringify({ ...parsed, spacingPts, extraMembers });
+}
+
 // --- Array trim geometry helpers (mirrors ViewerCanvas but needed for quantity derivation) ---
 
 function _sideOfLine(px: number, py: number, lx1: number, ly1: number, lx2: number, ly2: number): number {

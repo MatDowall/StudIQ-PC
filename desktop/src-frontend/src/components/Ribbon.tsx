@@ -20,6 +20,7 @@ const BUTTON_ICONS: Record<string, string> = {
   Geometry: "my_location",
   "Elevation PDF": "picture_as_pdf",
   "Set Scale": "straighten",
+  "Quick Measure": "square_foot",
   "Rotate Left": "rotate_90_degrees_ccw",
   "Rotate Right": "rotate_90_degrees_cw",
   "Flip Horizontal": "flip",
@@ -35,7 +36,7 @@ const ICON_ROTATION: Record<string, number> = {
 const groups = [
   { label: "Dimension Group", tools: ["Add", "Properties", "Copy", "Import", "Export"] },
   { label: "Type", tools: ["Point", "Line"] },
-  { label: "Drawing", tools: ["Plan View", "View in 3D", "Dim", "Elevation PDF", "Set Scale"] },
+  { label: "Drawing", tools: ["Plan View", "View in 3D", "Dim", "Elevation PDF", "Set Scale", "Quick Measure"] },
   { label: "Snap", tools: ["Geometry"] },
   { label: "Takeoff Items", tools: ["Rotate Left", "Rotate Right", "Flip Horizontal", "Flip Vertical"] },
 ];
@@ -144,6 +145,8 @@ export function Ribbon() {
   const pageScale = useAppStore((state) => state.pageScale);
   const calibrating = useAppStore((state) => state.calibrating);
   const setCalibrating = useAppStore((state) => state.setCalibrating);
+  const quickMeasure = useAppStore((state) => state.quickMeasure);
+  const setQuickMeasure = useAppStore((state) => state.setQuickMeasure);
   const viewerMode = useAppStore((state) => state.viewerMode);
   const setViewerMode = useAppStore((state) => state.setViewerMode);
   const drawPolarity = useAppStore((state) => state.drawPolarity);
@@ -234,7 +237,7 @@ export function Ribbon() {
                 style={{
                   display: "flex",
                   flexDirection: "column",
-                  minWidth: groupIndex === 0 ? 138 : isDrawingGroup ? 244 : isTakeoffItemGroup ? 600 : 72,
+                  minWidth: groupIndex === 0 ? 138 : isDrawingGroup ? 312 : isTakeoffItemGroup ? 600 : 72,
                   padding: "4px 8px 0",
                   borderRight: `1px solid ${theme.border.divider}`,
                 }}
@@ -248,6 +251,7 @@ export function Ribbon() {
                     const isSnapToggle = group.label === "Snap" && tool === "Geometry";
                     const isElevationExport = group.label === "Drawing" && tool === "Elevation PDF";
                     const isSetScale = group.label === "Drawing" && tool === "Set Scale";
+                    const isQuickMeasure = group.label === "Drawing" && tool === "Quick Measure";
                     const takeoffCommand = isTakeoffItemGroup ? TAKEOFF_ITEM_COMMANDS[tool] : undefined;
 
                     let enabled: boolean;
@@ -282,6 +286,12 @@ export function Ribbon() {
                       enabled = currentDocument !== null;
                       active = calibrating;
                       cursor = enabled ? "pointer" : "not-allowed";
+                    } else if (isQuickMeasure) {
+                      // A distance only means something on a scaled page, in plan.
+                      // Stays clickable while armed so it can always be switched back off.
+                      enabled = quickMeasure || (currentDocument !== null && pageScale !== null && !view3d);
+                      active = quickMeasure;
+                      cursor = enabled ? "pointer" : "not-allowed";
                     } else if (takeoffCommand !== undefined) {
                       enabled = selectedMeasurementIds.length > 0;
                       active = false;
@@ -315,7 +325,9 @@ export function Ribbon() {
                                 ? () => { void handleExportElevations(); }
                                 : isSetScale && enabled
                                   ? () => setCalibrating(!calibrating)
-                                  : undefined;
+                                  : isQuickMeasure && enabled
+                                    ? () => setQuickMeasure(!quickMeasure)
+                                    : undefined;
 
                     const iconName = BUTTON_ICONS[tool];
                     const isView3d = tool === "View in 3D";
@@ -334,7 +346,11 @@ export function Ribbon() {
                               ? pageScale
                                 ? "Rescale the page (draw a new reference line)"
                                 : "Set the page scale by drawing a line over a known dimension"
-                              : tool
+                              : isQuickMeasure
+                                ? enabled
+                                  ? "Measure a distance without recording it (click two points; Esc to finish)"
+                                  : "Quick Measure (set the page scale first)"
+                                : tool
                         }
                         className={`ribbon-btn${active ? " is-active" : ""}`}
                         style={{

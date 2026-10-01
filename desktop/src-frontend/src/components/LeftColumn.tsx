@@ -52,8 +52,6 @@ export function LeftColumn() {
         display: "grid",
         gridTemplateRows: `${Math.round(topHeight ?? 260)}px 4px minmax(120px, 1fr)`,
         height: "100%",
-        minWidth: 220,
-        maxWidth: 480,
         minHeight: 0,
         overflow: "hidden",
         background: theme.bg.pane,

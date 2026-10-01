@@ -13,11 +13,24 @@ import { UpdateBanner } from "./components/UpdateBanner";
 import { startBridgeListener } from "./lib/bridge";
 import { theme } from "./theme";
 
+const LEFT_WIDTH_KEY = "studiq.leftPaneWidth";
+const clampLeftWidth = (width: number) => Math.max(theme.leftPaneMinWidth, Math.min(theme.leftPaneMaxWidth, width));
+
 export default function App() {
   const activeProject = useAppStore((state) => state.activeProject);
   const activeTab = useAppStore((state) => state.activeTab);
   const setActiveTab = useAppStore((state) => state.setActiveTab);
-  const [leftWidth, setLeftWidth] = useState(theme.leftPaneWidth);
+  // The sidebar opens at a width that fits its columns; a width the estimator drags it to is
+  // remembered across restarts.
+  const [leftWidth, setLeftWidth] = useState(() => {
+    try {
+      const stored = Number.parseInt(localStorage.getItem(LEFT_WIDTH_KEY) ?? "", 10);
+      if (Number.isFinite(stored)) return clampLeftWidth(stored);
+    } catch {
+      // storage unavailable — fall through to the default
+    }
+    return theme.leftPaneWidth;
+  });
   const [dragging, setDragging] = useState(false);
   // Lazily mount WorkbookView on first visit; keep it mounted (display:none) thereafter
   // so workbook state survives tab switches without triggering expensive re-mounts.
@@ -61,10 +74,17 @@ export default function App() {
 
   function handlePointerMove(event: React.PointerEvent<HTMLDivElement>) {
     if (!dragging) return;
-    setLeftWidth(Math.max(220, Math.min(480, event.clientX)));
+    setLeftWidth(clampLeftWidth(event.clientX));
   }
 
   function stopDrag() {
+    if (dragging) {
+      try {
+        localStorage.setItem(LEFT_WIDTH_KEY, String(leftWidth));
+      } catch {
+        // storage unavailable — the width just won't be remembered
+      }
+    }
     setDragging(false);
   }
 
@@ -143,21 +163,23 @@ export default function App() {
       <Ribbon />
 
       {/* Left column — top pane switches per tab; dim group pane always at bottom */}
-      <div style={{ position: "relative", minHeight: 0, overflow: "hidden" }}>
-        <LeftColumn />
+      <div style={{ display: "flex", minHeight: 0, overflow: "hidden" }}>
+        <div style={{ flex: 1, minWidth: 0, minHeight: 0 }}>
+          <LeftColumn />
+        </div>
+        {/* Splitter — a visible bar framing the sidebar off from the canvas; drag to resize. */}
         <div
           onPointerDown={(event) => {
             event.currentTarget.setPointerCapture(event.pointerId);
             setDragging(true);
           }}
           style={{
-            position: "absolute",
-            top: 0,
-            right: 0,
-            bottom: 0,
-            width: 4,
+            flex: "0 0 auto",
+            width: theme.splitterWidth,
+            boxSizing: "border-box",
             cursor: "col-resize",
-            background: dragging ? theme.accent : "transparent",
+            background: dragging ? theme.accent : theme.bg.shell,
+            borderRight: `1px solid ${theme.border.divider}`,
           }}
         />
       </div>
